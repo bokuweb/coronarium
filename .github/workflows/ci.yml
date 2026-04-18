@@ -27,6 +27,9 @@ jobs:
           components: rust-src
       - name: Build eBPF object
         working-directory: crates/coronarium-ebpf
+        env:
+          # Override the repo-root rust-toolchain.toml (which pins stable).
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           cargo build --release --target bpfel-unknown-none -Z build-std=core
       - uses: actions/upload-artifact@v4
