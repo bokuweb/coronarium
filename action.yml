@@ -96,7 +96,12 @@ runs:
 
     - shell: bash
       run: |
-        "${CORONARIUM_BIN}" check-policy --policy "${CORONARIUM_POLICY}" >/dev/null
-        echo "Coronarium installed. Wrap the command you want to supervise like:"
+        if [[ -f "${CORONARIUM_POLICY}" ]]; then
+          "${CORONARIUM_BIN}" check-policy --policy "${CORONARIUM_POLICY}" >/dev/null
+          echo "✓ policy validated: ${CORONARIUM_POLICY}"
+        else
+          echo "::notice::policy file '${CORONARIUM_POLICY}' not found — the next 'coronarium run' step should point --policy somewhere real."
+        fi
         echo ""
-        echo "    - run: sudo -E \$CORONARIUM_BIN run --policy \$CORONARIUM_POLICY --mode \$CORONARIUM_MODE --log \$CORONARIUM_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
+        echo "Coronarium installed. Wrap the command you want to supervise like:"
+        echo "    - run: sudo -E \$CORONARIUM_BIN run --policy <path> --mode \$CORONARIUM_MODE --log \$CORONARIUM_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
