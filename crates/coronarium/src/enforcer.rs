@@ -131,53 +131,10 @@ async fn resolve_all(
 }
 
 #[cfg(target_os = "linux")]
-fn populate_file_maps(bpf: &mut aya::Ebpf, policy: &Policy) -> anyhow::Result<()> {
-    use coronarium_common::{
-        FILE_PREFIX_ENTRIES, FILE_PREFIX_LEN, FilePrefix, POLICY_ALLOW, POLICY_DENY,
-    };
-
-    let Some(map) = bpf.map_mut("FILE_PREFIX") else {
-        return Ok(());
-    };
-    let mut m: aya::maps::Array<_, FilePrefix> = aya::maps::Array::try_from(map)?;
-
-    // Deny first, then allow — on a linear scan, the first match wins, so
-    // deny entries get priority (same precedence the network side uses).
-    let mut idx: u32 = 0;
-    for (patterns, verdict) in [
-        (&policy.file.deny, POLICY_DENY),
-        (&policy.file.allow, POLICY_ALLOW),
-    ] {
-        for pat in patterns {
-            if idx >= FILE_PREFIX_ENTRIES {
-                log::warn!(
-                    "FILE_PREFIX map full ({FILE_PREFIX_ENTRIES} entries); \
-                     dropping '{pat}'"
-                );
-                break;
-            }
-            let bytes = pat.as_bytes();
-            if bytes.len() > FILE_PREFIX_LEN {
-                log::warn!(
-                    "file pattern '{pat}' is longer than {FILE_PREFIX_LEN} bytes; truncating"
-                );
-            }
-            let mut entry = FilePrefix::empty();
-            let n = bytes.len().min(FILE_PREFIX_LEN);
-            entry.bytes[..n].copy_from_slice(&bytes[..n]);
-            entry.len = n as u32;
-            entry.verdict = verdict;
-            entry.active = 1;
-            m.set(idx, entry, 0)?;
-            idx += 1;
-        }
-    }
-
-    // Explicitly clear any leftover slots from a previous session so stale
-    // prefixes from the pinned map (if the caller ever pins it) never match.
-    while idx < FILE_PREFIX_ENTRIES {
-        m.set(idx, FilePrefix::empty(), 0)?;
-        idx += 1;
-    }
+fn populate_file_maps(_bpf: &mut aya::Ebpf, _policy: &Policy) -> anyhow::Result<()> {
+    // File policy is evaluated entirely in userspace (see
+    // `FileMatcher` in the loader). The eBPF tracepoint only ships the
+    // filename; doing prefix matching in the kernel blew the verifier's
+    // instruction-count budget once the scan got unrolled.
     Ok(())
 }

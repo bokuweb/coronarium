@@ -34,9 +34,8 @@ use aya_ebpf::{
 };
 use coronarium_common::{
     COMM_LEN, Connect4Event, Connect6Event, EVENT_KIND_CONNECT4, EVENT_KIND_CONNECT6,
-    EVENT_KIND_EXEC, EVENT_KIND_OPEN, EventHeader, ExecEvent, FILE_PREFIX_ENTRIES, FILE_PREFIX_LEN,
-    FilePrefix, Ipv4Key, Ipv6Key, OpenEvent, POLICY_ALLOW, POLICY_DENY, Settings, VERDICT_ALLOW,
-    VERDICT_DENY,
+    EVENT_KIND_EXEC, EVENT_KIND_OPEN, EventHeader, ExecEvent, Ipv4Key, Ipv6Key, OpenEvent,
+    POLICY_ALLOW, POLICY_DENY, Settings, VERDICT_ALLOW, VERDICT_DENY,
 };
 
 #[map]
@@ -50,9 +49,6 @@ static NET4: HashMap<Ipv4Key, u8> = HashMap::with_max_entries(1024, BPF_F_NO_PRE
 
 #[map]
 static NET6: HashMap<Ipv6Key, u8> = HashMap::with_max_entries(1024, BPF_F_NO_PREALLOC);
-
-#[map]
-static FILE_PREFIX: Array<FilePrefix> = Array::with_max_entries(FILE_PREFIX_ENTRIES, 0);
 
 #[inline(always)]
 fn settings() -> Settings {
@@ -121,6 +117,11 @@ pub fn coronarium_execve(ctx: TracePointContext) -> u32 {
 // openat tracepoint — header-only open event
 // ---------------------------------------------------------------------------
 
+// File prefix matching happens in *userspace* from the ringbuf events —
+// doing it in the tracepoint blew the verifier's complexity budget (1M
+// insns) once the scan got unrolled. The kernel program just ships the
+// filename; userspace applies the policy and tags verdicts before the
+// aggregate log is printed.
 #[tracepoint]
 pub fn coronarium_openat(ctx: TracePointContext) -> u32 {
     // args[0] = dfd (i32 padded to u64), args[1] = filename, args[2] = flags
@@ -134,72 +135,16 @@ pub fn coronarium_openat(ctx: TracePointContext) -> u32 {
         let ptr = entry.as_mut_ptr();
         unsafe {
             core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<OpenEvent>());
+            (*ptr).header = make_header(EVENT_KIND_OPEN, VERDICT_ALLOW);
             (*ptr).flags = flags;
-
-            // Copy filename from userspace into the ringbuf-reserved record.
-            let mut len: usize = 0;
             if !filename_ptr.is_null() {
                 let buf: &mut [u8] = &mut (*ptr).filename;
-                if let Ok(n) = bpf_probe_read_user_str_bytes(filename_ptr, buf) {
-                    len = n.len();
-                }
+                let _ = bpf_probe_read_user_str_bytes(filename_ptr, buf);
             }
-
-            let verdict_byte = lookup_file(&(*ptr).filename, len);
-            (*ptr).header = make_header(
-                EVENT_KIND_OPEN,
-                if verdict_byte == POLICY_DENY {
-                    VERDICT_DENY
-                } else {
-                    VERDICT_ALLOW
-                },
-            );
         }
         entry.submit(0);
     }
     0
-}
-
-/// Linear scan of the FILE_PREFIX map. Returns the first matching slot's
-/// verdict, else `settings().file_default`. Straight-line control flow
-/// (no `continue`, bounded inner loop) keeps the verifier happy after
-/// bpf-linker unrolls the scan.
-#[inline(always)]
-fn lookup_file(path: &[u8; 256], path_len: usize) -> u8 {
-    let mut i: u32 = 0;
-    let mut hit: u8 = 0; // 0 = no match yet
-    while i < FILE_PREFIX_ENTRIES {
-        if hit == 0 {
-            if let Some(slot) = unsafe { FILE_PREFIX.get(i) } {
-                if slot.active != 0 && prefix_matches(path, path_len, slot) {
-                    hit = slot.verdict;
-                }
-            }
-        }
-        i += 1;
-    }
-    if hit != 0 {
-        hit
-    } else {
-        settings().file_default as u8
-    }
-}
-
-#[inline(always)]
-fn prefix_matches(path: &[u8; 256], path_len: usize, slot: &FilePrefix) -> bool {
-    let needle_len = slot.len as usize;
-    if needle_len == 0 || needle_len > FILE_PREFIX_LEN || needle_len > path_len {
-        return false;
-    }
-    let mut j = 0usize;
-    let mut mismatch = false;
-    while j < FILE_PREFIX_LEN {
-        if j < needle_len && path[j] != slot.bytes[j] {
-            mismatch = true;
-        }
-        j += 1;
-    }
-    !mismatch
 }
 
 // ---------------------------------------------------------------------------

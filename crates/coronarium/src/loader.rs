@@ -15,6 +15,7 @@ use tokio::{process::Command, sync::Mutex};
 use crate::{
     cgroup::Cgroup,
     events::{self, Event},
+    matcher::FileMatcher,
     policy::{Mode, Policy},
     resolve::Resolver,
 };
@@ -48,6 +49,7 @@ impl Supervisor {
     pub async fn start(policy: Policy, mode: Mode) -> Result<Self> {
         let stats = Arc::new(Mutex::new(Stats::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let file_matcher = Arc::new(FileMatcher::from_policy(&policy.file));
 
         let cgroup = match Cgroup::create() {
             Ok(c) => Some(c),
@@ -84,8 +86,10 @@ impl Supervisor {
 
         #[cfg(target_os = "linux")]
         if let Some(bpf) = bpf {
-            spawn_ringbuf_drain(bpf, stats, stop);
+            spawn_ringbuf_drain(bpf, stats, stop, file_matcher);
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = file_matcher;
 
         Ok(this)
     }
@@ -194,6 +198,7 @@ fn spawn_ringbuf_drain(
     bpf: Arc<Mutex<aya::Ebpf>>,
     stats: Arc<Mutex<Stats>>,
     stop: Arc<AtomicBool>,
+    file_matcher: Arc<FileMatcher>,
 ) {
     tokio::task::spawn(async move {
         // Take the ring buffer out of the map collection exactly once.
@@ -210,14 +215,11 @@ fn spawn_ringbuf_drain(
         };
 
         loop {
-            // Drain everything currently in the ring buffer.
             while let Some(item) = ring.next() {
                 let bytes: &[u8] = &item;
                 let mut s = stats.lock().await;
-                ingest(&mut s, bytes);
+                ingest(&mut s, bytes, &file_matcher);
             }
-            // Check `stop` *after* draining so a stop signal that races with
-            // a final burst of events doesn't drop them on the floor.
             if stop.load(Ordering::SeqCst) {
                 break;
             }
@@ -226,27 +228,33 @@ fn spawn_ringbuf_drain(
     });
 }
 
-pub(crate) fn ingest(stats: &mut Stats, raw: &[u8]) {
-    match events::decode(raw) {
-        Some(ev) => {
-            stats.observed += 1;
-            if ev.denied() {
-                stats.denied += 1;
-            }
-            // Per-kind cap so a flood of (say) openat events doesn't crowd out
-            // the first exec / connect we see in the JSON sample.
-            const PER_KIND_CAP: usize = 64;
-            let existing = stats
-                .samples
-                .iter()
-                .filter(|s| s.kind_tag() == ev.kind_tag())
-                .count();
-            if existing < PER_KIND_CAP && stats.samples.len() < 256 {
-                stats.samples.push(ev);
-            }
-        }
-        None => {
-            stats.lost += 1;
-        }
+pub(crate) fn ingest(stats: &mut Stats, raw: &[u8], file_matcher: &FileMatcher) {
+    let Some(mut ev) = events::decode(raw) else {
+        stats.lost += 1;
+        return;
+    };
+
+    // Apply userspace-side file policy here — the kernel program just
+    // ships the filename without a verdict.
+    if let Event::Open {
+        filename, denied, ..
+    } = &mut ev
+        && file_matcher.is_denied(filename)
+    {
+        *denied = true;
+    }
+
+    stats.observed += 1;
+    if ev.denied() {
+        stats.denied += 1;
+    }
+    const PER_KIND_CAP: usize = 64;
+    let existing = stats
+        .samples
+        .iter()
+        .filter(|s| s.kind_tag() == ev.kind_tag())
+        .count();
+    if existing < PER_KIND_CAP && stats.samples.len() < 256 {
+        stats.samples.push(ev);
     }
 }
