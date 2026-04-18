@@ -142,6 +142,14 @@ jobs:
             echo "::error::block mode did not fail despite deny-all network"
             exit 1
           fi
+          python3 - <<'PY'
+          import json, sys
+          log = json.load(open("/tmp/coronarium-block.log.json"))
+          print(f"observed={log['observed']} denied={log['denied']}")
+          if log['denied'] == 0:
+              print("::error::block mode: no denied events were recorded")
+              sys.exit(1)
+          PY
       - name: Upload audit logs
         if: always()
         uses: actions/upload-artifact@v4

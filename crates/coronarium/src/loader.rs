@@ -126,8 +126,11 @@ impl Supervisor {
     }
 
     pub async fn shutdown(self) -> Result<Stats> {
+        // Give the drain task one wake-up window so it can pull any events
+        // that arrived just before the child exited, then tell it to stop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         self.stop.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(self.stats.lock().await.clone())
     }
 
@@ -206,11 +209,17 @@ fn spawn_ringbuf_drain(
             return;
         };
 
-        while !stop.load(Ordering::SeqCst) {
+        loop {
+            // Drain everything currently in the ring buffer.
             while let Some(item) = ring.next() {
                 let bytes: &[u8] = &item;
                 let mut s = stats.lock().await;
                 ingest(&mut s, bytes);
+            }
+            // Check `stop` *after* draining so a stop signal that races with
+            // a final burst of events doesn't drop them on the floor.
+            if stop.load(Ordering::SeqCst) {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
