@@ -185,6 +185,39 @@ jobs:
               print(json.dumps(log['samples'][:5], indent=2))
               sys.exit(1)
           PY
+      - name: process.deny_exec audit (flags /usr/bin/whoami)
+        env:
+          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          RUST_LOG: info
+        run: |
+          cat > /tmp/exec.yml <<'EOF'
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+          process:
+            deny_exec:
+              - /usr/bin/whoami
+          EOF
+          sudo -E ./bin/coronarium run \
+            --policy /tmp/exec.yml \
+            --log /tmp/coronarium-exec.log.json \
+            -- /bin/sh -c '/usr/bin/whoami >/dev/null'
+          python3 - <<'PY'
+          import json, sys
+          log = json.load(open("/tmp/coronarium-exec.log.json"))
+          hit = any(
+              s.get("kind") == "exec"
+              and s.get("denied") is True
+              and (s.get("filename") == "/usr/bin/whoami" or s.get("argv0") == "/usr/bin/whoami")
+              for s in log["samples"]
+          )
+          if not hit:
+              print("::error::expected /usr/bin/whoami exec to be tagged denied")
+              print(json.dumps([s for s in log['samples'] if s['kind'] == 'exec'], indent=2))
+              sys.exit(1)
+          PY
       - name: Upload audit logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -194,3 +227,4 @@ jobs:
             /tmp/coronarium.log.json
             /tmp/coronarium-block.log.json
             /tmp/coronarium-file.log.json
+            /tmp/coronarium-exec.log.json

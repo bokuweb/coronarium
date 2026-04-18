@@ -15,7 +15,7 @@ use tokio::{process::Command, sync::Mutex};
 use crate::{
     cgroup::Cgroup,
     events::{self, Event},
-    matcher::FileMatcher,
+    matcher::{ExecMatcher, FileMatcher},
     policy::{Mode, Policy},
     resolve::Resolver,
 };
@@ -50,6 +50,19 @@ impl Supervisor {
         let stats = Arc::new(Mutex::new(Stats::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let file_matcher = Arc::new(FileMatcher::from_policy(&policy.file));
+        let exec_matcher = Arc::new(ExecMatcher::from_policy(&policy.process));
+
+        // Loud warning: deny_exec is audit-only for now. Silently ignoring
+        // it in block mode would be a security footgun.
+        if matches!(mode, Mode::Block) && !exec_matcher.is_empty() {
+            log::warn!(
+                "process.deny_exec is currently audit-only — matching exec events \
+                 will be tagged `denied` in the log and coronarium will exit \
+                 non-zero, but the child process is NOT prevented from running. \
+                 Kernel-side exec block requires bpf_override_return and is on \
+                 the roadmap."
+            );
+        }
 
         let cgroup = match Cgroup::create() {
             Ok(c) => Some(c),
@@ -86,10 +99,12 @@ impl Supervisor {
 
         #[cfg(target_os = "linux")]
         if let Some(bpf) = bpf {
-            spawn_ringbuf_drain(bpf, stats, stop, file_matcher);
+            spawn_ringbuf_drain(bpf, stats, stop, file_matcher, exec_matcher);
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = file_matcher;
+        {
+            let _ = (file_matcher, exec_matcher);
+        }
 
         Ok(this)
     }
@@ -199,9 +214,9 @@ fn spawn_ringbuf_drain(
     stats: Arc<Mutex<Stats>>,
     stop: Arc<AtomicBool>,
     file_matcher: Arc<FileMatcher>,
+    exec_matcher: Arc<ExecMatcher>,
 ) {
     tokio::task::spawn(async move {
-        // Take the ring buffer out of the map collection exactly once.
         let ring = {
             let mut guard = bpf.lock().await;
             match guard.take_map("EVENTS") {
@@ -218,7 +233,7 @@ fn spawn_ringbuf_drain(
             while let Some(item) = ring.next() {
                 let bytes: &[u8] = &item;
                 let mut s = stats.lock().await;
-                ingest(&mut s, bytes, &file_matcher);
+                ingest(&mut s, bytes, &file_matcher, &exec_matcher);
             }
             if stop.load(Ordering::SeqCst) {
                 break;
@@ -228,20 +243,34 @@ fn spawn_ringbuf_drain(
     });
 }
 
-pub(crate) fn ingest(stats: &mut Stats, raw: &[u8], file_matcher: &FileMatcher) {
+pub(crate) fn ingest(
+    stats: &mut Stats,
+    raw: &[u8],
+    file_matcher: &FileMatcher,
+    exec_matcher: &ExecMatcher,
+) {
     let Some(mut ev) = events::decode(raw) else {
         stats.lost += 1;
         return;
     };
 
-    // Apply userspace-side file policy here — the kernel program just
-    // ships the filename without a verdict.
-    if let Event::Open {
-        filename, denied, ..
-    } = &mut ev
-        && file_matcher.is_denied(filename)
-    {
-        *denied = true;
+    // Apply userspace-side policy: the kernel ships the filename/argv0 but
+    // not a verdict for file/exec kinds.
+    match &mut ev {
+        Event::Open {
+            filename, denied, ..
+        } if file_matcher.is_denied(filename) => {
+            *denied = true;
+        }
+        Event::Exec {
+            filename,
+            argv0,
+            denied,
+            ..
+        } if exec_matcher.is_denied(filename, argv0) => {
+            *denied = true;
+        }
+        _ => {}
     }
 
     stats.observed += 1;

@@ -219,9 +219,68 @@ Install step outputs:
 A human-readable summary is appended to `$GITHUB_STEP_SUMMARY` when you
 pass `--summary`. Full JSON events go to `--log`.
 
-> `ubuntu-latest` / `ubuntu-24.04-arm` runners have `CAP_BPF` /
-> `CAP_SYS_ADMIN` via `sudo`, which `coronarium run` requires. Container
-> / self-hosted runners need the same privileges.
+### Runner requirements
+
+Coronarium requires:
+
+- **Linux kernel ≥ 5.13** (cgroup v2, ringbuf, `sys_enter_*` tracepoints)
+- **`CAP_BPF` + `CAP_SYS_ADMIN`** — `coronarium run` is invoked via `sudo`
+- **cgroup v2 unified hierarchy** at `/sys/fs/cgroup` (default on Ubuntu ≥ 22.04)
+
+| runner | supported | notes |
+|---|---|---|
+| `ubuntu-latest`, `ubuntu-22.04`, `ubuntu-24.04` | ✅ | canonical target |
+| `ubuntu-24.04-arm` | ✅ | aarch64 assets ship in the same release |
+| container jobs (`container:` key) | ⚠️ | needs `--privileged` and host cgroup mount |
+| self-hosted | ⚠️ | runner user must have passwordless `sudo` and the host kernel must expose tracepoints + bpf |
+| Windows / macOS | ❌ | eBPF is Linux-only; action exits early |
+
+If the BPF programs fail to attach (typically a kernel-config or
+capabilities issue), `coronarium run` logs a warning and falls through to
+**passthrough mode** — the supervised command still runs, but no
+events are captured. Watch for `eBPF attach failed, running in passthrough`
+in the step log.
+
+## Limitations
+
+Honesty about what this does and doesn't do:
+
+- **Network block works at the kernel**: `default: deny` actually makes
+  `connect(2)` return EPERM to the caller, so the supervised process
+  observes `Connection refused`.
+- **File block is audit-only**: `file.deny` tags matching opens as
+  `denied: true` in the JSON log and makes `mode: block` exit non-zero,
+  but the child still reads the file. Real enforcement needs
+  `bpf_override_return` (kernel-config dependent).
+- **Exec block is audit-only** for the same reason. `coronarium run`
+  prints a loud warning when `mode: block` + non-empty
+  `process.deny_exec` is configured.
+- **Hostname resolution is one-shot** at startup. If DNS changes during
+  the run, the map is stale.
+- **Ring-buffer overflow** under event bursts is counted as `lost`; the
+  summary surfaces a warning when `lost > 0`.
+
+## Troubleshooting
+
+**`eBPF attach failed, running in passthrough`**
+: The verifier rejected a program or you don't have `CAP_BPF`. Check
+  that the job runs as root (or has the caps) and the kernel exposes
+  `CONFIG_BPF_SYSCALL=y`. The full verifier log goes to stderr.
+
+**`observed: 0` in the JSON log**
+: Either (a) BPF didn't load (see above), or (b) the child exited so
+  quickly that the ringbuf drain missed events. Try a longer-running
+  command first to isolate the cause.
+
+**`cgroup creation failed (…); network policy will be degraded`**
+: The runner doesn't have cgroup v2 at the expected path. Network
+  policy won't apply; file/exec audit will still work because those
+  are attached globally via tracepoints.
+
+**Child exits 0 but `denied > 0`**
+: Expected in `mode: audit` — events are tagged denied but not
+  enforced. Switch to `mode: block` to make the wrapper exit non-zero
+  (the child itself still runs for file/exec; see Limitations).
 
 ## Modes
 

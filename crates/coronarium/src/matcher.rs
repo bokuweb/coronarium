@@ -5,7 +5,7 @@
 //! in-kernel blew the verifier's complexity budget. We stamp the verdict
 //! here, just before the event is counted.
 
-use crate::policy::{DefaultDecision, FilePolicy};
+use crate::policy::{DefaultDecision, FilePolicy, ProcessPolicy};
 
 pub struct FileMatcher {
     pub default: DefaultDecision,
@@ -37,6 +37,38 @@ impl FileMatcher {
             }
         }
         matches!(self.default, DefaultDecision::Deny)
+    }
+}
+
+/// Matches exec events against `process.deny_exec`. Userspace-only for now
+/// (kernel-side deny would need `bpf_override_return`, which is kernel-config
+/// dependent). A match stamps the event as denied in the audit log; in
+/// `mode: block` the run exits non-zero because `stats.denied > 0`, but the
+/// child process itself is **not** prevented from exec'ing. See README
+/// "Limitations".
+pub struct ExecMatcher {
+    patterns: Vec<String>,
+}
+
+impl ExecMatcher {
+    pub fn from_policy(p: &ProcessPolicy) -> Self {
+        Self {
+            patterns: p.deny_exec.clone(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// Returns true when an exec of `filename` (absolute path from the kernel
+    /// tracepoint) or `argv0` matches any deny pattern. Exact string equality
+    /// with a directory-boundary-aware prefix — same rules as the file
+    /// matcher.
+    pub fn is_denied(&self, filename: &str, argv0: &str) -> bool {
+        self.patterns
+            .iter()
+            .any(|p| prefix_match(filename, p) || prefix_match(argv0, p))
     }
 }
 
@@ -89,5 +121,28 @@ mod tests {
         let fm = m(DefaultDecision::Allow, &["/etc"], &["/etc/shadow"]);
         assert!(fm.is_denied("/etc/shadow"));
         assert!(!fm.is_denied("/etc/hostname"));
+    }
+
+    fn em(patterns: &[&str]) -> ExecMatcher {
+        ExecMatcher {
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn exec_matcher_matches_filename_or_argv0() {
+        let nc = em(&["/usr/bin/nc"]);
+        assert!(nc.is_denied("/usr/bin/nc", "nc"));
+        assert!(nc.is_denied("/usr/bin/nc", ""));
+        // `argv0` alone can match too — shells often launch tools by name.
+        let curl = em(&["curl"]);
+        assert!(curl.is_denied("", "curl"));
+    }
+
+    #[test]
+    fn exec_matcher_ignores_unrelated() {
+        let em = em(&["/usr/bin/nc"]);
+        assert!(!em.is_denied("/usr/bin/ncat", ""));
+        assert!(!em.is_denied("/bin/bash", "bash"));
     }
 }
