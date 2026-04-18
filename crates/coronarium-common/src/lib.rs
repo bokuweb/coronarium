@@ -120,3 +120,14 @@ pub struct Settings {
     pub file_default: u32,
     pub exec_default: u32,
 }
+
+// aya requires its own marker trait `aya::Pod` on map key/value types. Our
+// structs are `#[repr(C)]` POD, so implementing it is safe. We do it here
+// (rather than in the userspace crate) because the orphan rule bans impls
+// for foreign types from downstream crates.
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for Ipv4Key {}
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for Ipv6Key {}
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for Settings {}

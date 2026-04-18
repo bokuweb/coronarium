@@ -141,16 +141,6 @@ impl Supervisor {
     }
 }
 
-// aya requires its own marker trait `aya::Pod` on map key/value types; the
-// trait is unsafe and only implemented for primitives by default. Our shared
-// structs are `#[repr(C)]` POD (already `bytemuck::Pod`), so it is safe.
-#[cfg(target_os = "linux")]
-unsafe impl aya::Pod for coronarium_common::Ipv4Key {}
-#[cfg(target_os = "linux")]
-unsafe impl aya::Pod for coronarium_common::Ipv6Key {}
-#[cfg(target_os = "linux")]
-unsafe impl aya::Pod for coronarium_common::Settings {}
-
 #[cfg(target_os = "linux")]
 async fn load_bpf(
     policy: &Policy,

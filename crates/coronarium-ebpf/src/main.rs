@@ -19,9 +19,11 @@
 #![no_main]
 
 use aya_ebpf::{
-    EbpfContext,
     bindings::BPF_F_NO_PREALLOC,
-    helpers::{bpf_get_current_comm, bpf_probe_read_user_str_bytes},
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_probe_read_user_str_bytes,
+    },
     macros::{cgroup_sock_addr, map, tracepoint},
     maps::{Array, HashMap, RingBuf},
     programs::{SockAddrContext, TracePointContext},
@@ -50,9 +52,9 @@ fn settings() -> Settings {
         .unwrap_or(Settings { mode: 0, net_default: POLICY_ALLOW as u32, file_default: POLICY_ALLOW as u32, exec_default: POLICY_ALLOW as u32 })
 }
 
-fn fill_header(kind: u32, verdict: u32, ctx: &impl EbpfContext) -> EventHeader {
-    let pid_tgid = ctx.pid_tgid();
-    let uid_gid = ctx.uid_gid();
+fn fill_header(kind: u32, verdict: u32) -> EventHeader {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let uid_gid = bpf_get_current_uid_gid();
     let mut comm = [0u8; COMM_LEN];
     if let Ok(c) = bpf_get_current_comm() {
         let len = c.len().min(COMM_LEN);
@@ -86,7 +88,7 @@ fn try_execve(ctx: &TracePointContext) -> Result<(), i64> {
     let argv_ptr: *const *const u8 = unsafe { ctx.read_at::<*const *const u8>(24)? };
 
     let mut ev = ExecEvent {
-        header: fill_header(EVENT_KIND_EXEC, VERDICT_ALLOW, ctx),
+        header: fill_header(EVENT_KIND_EXEC, VERDICT_ALLOW),
         filename: [0; PATH_LEN],
         argv0: [0; ARGV0_LEN],
     };
@@ -121,7 +123,7 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
     let flags: u32 = unsafe { ctx.read_at::<u32>(32).unwrap_or(0) };
 
     let mut ev = OpenEvent {
-        header: fill_header(EVENT_KIND_OPEN, VERDICT_ALLOW, ctx),
+        header: fill_header(EVENT_KIND_OPEN, VERDICT_ALLOW),
         filename: [0; PATH_LEN],
         flags,
         _pad: 0,
@@ -151,8 +153,11 @@ pub fn coronarium_connect4(ctx: SockAddrContext) -> i32 {
     let mut ev = Connect4Event {
         header: fill_header(
             EVENT_KIND_CONNECT4,
-            if verdict == POLICY_DENY { VERDICT_DENY } else { VERDICT_ALLOW },
-            &ctx,
+            if verdict == POLICY_DENY {
+                VERDICT_DENY
+            } else {
+                VERDICT_ALLOW
+            },
         ),
         saddr: 0,
         daddr,
@@ -185,8 +190,11 @@ pub fn coronarium_connect6(ctx: SockAddrContext) -> i32 {
     let ev = Connect6Event {
         header: fill_header(
             EVENT_KIND_CONNECT6,
-            if verdict == POLICY_DENY { VERDICT_DENY } else { VERDICT_ALLOW },
-            &ctx,
+            if verdict == POLICY_DENY {
+                VERDICT_DENY
+            } else {
+                VERDICT_ALLOW
+            },
         ),
         saddr: [0; 16],
         daddr,

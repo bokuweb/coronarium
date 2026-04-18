@@ -13,3 +13,8 @@ ebpf = []
 [dependencies]
 bytemuck = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+
+# `aya` only compiles on Linux. We depend on it unconditionally when on
+# Linux so we can impl its `Pod` marker for our shared types (orphan rule).
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
