@@ -71,7 +71,7 @@ jobs:
       - name: policy dry-run
         run: |
           ./bin/coronarium check-policy -p examples/coronarium.yml
-      - name: audit-mode e2e (permissive policy, echo)
+      - name: audit-mode e2e (permissive policy, echo + curl)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
           RUST_LOG: info
@@ -83,12 +83,28 @@ jobs:
           file:
             default: allow
           EOF
+          # Run with stderr captured so we can assert the BPF programs
+          # actually loaded (no passthrough fallback).
           sudo -E ./bin/coronarium run \
             --policy /tmp/audit.yml \
             --log /tmp/coronarium.log.json \
-            -- /bin/sh -c 'echo hello from coronarium; /usr/bin/env true'
+            -- /bin/sh -c 'echo hello from coronarium; curl -s -o /dev/null -m 5 https://example.com || true' \
+            2> /tmp/coronarium.stderr
+          echo "--- stderr ---"
+          cat /tmp/coronarium.stderr
+          if grep -q "running in passthrough" /tmp/coronarium.stderr; then
+            echo "::error::eBPF attach failed; programs did not load"
+            exit 1
+          fi
           echo "--- audit log ---"
           cat /tmp/coronarium.log.json
+          # Sanity: we expect at least one event (execve / connect) to have
+          # been observed when the programs actually loaded.
+          observed=$(python3 -c 'import json,sys;print(json.load(open("/tmp/coronarium.log.json"))["observed"])')
+          echo "observed events: $observed"
+          if [ "$observed" = "0" ]; then
+            echo "::warning::no events captured — program loaded but never fired"
+          fi
       - name: Upload audit log
         if: always()
         uses: actions/upload-artifact@v4
