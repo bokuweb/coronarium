@@ -1,0 +1,40 @@
+name: consumer-smoke
+
+# Proves the published release is consumable as `bokuweb/coronarium@v0`.
+# Runs after a release is published and on manual dispatch.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  use-as-action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This is the exact pattern third-party consumers will write.
+      - uses: bokuweb/coronarium@v0
+        with:
+          mode: audit
+
+      - name: Run supervised command
+        run: |
+          cat > /tmp/policy.yml <<'EOF'
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+            deny:
+              - /etc/shadow
+          EOF
+          sudo -E "$CORONARIUM_BIN" run \
+            --policy /tmp/policy.yml \
+            --log /tmp/log.json \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            -- /bin/sh -c 'echo "consumer test"; cat /etc/hostname >/dev/null'
+          cat /tmp/log.json | head -40
+          observed=$(python3 -c 'import json;print(json.load(open("/tmp/log.json"))["observed"])')
+          test "$observed" -gt 0
