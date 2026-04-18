@@ -12,6 +12,12 @@ pub const COMM_LEN: usize = 16;
 pub const PATH_LEN: usize = 256;
 pub const ARGV0_LEN: usize = 128;
 
+/// Maximum bytes of a path prefix the kernel will match against. Keep in
+/// sync with eBPF-side stack bounds — longer values hit verifier limits.
+pub const FILE_PREFIX_LEN: usize = 64;
+/// How many prefix entries fit in the FILE_PREFIX array map.
+pub const FILE_PREFIX_ENTRIES: u32 = 256;
+
 pub const EVENT_KIND_EXEC: u32 = 1;
 pub const EVENT_KIND_CONNECT4: u32 = 2;
 pub const EVENT_KIND_CONNECT6: u32 = 3;
@@ -121,6 +127,33 @@ pub struct Settings {
     pub exec_default: u32,
 }
 
+/// One prefix entry for the FILE_PREFIX array: the first `len` bytes of
+/// `bytes` form the prefix to match. `verdict` is [`POLICY_ALLOW`] or
+/// [`POLICY_DENY`]. `active == 0` means the slot is empty (skipped during
+/// matching).
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "user", derive(bytemuck::Pod, bytemuck::Zeroable, Debug))]
+pub struct FilePrefix {
+    pub bytes: [u8; FILE_PREFIX_LEN],
+    pub len: u32,
+    pub verdict: u8,
+    pub active: u8,
+    pub _pad: [u8; 2],
+}
+
+impl FilePrefix {
+    pub const fn empty() -> Self {
+        Self {
+            bytes: [0; FILE_PREFIX_LEN],
+            len: 0,
+            verdict: 0,
+            active: 0,
+            _pad: [0; 2],
+        }
+    }
+}
+
 // aya requires its own marker trait `aya::Pod` on map key/value types. Our
 // structs are `#[repr(C)]` POD, so implementing it is safe. We do it here
 // (rather than in the userspace crate) because the orphan rule bans impls
@@ -131,3 +164,5 @@ unsafe impl aya::Pod for Ipv4Key {}
 unsafe impl aya::Pod for Ipv6Key {}
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for Settings {}
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for FilePrefix {}

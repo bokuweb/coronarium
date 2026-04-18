@@ -11,10 +11,14 @@ pub enum Mode {
     Block,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultDecision {
     Allow,
+    /// Implicit default: if `default:` is omitted, everything not on the
+    /// allow list is denied. Combine with `--mode audit` the first time
+    /// you write a policy to see what *would* break before enforcing.
+    #[default]
     Deny,
 }
 
@@ -30,24 +34,14 @@ pub struct Policy {
     pub process: ProcessPolicy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkPolicy {
-    #[serde(default = "allow")]
+    #[serde(default)]
     pub default: DefaultDecision,
     #[serde(default)]
     pub allow: Vec<NetRule>,
     #[serde(default)]
     pub deny: Vec<NetRule>,
-}
-
-impl Default for NetworkPolicy {
-    fn default() -> Self {
-        Self {
-            default: DefaultDecision::Allow,
-            allow: vec![],
-            deny: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +52,9 @@ pub struct NetRule {
     pub ports: Vec<u16>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FilePolicy {
-    #[serde(default = "allow")]
+    #[serde(default)]
     pub default: DefaultDecision,
     #[serde(default)]
     pub allow: Vec<String>,
@@ -68,24 +62,10 @@ pub struct FilePolicy {
     pub deny: Vec<String>,
 }
 
-impl Default for FilePolicy {
-    fn default() -> Self {
-        Self {
-            default: DefaultDecision::Allow,
-            allow: vec![],
-            deny: vec![],
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessPolicy {
     #[serde(default)]
     pub deny_exec: Vec<String>,
-}
-
-fn allow() -> DefaultDecision {
-    DefaultDecision::Allow
 }
 
 impl Policy {
@@ -100,32 +80,38 @@ impl Policy {
         Ok(policy)
     }
 
+    /// Policy used when no `--policy` argument is passed: audit everything,
+    /// deny nothing. Handy for "what would this job do?" dry-runs.
     pub fn permissive_audit() -> Self {
         Self {
             mode: Mode::Audit,
-            network: NetworkPolicy::default(),
-            file: FilePolicy::default(),
+            network: NetworkPolicy {
+                default: DefaultDecision::Allow,
+                ..Default::default()
+            },
+            file: FilePolicy {
+                default: DefaultDecision::Allow,
+                ..Default::default()
+            },
             process: ProcessPolicy::default(),
         }
     }
 
-    /// Returns human-readable warnings about likely-misconfigured shapes.
-    /// The most common one: writing an `allow:` list but leaving
-    /// `default: allow`, which makes the allow list a no-op.
+    /// Spot obviously-redundant policy shapes. Kept small on purpose —
+    /// prefer clear docs over implicit behaviour.
     pub fn lint(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.network.allow.is_empty() && matches!(self.network.default, DefaultDecision::Allow)
-        {
+        if !self.network.deny.is_empty() && matches!(self.network.default, DefaultDecision::Deny) {
             out.push(
-                "network.allow is non-empty but network.default is 'allow' — \
-                 the allow list has no effect. Did you mean `network.default: deny`?"
+                "network.deny is non-empty but network.default is already 'deny' — \
+                 the deny list is redundant."
                     .to_string(),
             );
         }
         if !self.file.deny.is_empty() && matches!(self.file.default, DefaultDecision::Deny) {
             out.push(
                 "file.deny is non-empty but file.default is already 'deny' — \
-                 the deny list is redundant. Did you mean `file.default: allow`?"
+                 the deny list is redundant."
                     .to_string(),
             );
         }

@@ -114,7 +114,7 @@ YAML or JSON. Fields are optional; missing sections default to
 mode: block                    # audit | block
 
 network:
-  default: deny                # allow | deny
+  # default is `deny`, so only listed destinations can be reached.
   allow:
     - target: api.github.com   # hostname resolved at startup
       ports: [443]
@@ -122,11 +122,10 @@ network:
       ports: [22, 443]
     - target: 2606:4700::/48   # IPv6 CIDRs work too
       ports: [443]
-  deny:
-    - target: 169.254.169.254  # metadata service
-      ports: [80, 443]
 
 file:
+  # Most builds open hundreds of files; flip to allow-by-default and
+  # use `deny` for the handful of things you want to protect.
   default: allow
   deny:
     - /etc/shadow
@@ -145,24 +144,20 @@ Rule resolution:
 - `deny` overrides `allow` when the same (addr, port) appears on both lists
 - `default` decides unmatched traffic
 
-### ⚠️ `allow` only works with `default: deny`
+### Defaults
 
-Writing an `allow:` list **does not** turn the section into an allow-list —
-it only marks those endpoints as allowed. Everything else keeps following
-`default`. To get "only the listed destinations are allowed, everything else
-is blocked":
+**Every section defaults to `deny`.** If you omit `default:`, anything not
+listed under `allow:` is denied. `file.default` likewise defaults to `deny`
+— but because most builds touch hundreds of files, you almost certainly
+want `file.default: allow` explicitly and use `file.deny:` for secrets.
 
-```yaml
-network:
-  default: deny              # ← required!
-  allow:
-    - target: api.github.com
-      ports: [443]
-```
+First-time setup pattern:
 
-Without `default: deny`, the `allow:` list is a no-op. `coronarium
-check-policy` and `coronarium run` both print a warning when they detect
-this shape.
+1. Start with `mode: audit` (or pass `--mode audit` on the CLI). Nothing is
+   blocked; everything is logged.
+2. Run your real job once and inspect the JSON log / step summary.
+3. Add the destinations / paths you actually need to `allow:`.
+4. Flip to `mode: block` once the log is clean.
 
 The full parsed shape is what `coronarium check-policy` prints.
 

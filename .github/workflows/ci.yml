@@ -118,15 +118,17 @@ jobs:
               if "exec" in missing:
                   sys.exit(1)
           PY
-      - name: block-mode e2e (curl should fail when default=deny)
+      - name: block-mode e2e (implicit default=deny blocks curl)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
           RUST_LOG: info
         run: |
+          # No `default:` written — implicit deny. This is the whole point
+          # of the sensible-default change: if you forgot to configure the
+          # network section, the job doesn't silently get full egress.
           cat > /tmp/block.yml <<'EOF'
           mode: block
-          network:
-            default: deny
+          network: {}
           EOF
           set +e
           sudo -E ./bin/coronarium run \
@@ -150,6 +152,39 @@ jobs:
               print("::error::block mode: no denied events were recorded")
               sys.exit(1)
           PY
+      - name: file-prefix audit (flags /etc/shadow reads as denied)
+        env:
+          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          RUST_LOG: info
+        run: |
+          cat > /tmp/file.yml <<'EOF'
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+            deny:
+              - /etc/shadow
+          EOF
+          sudo -E ./bin/coronarium run \
+            --policy /tmp/file.yml \
+            --log /tmp/coronarium-file.log.json \
+            -- /bin/sh -c 'cat /etc/shadow >/dev/null 2>&1 || true; cat /etc/hostname >/dev/null'
+          python3 - <<'PY'
+          import json, sys
+          log = json.load(open("/tmp/coronarium-file.log.json"))
+          shadow_denied = any(
+              s.get("kind") == "open"
+              and s.get("denied") is True
+              and s.get("filename", "").startswith("/etc/shadow")
+              for s in log["samples"]
+          )
+          print(f"denied={log['denied']} observed={log['observed']}")
+          if not shadow_denied:
+              print("::error::expected /etc/shadow open to be logged as denied")
+              print(json.dumps(log['samples'][:5], indent=2))
+              sys.exit(1)
+          PY
       - name: Upload audit logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -158,3 +193,4 @@ jobs:
           path: |
             /tmp/coronarium.log.json
             /tmp/coronarium-block.log.json
+            /tmp/coronarium-file.log.json
