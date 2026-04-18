@@ -160,48 +160,46 @@ pub fn coronarium_openat(ctx: TracePointContext) -> u32 {
     0
 }
 
-/// Linear scan of the FILE_PREFIX map. Each slot is an optional prefix; we
-/// return the verdict of the first prefix that matches (or file_default when
-/// none match). Kept small (`FILE_PREFIX_ENTRIES` = 256) to stay under the
-/// verifier's instruction-count limit once inlined.
+/// Linear scan of the FILE_PREFIX map. Returns the first matching slot's
+/// verdict, else `settings().file_default`. Straight-line control flow
+/// (no `continue`, bounded inner loop) keeps the verifier happy after
+/// bpf-linker unrolls the scan.
 #[inline(always)]
 fn lookup_file(path: &[u8; 256], path_len: usize) -> u8 {
     let mut i: u32 = 0;
+    let mut hit: u8 = 0; // 0 = no match yet
     while i < FILE_PREFIX_ENTRIES {
-        let slot = match unsafe { FILE_PREFIX.get(i) } {
-            Some(s) => s,
-            None => {
-                i += 1;
-                continue;
+        if hit == 0 {
+            if let Some(slot) = unsafe { FILE_PREFIX.get(i) } {
+                if slot.active != 0 && prefix_matches(path, path_len, slot) {
+                    hit = slot.verdict;
+                }
             }
-        };
-        if slot.active != 0 && prefix_matches(path, path_len, slot) {
-            return slot.verdict;
         }
         i += 1;
     }
-    settings().file_default as u8
+    if hit != 0 {
+        hit
+    } else {
+        settings().file_default as u8
+    }
 }
 
 #[inline(always)]
 fn prefix_matches(path: &[u8; 256], path_len: usize, slot: &FilePrefix) -> bool {
-    // Bound the loop by the constant FILE_PREFIX_LEN so the verifier can
-    // prove termination. We also clip against slot.len and path_len.
     let needle_len = slot.len as usize;
     if needle_len == 0 || needle_len > FILE_PREFIX_LEN || needle_len > path_len {
         return false;
     }
     let mut j = 0usize;
+    let mut mismatch = false;
     while j < FILE_PREFIX_LEN {
-        if j >= needle_len {
-            return true;
-        }
-        if path[j] != slot.bytes[j] {
-            return false;
+        if j < needle_len && path[j] != slot.bytes[j] {
+            mismatch = true;
         }
         j += 1;
     }
-    true
+    !mismatch
 }
 
 // ---------------------------------------------------------------------------

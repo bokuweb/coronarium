@@ -15,8 +15,10 @@ pub const ARGV0_LEN: usize = 128;
 /// Maximum bytes of a path prefix the kernel will match against. Keep in
 /// sync with eBPF-side stack bounds — longer values hit verifier limits.
 pub const FILE_PREFIX_LEN: usize = 64;
-/// How many prefix entries fit in the FILE_PREFIX array map.
-pub const FILE_PREFIX_ENTRIES: u32 = 256;
+/// How many prefix entries fit in the FILE_PREFIX array map. Deliberately
+/// small: lookup is an unrolled linear scan and blowing past ~32 entries
+/// pushes the tracepoint program over the kernel's complexity budget.
+pub const FILE_PREFIX_ENTRIES: u32 = 32;
 
 pub const EVENT_KIND_EXEC: u32 = 1;
 pub const EVENT_KIND_CONNECT4: u32 = 2;
