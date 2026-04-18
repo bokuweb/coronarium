@@ -42,9 +42,9 @@ pub enum Event {
 impl Event {
     pub fn denied(&self) -> bool {
         match self {
-            Event::Exec { denied, .. } | Event::Connect { denied, .. } | Event::Open { denied, .. } => {
-                *denied
-            }
+            Event::Exec { denied, .. }
+            | Event::Connect { denied, .. }
+            | Event::Open { denied, .. } => *denied,
         }
     }
 }

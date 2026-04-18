@@ -94,10 +94,7 @@ impl Supervisor {
             .split_first()
             .context("internal error: empty command after clap parse")?;
 
-        let cgroup_path = self
-            .cgroup
-            .as_ref()
-            .map(|c| c.path.clone());
+        let cgroup_path = self.cgroup.as_ref().map(|c| c.path.clone());
 
         let mut cmd = Command::new(program);
         cmd.args(rest);

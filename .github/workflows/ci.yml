@@ -25,7 +25,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-          targets: bpfel-unknown-none
       - name: Build eBPF object
         working-directory: crates/coronarium-ebpf
         run: |

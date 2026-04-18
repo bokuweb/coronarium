@@ -75,7 +75,9 @@ impl Drop for Cgroup {
 #[cfg(not(target_os = "linux"))]
 impl Cgroup {
     pub fn create() -> Result<Self> {
-        Ok(Self { path: PathBuf::from("/tmp/coronarium-noop") })
+        Ok(Self {
+            path: PathBuf::from("/tmp/coronarium-noop"),
+        })
     }
 
     pub fn add_pid(&self, _pid: u32) -> Result<()> {

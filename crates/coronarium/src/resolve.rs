@@ -102,7 +102,9 @@ fn expand_v4(net: Ipv4Net) -> Vec<IpAddr> {
 fn expand_v6(net: Ipv6Net) -> Vec<IpAddr> {
     let prefix = net.prefix_len();
     if prefix < 112 {
-        log::warn!("IPv6 CIDR {net} is wider than /112; only the first {MAX_CIDR_EXPANSION} addresses will be enforced");
+        log::warn!(
+            "IPv6 CIDR {net} is wider than /112; only the first {MAX_CIDR_EXPANSION} addresses will be enforced"
+        );
     }
     net.hosts()
         .take(MAX_CIDR_EXPANSION)

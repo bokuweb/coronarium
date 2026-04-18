@@ -3,17 +3,12 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
+    #[default]
     Audit,
     Block,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Audit
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +42,11 @@ pub struct NetworkPolicy {
 
 impl Default for NetworkPolicy {
     fn default() -> Self {
-        Self { default: DefaultDecision::Allow, allow: vec![], deny: vec![] }
+        Self {
+            default: DefaultDecision::Allow,
+            allow: vec![],
+            deny: vec![],
+        }
     }
 }
 
@@ -71,7 +70,11 @@ pub struct FilePolicy {
 
 impl Default for FilePolicy {
     fn default() -> Self {
-        Self { default: DefaultDecision::Allow, allow: vec![], deny: vec![] }
+        Self {
+            default: DefaultDecision::Allow,
+            allow: vec![],
+            deny: vec![],
+        }
     }
 }
 

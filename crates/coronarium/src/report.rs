@@ -19,7 +19,10 @@ pub fn write(args: &RunArgs, stats: &Stats) -> Result<()> {
     if args.log == "-" {
         writeln!(io::stdout(), "{serialized}")?;
     } else {
-        let mut f = OpenOptions::new().create(true).append(true).open(&args.log)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&args.log)?;
         writeln!(f, "{serialized}")?;
     }
 

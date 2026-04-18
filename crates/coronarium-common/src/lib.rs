@@ -104,7 +104,13 @@ pub const POLICY_DENY: u8 = 2;
 #[derive(Copy, Clone)]
 #[cfg_attr(
     feature = "user",
-    derive(bytemuck::Pod, bytemuck::Zeroable, Debug, serde::Serialize, serde::Deserialize)
+    derive(
+        bytemuck::Pod,
+        bytemuck::Zeroable,
+        Debug,
+        serde::Serialize,
+        serde::Deserialize
+    )
 )]
 pub struct Settings {
     /// 0 = audit (log only), 1 = block.
