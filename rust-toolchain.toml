@@ -1,0 +1,5 @@
+[toolchain]
+# Stable for the userspace workspace; the eBPF crate pins its own nightly via
+# `cargo +nightly build` in the xtask (nightly is needed for `-Z build-std`).
+channel = "stable"
+components = ["rustfmt", "clippy"]

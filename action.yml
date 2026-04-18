@@ -1,0 +1,57 @@
+name: "coronarium"
+description: "eBPF-based network/file/exec audit & block for GitHub Actions"
+author: "bokuweb"
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  policy:
+    description: "Path to the policy file (YAML or JSON)."
+    required: false
+    default: ".github/coronarium.yml"
+  mode:
+    description: "audit | block. Overrides `mode:` in the policy file."
+    required: false
+    default: "audit"
+  version:
+    description: "Coronarium release to install (tag name)."
+    required: false
+    default: "latest"
+  log:
+    description: "Where to write the JSON audit log. '-' for stdout."
+    required: false
+    default: "coronarium.log.json"
+
+runs:
+  using: composite
+  steps:
+    - name: Install coronarium
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" != "Linux" ]]; then
+          echo "coronarium only supports Linux runners (got ${RUNNER_OS})" >&2
+          exit 1
+        fi
+        tag="${{ inputs.version }}"
+        if [[ "$tag" == "latest" ]]; then
+          tag=$(curl -fsSL https://api.github.com/repos/bokuweb/coronarium/releases/latest | jq -r .tag_name)
+        fi
+        arch=$(uname -m)
+        url="https://github.com/bokuweb/coronarium/releases/download/${tag}/coronarium-${arch}-unknown-linux-musl.tar.gz"
+        curl -fsSL "$url" | sudo tar -xz -C /usr/local/bin
+        sudo chmod +x /usr/local/bin/coronarium /usr/local/bin/coronarium.bpf.o || true
+        echo "CORONARIUM_BPF_OBJ=/usr/local/bin/coronarium.bpf.o" >> "$GITHUB_ENV"
+
+    - name: Start coronarium daemon
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo -E coronarium run \
+          --policy "${{ inputs.policy }}" \
+          --mode "${{ inputs.mode }}" \
+          --log "${{ inputs.log }}" \
+          --summary "$GITHUB_STEP_SUMMARY" \
+          -- sleep infinity &
+        echo "CORONARIUM_PID=$!" >> "$GITHUB_ENV"

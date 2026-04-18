@@ -1,0 +1,15 @@
+[package]
+name = "coronarium-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["user"]
+# `user` pulls in bytemuck / serde. `ebpf` keeps the crate no_std.
+user = ["dep:bytemuck", "dep:serde"]
+ebpf = []
+
+[dependencies]
+bytemuck = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }

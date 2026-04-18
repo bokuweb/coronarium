@@ -1,0 +1,22 @@
+# Example policy. Copy to .github/coronarium.yml in your repo.
+mode: audit
+
+network:
+  default: deny
+  allow:
+    - target: api.github.com
+      ports: [443]
+    - target: objects.githubusercontent.com
+      ports: [443]
+    - target: 140.82.112.0/20
+      ports: [22, 443]
+
+file:
+  default: allow
+  deny:
+    - /etc/shadow
+    - /root/.ssh
+
+process:
+  deny_exec:
+    - /usr/bin/nc

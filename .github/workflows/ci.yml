@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  userspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --release
+      - run: cargo test --workspace
+
+  ebpf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: bpfel-unknown-none
+      - name: Build eBPF object
+        working-directory: crates/coronarium-ebpf
+        run: |
+          cargo build --release --target bpfel-unknown-none -Z build-std=core
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coronarium-bpf
+          path: crates/coronarium-ebpf/target/bpfel-unknown-none/release/coronarium
