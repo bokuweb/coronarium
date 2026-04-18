@@ -17,6 +17,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace --release
       - run: cargo test --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coronarium-bin
+          path: target/release/coronarium
 
   ebpf:
     runs-on: ubuntu-latest
@@ -41,3 +45,53 @@ jobs:
         with:
           name: coronarium-bpf
           path: crates/coronarium-ebpf/target/bpfel-unknown-none/release/coronarium
+
+  smoke:
+    needs: [userspace, ebpf]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coronarium-bin
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: coronarium-bpf
+          path: bpf
+      - name: Inspect kernel / bpf capabilities
+        run: |
+          uname -a
+          mount | grep cgroup || true
+          ls -la /sys/fs/cgroup | head -20
+      - name: Prepare binary
+        run: |
+          chmod +x bin/coronarium
+          ls -la bpf
+      - name: policy dry-run
+        run: |
+          ./bin/coronarium check-policy -p examples/coronarium.yml
+      - name: audit-mode e2e (permissive policy, echo)
+        env:
+          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          RUST_LOG: info
+        run: |
+          cat > /tmp/audit.yml <<'EOF'
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+          EOF
+          sudo -E ./bin/coronarium run \
+            --policy /tmp/audit.yml \
+            --log /tmp/coronarium.log.json \
+            -- /bin/sh -c 'echo hello from coronarium; /usr/bin/env true'
+          echo "--- audit log ---"
+          cat /tmp/coronarium.log.json
+      - name: Upload audit log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-audit-log
+          path: /tmp/coronarium.log.json
