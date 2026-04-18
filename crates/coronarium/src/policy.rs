@@ -108,4 +108,27 @@ impl Policy {
             process: ProcessPolicy::default(),
         }
     }
+
+    /// Returns human-readable warnings about likely-misconfigured shapes.
+    /// The most common one: writing an `allow:` list but leaving
+    /// `default: allow`, which makes the allow list a no-op.
+    pub fn lint(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.network.allow.is_empty() && matches!(self.network.default, DefaultDecision::Allow)
+        {
+            out.push(
+                "network.allow is non-empty but network.default is 'allow' — \
+                 the allow list has no effect. Did you mean `network.default: deny`?"
+                    .to_string(),
+            );
+        }
+        if !self.file.deny.is_empty() && matches!(self.file.default, DefaultDecision::Deny) {
+            out.push(
+                "file.deny is non-empty but file.default is already 'deny' — \
+                 the deny list is redundant. Did you mean `file.default: allow`?"
+                    .to_string(),
+            );
+        }
+        out
+    }
 }

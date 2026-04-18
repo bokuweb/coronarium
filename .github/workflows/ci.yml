@@ -71,7 +71,7 @@ jobs:
       - name: policy dry-run
         run: |
           ./bin/coronarium check-policy -p examples/coronarium.yml
-      - name: audit-mode e2e (permissive policy, echo + curl)
+      - name: audit-mode e2e (captures exec/open/connect)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
           RUST_LOG: info
@@ -100,14 +100,53 @@ jobs:
           cat /tmp/coronarium.log.json
           # Sanity: we expect at least one event (execve / connect) to have
           # been observed when the programs actually loaded.
-          observed=$(python3 -c 'import json,sys;print(json.load(open("/tmp/coronarium.log.json"))["observed"])')
-          echo "observed events: $observed"
-          if [ "$observed" = "0" ]; then
-            echo "::warning::no events captured — program loaded but never fired"
+          python3 - <<'PY'
+          import json, sys
+          log = json.load(open("/tmp/coronarium.log.json"))
+          kinds = {}
+          for s in log.get("samples", []):
+              kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
+          print(f"observed={log['observed']} denied={log['denied']} lost={log['lost']}")
+          print(f"sample kinds: {kinds}")
+          missing = []
+          for k in ("exec", "open", "connect"):
+              if kinds.get(k, 0) == 0:
+                  missing.append(k)
+          if missing:
+              print(f"::warning::no samples for: {missing}")
+              # Only fail hard on exec (guaranteed to fire for /bin/sh).
+              if "exec" in missing:
+                  sys.exit(1)
+          PY
+      - name: block-mode e2e (curl should fail when default=deny)
+        env:
+          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          RUST_LOG: info
+        run: |
+          cat > /tmp/block.yml <<'EOF'
+          mode: block
+          network:
+            default: deny
+          EOF
+          set +e
+          sudo -E ./bin/coronarium run \
+            --policy /tmp/block.yml \
+            --log /tmp/coronarium-block.log.json \
+            -- /bin/sh -c 'curl -s -o /dev/null -m 5 http://example.com'
+          rc=$?
+          set -e
+          echo "coronarium exit=$rc"
+          cat /tmp/coronarium-block.log.json
+          # Expect coronarium to exit non-zero because a denied connect happened.
+          if [ "$rc" = "0" ]; then
+            echo "::error::block mode did not fail despite deny-all network"
+            exit 1
           fi
-      - name: Upload audit log
+      - name: Upload audit logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-audit-log
-          path: /tmp/coronarium.log.json
+          path: |
+            /tmp/coronarium.log.json
+            /tmp/coronarium-block.log.json

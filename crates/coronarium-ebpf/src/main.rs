@@ -24,7 +24,10 @@
 
 use aya_ebpf::{
     bindings::BPF_F_NO_PREALLOC,
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_probe_read_user_str_bytes,
+    },
     macros::{cgroup_sock_addr, map, tracepoint},
     maps::{Array, HashMap, RingBuf},
     programs::{SockAddrContext, TracePointContext},
@@ -87,13 +90,23 @@ fn make_header(kind: u32, verdict: u32) -> EventHeader {
 // ---------------------------------------------------------------------------
 
 #[tracepoint]
-pub fn coronarium_execve(_ctx: TracePointContext) -> u32 {
+pub fn coronarium_execve(ctx: TracePointContext) -> u32 {
+    // struct trace_event_raw_sys_enter { u64 unused; u64 id; u64 args[6]; }
+    // filename pointer = args[0] at offset 16.
+    let filename_ptr: *const u8 = match unsafe { ctx.read_at::<*const u8>(16) } {
+        Ok(p) => p,
+        Err(_) => core::ptr::null(),
+    };
+
     if let Some(mut entry) = EVENTS.reserve::<ExecEvent>(0) {
         let ptr = entry.as_mut_ptr();
         unsafe {
-            // Zero the whole record first (the ringbuf gives us uninit memory).
             core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<ExecEvent>());
             (*ptr).header = make_header(EVENT_KIND_EXEC, VERDICT_ALLOW);
+            if !filename_ptr.is_null() {
+                let buf: &mut [u8] = &mut (*ptr).filename;
+                let _ = bpf_probe_read_user_str_bytes(filename_ptr, buf);
+            }
         }
         entry.submit(0);
     }
@@ -105,12 +118,24 @@ pub fn coronarium_execve(_ctx: TracePointContext) -> u32 {
 // ---------------------------------------------------------------------------
 
 #[tracepoint]
-pub fn coronarium_openat(_ctx: TracePointContext) -> u32 {
+pub fn coronarium_openat(ctx: TracePointContext) -> u32 {
+    // args[0] = dfd (i32 padded to u64), args[1] = filename, args[2] = flags
+    let filename_ptr: *const u8 = match unsafe { ctx.read_at::<*const u8>(24) } {
+        Ok(p) => p,
+        Err(_) => core::ptr::null(),
+    };
+    let flags: u32 = unsafe { ctx.read_at::<u32>(32).unwrap_or(0) };
+
     if let Some(mut entry) = EVENTS.reserve::<OpenEvent>(0) {
         let ptr = entry.as_mut_ptr();
         unsafe {
             core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<OpenEvent>());
             (*ptr).header = make_header(EVENT_KIND_OPEN, VERDICT_ALLOW);
+            (*ptr).flags = flags;
+            if !filename_ptr.is_null() {
+                let buf: &mut [u8] = &mut (*ptr).filename;
+                let _ = bpf_probe_read_user_str_bytes(filename_ptr, buf);
+            }
         }
         entry.submit(0);
     }

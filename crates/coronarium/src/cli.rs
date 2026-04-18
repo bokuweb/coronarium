@@ -63,6 +63,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::CheckPolicy { policy } => {
             let p = policy::Policy::from_file(&policy)
                 .with_context(|| format!("loading {}", policy.display()))?;
+            for w in p.lint() {
+                eprintln!("warning: {w}");
+            }
             println!("{}", serde_json::to_string_pretty(&p)?);
             Ok(())
         }
@@ -80,6 +83,9 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         Some(Mode::Block) => policy::Mode::Block,
         None => policy.mode,
     };
+    for w in policy.lint() {
+        log::warn!("{w}");
+    }
     log::info!(
         "starting coronarium (mode={:?}, command={:?})",
         mode,

@@ -145,6 +145,25 @@ Rule resolution:
 - `deny` overrides `allow` when the same (addr, port) appears on both lists
 - `default` decides unmatched traffic
 
+### ⚠️ `allow` only works with `default: deny`
+
+Writing an `allow:` list **does not** turn the section into an allow-list —
+it only marks those endpoints as allowed. Everything else keeps following
+`default`. To get "only the listed destinations are allowed, everything else
+is blocked":
+
+```yaml
+network:
+  default: deny              # ← required!
+  allow:
+    - target: api.github.com
+      ports: [443]
+```
+
+Without `default: deny`, the `allow:` list is a no-op. `coronarium
+check-policy` and `coronarium run` both print a warning when they detect
+this shape.
+
 The full parsed shape is what `coronarium check-policy` prints.
 
 ## GitHub Actions

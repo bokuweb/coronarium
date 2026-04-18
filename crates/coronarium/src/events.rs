@@ -47,6 +47,15 @@ impl Event {
             | Event::Open { denied, .. } => *denied,
         }
     }
+
+    /// Compact discriminant used to bucket events by kind for sampling.
+    pub fn kind_tag(&self) -> u8 {
+        match self {
+            Event::Exec { .. } => 0,
+            Event::Connect { .. } => 1,
+            Event::Open { .. } => 2,
+        }
+    }
 }
 
 /// Decode a ring-buffer frame. Returns `None` if the buffer is too short or

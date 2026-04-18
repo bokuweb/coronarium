@@ -224,7 +224,15 @@ pub(crate) fn ingest(stats: &mut Stats, raw: &[u8]) {
             if ev.denied() {
                 stats.denied += 1;
             }
-            if stats.samples.len() < 256 {
+            // Per-kind cap so a flood of (say) openat events doesn't crowd out
+            // the first exec / connect we see in the JSON sample.
+            const PER_KIND_CAP: usize = 64;
+            let existing = stats
+                .samples
+                .iter()
+                .filter(|s| s.kind_tag() == ev.kind_tag())
+                .count();
+            if existing < PER_KIND_CAP && stats.samples.len() < 256 {
                 stats.samples.push(ev);
             }
         }
