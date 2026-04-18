@@ -44,6 +44,7 @@ impl Cgroup {
     }
 
     /// Add a pid to `cgroup.procs`. Writing a single pid is atomic.
+    #[allow(dead_code)] // currently enrolled via pre_exec; kept for future use
     pub fn add_pid(&self, pid: u32) -> Result<()> {
         use std::io::Write as _;
 

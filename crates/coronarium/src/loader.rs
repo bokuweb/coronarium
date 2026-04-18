@@ -40,6 +40,7 @@ pub struct Supervisor {
     // On Linux we keep the loaded BPF object alive so maps + links persist
     // for the lifetime of the supervisor.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     bpf: Option<Arc<Mutex<aya::Ebpf>>>,
 }
 
