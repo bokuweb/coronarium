@@ -219,6 +219,42 @@ Install step outputs:
 A human-readable summary is appended to `$GITHUB_STEP_SUMMARY` when you
 pass `--summary`. Full JSON events go to `--log`.
 
+### Posting the report as a PR comment
+
+The companion sub-action `bokuweb/coronarium/comment@v0` reads the JSON
+log and upserts a single pull-request comment (keyed by an HTML marker,
+so re-runs update the existing comment instead of appending):
+
+```yaml
+- uses: actions/checkout@v4
+- uses: bokuweb/coronarium@v0
+- run: |
+    sudo -E "$CORONARIUM_BIN" run \
+      --policy .github/coronarium.yml \
+      --log coronarium.log.json \
+      -- cargo test
+
+# Posts/updates a comment on the PR with observed/denied counts,
+# breakdown by kind, and the first 10 denied samples.
+- uses: bokuweb/coronarium/comment@v0
+  if: github.event_name == 'pull_request'
+  with:
+    log: coronarium.log.json
+    fail-on-denied: "true"   # optional: make this step fail if denied>0
+```
+
+Comment step inputs:
+
+| input | default | description |
+|---|---|---|
+| `log` | `coronarium.log.json` | path to the JSON log written by `coronarium run` |
+| `marker` | `<!-- coronarium-report -->` | HTML marker used for upsert; change only if you post multiple reports |
+| `fail-on-denied` | `false` | if `true`, exit non-zero after posting when `denied > 0` |
+| `title` | `coronarium report` | heading shown at the top of the comment |
+
+The step needs `pull-requests: write` in `permissions:` (or the default
+`GITHUB_TOKEN` with that scope).
+
 ### Runner requirements
 
 Coronarium requires:

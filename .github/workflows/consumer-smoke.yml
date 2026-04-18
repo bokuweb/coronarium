@@ -1,12 +1,18 @@
 name: consumer-smoke
 
 # Proves the published release is consumable as `bokuweb/coronarium@v0`.
-# Runs after a release is published and on manual dispatch.
+# Runs after a release is published, on manual dispatch, and on PRs
+# (so we exercise the PR-comment sub-action end-to-end).
 
 on:
   workflow_dispatch:
+  pull_request:
   release:
     types: [published]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   use-as-action:
@@ -14,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # This is the exact pattern third-party consumers will write.
+      # The exact pattern third-party consumers will write.
       - uses: bokuweb/coronarium@v0
         with:
           mode: audit
@@ -32,9 +38,28 @@ jobs:
           EOF
           sudo -E "$CORONARIUM_BIN" run \
             --policy /tmp/policy.yml \
-            --log /tmp/log.json \
+            --log coronarium.log.json \
             --summary "$GITHUB_STEP_SUMMARY" \
-            -- /bin/sh -c 'echo "consumer test"; cat /etc/hostname >/dev/null'
-          cat /tmp/log.json | head -40
-          observed=$(python3 -c 'import json;print(json.load(open("/tmp/log.json"))["observed"])')
+            -- /bin/sh -c 'cat /etc/shadow >/dev/null 2>&1 || true; cat /etc/hostname >/dev/null'
+          cat coronarium.log.json | head -60
+          observed=$(python3 -c 'import json;print(json.load(open("coronarium.log.json"))["observed"])')
           test "$observed" -gt 0
+
+      # Only meaningful on pull_request events — on release/dispatch this
+      # step no-ops (the sub-action bails early).
+      - uses: bokuweb/coronarium/comment@v0
+        if: github.event_name == 'pull_request'
+        with:
+          log: coronarium.log.json
+
+      - name: Verify PR comment was posted
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr="${{ github.event.pull_request.number }}"
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --paginate \
+            --jq '.[] | .body' | grep -q "coronarium-report" \
+            || { echo "::error::comment not found on PR"; exit 1; }
+          echo "✓ coronarium-report comment is on PR #${pr}"

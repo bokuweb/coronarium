@@ -118,40 +118,90 @@ jobs:
               if "exec" in missing:
                   sys.exit(1)
           PY
-      - name: block-mode e2e (implicit default=deny blocks curl)
+      - name: block-mode e2e (kernel actually denies egress)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
           RUST_LOG: info
         run: |
-          # No `default:` written — implicit deny. This is the whole point
-          # of the sensible-default change: if you forgot to configure the
-          # network section, the job doesn't silently get full egress.
+          # No `default:` — implicit deny. Forgotten network sections
+          # must fail closed; the whole point of the sensible default.
           cat > /tmp/block.yml <<'EOF'
           mode: block
           network: {}
           EOF
+
+          # Bypass coronarium's block-mode exit logic by wrapping the curl
+          # in a shell that captures its *own* exit code. That way we can
+          # distinguish "coronarium exited 1 because it counted denies"
+          # (weak evidence) from "curl itself got EPERM from the kernel"
+          # (real evidence of enforcement).
           set +e
           sudo -E ./bin/coronarium run \
             --policy /tmp/block.yml \
             --log /tmp/coronarium-block.log.json \
-            -- /bin/sh -c 'curl -s -o /dev/null -m 5 http://example.com'
-          rc=$?
+            -- /bin/sh -c '
+              curl -sS -o /dev/null -m 5 http://93.184.216.34 2> /tmp/curl.stderr
+              echo "curl_rc=$?" > /tmp/child.result
+            '
+          coro_rc=$?
           set -e
-          echo "coronarium exit=$rc"
+
+          echo "--- coronarium rc=${coro_rc} ---"
+          echo "--- child result ---"
+          cat /tmp/child.result
+          echo "--- curl stderr ---"
+          cat /tmp/curl.stderr
+          echo "--- audit log ---"
           cat /tmp/coronarium-block.log.json
-          # Expect coronarium to exit non-zero because a denied connect happened.
-          if [ "$rc" = "0" ]; then
-            echo "::error::block mode did not fail despite deny-all network"
+
+          python3 - <<'PY'
+          import json, re, sys
+
+          # 1. coronarium signalled a violation
+          log = json.load(open("/tmp/coronarium-block.log.json"))
+          if log['denied'] == 0:
+              print("::error::block: no denied events recorded in JSON log")
+              sys.exit(1)
+
+          # 2. curl itself failed — this is the real proof that the kernel
+          # enforced the deny. We connect to a literal IP (skipping DNS) so
+          # the failure mode is unambiguous: 'Couldn't connect' / EPERM.
+          child = dict(
+              line.split("=", 1) for line in open("/tmp/child.result") if "=" in line
+          )
+          curl_rc = int(child.get("curl_rc", "0").strip())
+          if curl_rc == 0:
+              print("::error::block: curl succeeded — kernel did NOT enforce deny")
+              sys.exit(1)
+
+          stderr = open("/tmp/curl.stderr").read()
+          # curl surfaces EPERM from connect() as "Couldn't connect to server"
+          # or "Failed to connect". Accept either.
+          if not re.search(r"(connect|denied|permission)", stderr, re.I):
+              print(f"::error::block: curl failed (rc={curl_rc}) but stderr doesn't look like a network block:\n{stderr}")
+              sys.exit(1)
+
+          # 3. At least one sample should be a connect tagged denied to the
+          # address we tried to reach.
+          bad = [
+              s for s in log['samples']
+              if s.get('kind') == 'connect'
+              and s.get('denied') is True
+              and s.get('daddr') == '93.184.216.34'
+          ]
+          if not bad:
+              print(f"::error::no denied connect event for 93.184.216.34 in samples")
+              print(json.dumps([s for s in log['samples'] if s['kind']=='connect'], indent=2))
+              sys.exit(1)
+
+          print(f"OK: coronarium_rc={log['denied']} denied events, curl rc={curl_rc}, stderr confirms kernel-level block")
+          PY
+
+          # Coronarium should have exited non-zero because denies happened.
+          if [ "$coro_rc" = "0" ]; then
+            echo "::error::coronarium exit=0 despite denied>0"
             exit 1
           fi
-          python3 - <<'PY'
-          import json, sys
-          log = json.load(open("/tmp/coronarium-block.log.json"))
-          print(f"observed={log['observed']} denied={log['denied']}")
-          if log['denied'] == 0:
-              print("::error::block mode: no denied events were recorded")
-              sys.exit(1)
-          PY
       - name: file-prefix audit (flags /etc/shadow reads as denied)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium

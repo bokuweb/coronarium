@@ -1,0 +1,122 @@
+name: "coronarium / comment"
+description: "Post a coronarium audit summary as a pull-request comment."
+author: "bokuweb"
+
+inputs:
+  log:
+    description: "Path to the coronarium JSON log (default matches the main action)."
+    required: false
+    default: "coronarium.log.json"
+  marker:
+    description: "HTML comment marker used to upsert a single comment per PR instead of appending."
+    required: false
+    default: "<!-- coronarium-report -->"
+  fail-on-denied:
+    description: "Set to 'true' to make this step exit non-zero when denied>0 (after posting)."
+    required: false
+    default: "false"
+  title:
+    description: "Heading shown at the top of the comment."
+    required: false
+    default: "coronarium report"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LOG: ${{ inputs.log }}
+        MARKER: ${{ inputs.marker }}
+        FAIL_ON_DENIED: ${{ inputs.fail-on-denied }}
+        TITLE: ${{ inputs.title }}
+      run: |
+        set -euo pipefail
+
+        if [[ "${GITHUB_EVENT_NAME}" != "pull_request" && "${GITHUB_EVENT_NAME}" != "pull_request_target" ]]; then
+          echo "::notice::not a pull_request event (${GITHUB_EVENT_NAME}); skipping comment"
+          exit 0
+        fi
+
+        if [[ ! -f "${LOG}" ]]; then
+          echo "::error::log file '${LOG}' not found — did the coronarium run step complete?"
+          exit 1
+        fi
+
+        # Render the markdown body.
+        body=$(python3 - "${LOG}" "${MARKER}" "${TITLE}" <<'PY'
+        import json, sys, collections
+
+        log_path, marker, title = sys.argv[1], sys.argv[2], sys.argv[3]
+        log = json.load(open(log_path))
+
+        kinds = collections.Counter()
+        denied_samples = []
+        for s in log.get("samples", []):
+            kinds[s["kind"]] += 1
+            if s.get("denied"):
+                denied_samples.append(s)
+
+        parts = [marker, f"### {title}", ""]
+        parts.append("| metric | count |")
+        parts.append("|---|---:|")
+        parts.append(f"| observed | **{log['observed']}** |")
+        parts.append(f"| denied   | **{log['denied']}** |")
+        parts.append(f"| lost     | {log['lost']} |")
+        parts.append("")
+
+        if kinds:
+            parts.append("#### events by kind")
+            parts.append("| kind | count |")
+            parts.append("|---|---:|")
+            for k in ("exec", "open", "connect"):
+                if k in kinds:
+                    parts.append(f"| {k} | {kinds[k]} |")
+            parts.append("")
+
+        if denied_samples:
+            parts.append("#### denied samples (first 10)")
+            parts.append("| kind | detail |")
+            parts.append("|---|---|")
+            for s in denied_samples[:10]:
+                if s["kind"] == "connect":
+                    detail = f"`{s.get('daddr')}:{s.get('dport')}`"
+                elif s["kind"] == "open":
+                    detail = f"`{s.get('filename','')}`"
+                elif s["kind"] == "exec":
+                    detail = f"`{s.get('filename','')}` ({s.get('argv0','')})"
+                else:
+                    detail = str(s)
+                parts.append(f"| {s['kind']} | {detail} |")
+            parts.append("")
+
+        if log.get("lost", 0) > 0:
+            parts.append(f"> ⚠️ {log['lost']} events dropped (ring-buffer overflow); totals may undercount.")
+
+        print("\n".join(parts))
+        PY
+        )
+
+        # Upsert by marker: if a previous comment on this PR contains the
+        # marker, edit it; otherwise create a new one.
+        pr_number="${{ github.event.pull_request.number }}"
+        repo="${GITHUB_REPOSITORY}"
+        existing=$(gh api -X GET "repos/${repo}/issues/${pr_number}/comments" --paginate \
+          --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n1)
+
+        if [[ -n "${existing}" ]]; then
+          echo "Updating existing coronarium comment ${existing}"
+          gh api -X PATCH "repos/${repo}/issues/comments/${existing}" \
+            -f body="${body}" >/dev/null
+        else
+          echo "Creating new coronarium comment on PR #${pr_number}"
+          gh pr comment "${pr_number}" --repo "${repo}" --body "${body}"
+        fi
+
+        if [[ "${FAIL_ON_DENIED}" == "true" ]]; then
+          denied=$(python3 -c 'import json,sys;print(json.load(open("'"${LOG}"'"))["denied"])')
+          if [[ "${denied}" != "0" ]]; then
+            echo "::error::coronarium recorded ${denied} denied events"
+            exit 1
+          fi
+        fi
