@@ -15,43 +15,88 @@ inputs:
     required: false
     default: "audit"
   version:
-    description: "Coronarium release to install (tag name)."
+    description: "Coronarium release tag to install (e.g. v0.1.0). Defaults to whatever tag this action was referenced as."
     required: false
-    default: "latest"
+    default: ""
   log:
-    description: "Where to write the JSON audit log. '-' for stdout."
+    description: "Where the subsequent `coronarium-run` step should write its JSON audit log."
     required: false
     default: "coronarium.log.json"
+
+outputs:
+  bin:
+    description: "Absolute path to the installed coronarium binary."
+    value: ${{ steps.install.outputs.bin }}
+  bpf:
+    description: "Absolute path to the installed coronarium.bpf.o."
+    value: ${{ steps.install.outputs.bpf }}
 
 runs:
   using: composite
   steps:
-    - name: Install coronarium
+    - id: install
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+
         if [[ "${RUNNER_OS}" != "Linux" ]]; then
-          echo "coronarium only supports Linux runners (got ${RUNNER_OS})" >&2
+          echo "::error::coronarium only supports Linux runners (got ${RUNNER_OS})"
           exit 1
         fi
-        tag="${{ inputs.version }}"
-        if [[ "$tag" == "latest" ]]; then
-          tag=$(curl -fsSL https://api.github.com/repos/bokuweb/coronarium/releases/latest | jq -r .tag_name)
-        fi
-        arch=$(uname -m)
-        url="https://github.com/bokuweb/coronarium/releases/download/${tag}/coronarium-${arch}-unknown-linux-musl.tar.gz"
-        curl -fsSL "$url" | sudo tar -xz -C /usr/local/bin
-        sudo chmod +x /usr/local/bin/coronarium /usr/local/bin/coronarium.bpf.o || true
-        echo "CORONARIUM_BPF_OBJ=/usr/local/bin/coronarium.bpf.o" >> "$GITHUB_ENV"
 
-    - name: Start coronarium daemon
-      shell: bash
+        # Resolve version: input > action ref > latest.
+        version="${INPUT_VERSION}"
+        if [[ -z "${version}" ]]; then
+          # github.action_ref isn't exposed to composite steps directly; fall
+          # back to whatever the parent workflow pinned.
+          version="${GITHUB_ACTION_REF:-}"
+        fi
+        if [[ -z "${version}" || "${version}" == "main" ]]; then
+          version=$(gh release view --repo bokuweb/coronarium --json tagName -q .tagName)
+        fi
+        echo "Installing coronarium ${version}"
+
+        arch=$(uname -m)
+        case "${arch}" in
+          x86_64)  target="x86_64-unknown-linux-musl" ;;
+          aarch64) target="aarch64-unknown-linux-musl" ;;
+          *)
+            echo "::error::unsupported runner arch: ${arch}"
+            exit 1
+            ;;
+        esac
+
+        asset="coronarium-${target}.tar.gz"
+        workdir=$(mktemp -d)
+        cd "${workdir}"
+        gh release download "${version}" \
+          --repo bokuweb/coronarium \
+          --pattern "${asset}" \
+          --pattern "${asset}.sha256"
+        sha256sum -c "${asset}.sha256"
+        tar -xzf "${asset}"
+
+        dest="${RUNNER_TEMP}/coronarium"
+        mkdir -p "${dest}"
+        mv "coronarium-${target}/coronarium" "${dest}/coronarium"
+        mv "coronarium-${target}/coronarium.bpf.o" "${dest}/coronarium.bpf.o"
+        chmod +x "${dest}/coronarium"
+
+        echo "bin=${dest}/coronarium" >> "${GITHUB_OUTPUT}"
+        echo "bpf=${dest}/coronarium.bpf.o" >> "${GITHUB_OUTPUT}"
+        echo "CORONARIUM_BPF_OBJ=${dest}/coronarium.bpf.o" >> "${GITHUB_ENV}"
+        # Stash the binary path for the companion coronarium-run action.
+        echo "CORONARIUM_BIN=${dest}/coronarium" >> "${GITHUB_ENV}"
+        echo "CORONARIUM_POLICY=${{ inputs.policy }}" >> "${GITHUB_ENV}"
+        echo "CORONARIUM_MODE=${{ inputs.mode }}" >> "${GITHUB_ENV}"
+        echo "CORONARIUM_LOG=${{ inputs.log }}" >> "${GITHUB_ENV}"
+
+    - shell: bash
       run: |
-        set -euo pipefail
-        sudo -E coronarium run \
-          --policy "${{ inputs.policy }}" \
-          --mode "${{ inputs.mode }}" \
-          --log "${{ inputs.log }}" \
-          --summary "$GITHUB_STEP_SUMMARY" \
-          -- sleep infinity &
-        echo "CORONARIUM_PID=$!" >> "$GITHUB_ENV"
+        "${CORONARIUM_BIN}" check-policy --policy "${CORONARIUM_POLICY}" >/dev/null
+        echo "Coronarium installed. Wrap the command you want to supervise like:"
+        echo ""
+        echo "    - run: sudo -E \$CORONARIUM_BIN run --policy \$CORONARIUM_POLICY --mode \$CORONARIUM_MODE --log \$CORONARIUM_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"

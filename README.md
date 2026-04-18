@@ -163,8 +163,6 @@ The full parsed shape is what `coronarium check-policy` prints.
 
 ## GitHub Actions
 
-Reference the composite action directly:
-
 ```yaml
 # .github/workflows/build.yml
 name: build
@@ -175,29 +173,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bokuweb/coronarium@v0  # installs coronarium + starts daemon
+
+      # Installs the coronarium binary + bpf.o from the v0.x release.
+      # `@v0` is a floating tag that tracks the newest v0.x.y.
+      - uses: bokuweb/coronarium@v0
         with:
           policy: .github/coronarium.yml
           mode: audit
-      - run: cargo test
+
+      # Wrap your real command with `coronarium run`. The install step
+      # exported CORONARIUM_BIN / CORONARIUM_POLICY / CORONARIUM_MODE /
+      # CORONARIUM_LOG so you don't need to repeat them here.
+      - run: |
+          sudo -E "$CORONARIUM_BIN" run \
+            --policy  "$CORONARIUM_POLICY" \
+            --mode    "$CORONARIUM_MODE" \
+            --log     "$CORONARIUM_LOG" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            -- cargo test
+
+      # Optional: attach the JSON log as an artifact for later inspection.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coronarium-log
+          path: coronarium.log.json
 ```
 
-Inputs:
+Install step inputs:
 
-| input | default | description |
-|---|---|---|
-| `policy` | `.github/coronarium.yml` | path to the policy file |
-| `mode`   | `audit` | overrides `mode:` in the policy |
-| `version`| `latest` | coronarium release tag to install |
-| `log`    | `coronarium.log.json` | JSON log destination |
+| input     | default                    | description |
+|---         |---                         |--- |
+| `policy`   | `.github/coronarium.yml`   | policy file path |
+| `mode`     | `audit`                    | overrides `mode:` in the policy |
+| `version`  | the action ref (e.g. `v0`) | release tag to download |
+| `log`      | `coronarium.log.json`      | where the subsequent `coronarium run` step should log |
 
-A human-readable summary is automatically appended to
-`$GITHUB_STEP_SUMMARY`. Full JSON events are written to `log` and can be
-uploaded as an artifact.
+Install step outputs:
 
-> `ubuntu-latest` runners have `CAP_BPF` / `CAP_SYS_ADMIN` via `sudo`, which
-> the action uses internally. Container / self-hosted runners need the
-> same privileges.
+| output | description |
+|---|---|
+| `bin`  | path to the installed `coronarium` binary |
+| `bpf`  | path to the installed `coronarium.bpf.o` |
+
+A human-readable summary is appended to `$GITHUB_STEP_SUMMARY` when you
+pass `--summary`. Full JSON events go to `--log`.
+
+> `ubuntu-latest` / `ubuntu-24.04-arm` runners have `CAP_BPF` /
+> `CAP_SYS_ADMIN` via `sudo`, which `coronarium run` requires. Container
+> / self-hosted runners need the same privileges.
 
 ## Modes
 

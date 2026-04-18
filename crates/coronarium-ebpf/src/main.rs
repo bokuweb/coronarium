@@ -25,7 +25,7 @@
 use aya_ebpf::{
     bindings::BPF_F_NO_PREALLOC,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_probe_read_user,
         bpf_probe_read_user_str_bytes,
     },
     macros::{cgroup_sock_addr, map, tracepoint},
@@ -92,8 +92,13 @@ fn make_header(kind: u32, verdict: u32) -> EventHeader {
 #[tracepoint]
 pub fn coronarium_execve(ctx: TracePointContext) -> u32 {
     // struct trace_event_raw_sys_enter { u64 unused; u64 id; u64 args[6]; }
-    // filename pointer = args[0] at offset 16.
+    // args[0] = filename  (const char*)        at offset 16
+    // args[1] = argv      (const char *const*) at offset 24
     let filename_ptr: *const u8 = match unsafe { ctx.read_at::<*const u8>(16) } {
+        Ok(p) => p,
+        Err(_) => core::ptr::null(),
+    };
+    let argv_ptr: *const *const u8 = match unsafe { ctx.read_at::<*const *const u8>(24) } {
         Ok(p) => p,
         Err(_) => core::ptr::null(),
     };
@@ -103,9 +108,21 @@ pub fn coronarium_execve(ctx: TracePointContext) -> u32 {
         unsafe {
             core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<ExecEvent>());
             (*ptr).header = make_header(EVENT_KIND_EXEC, VERDICT_ALLOW);
+
             if !filename_ptr.is_null() {
                 let buf: &mut [u8] = &mut (*ptr).filename;
                 let _ = bpf_probe_read_user_str_bytes(filename_ptr, buf);
+            }
+
+            // argv is an array of user pointers; dereference the first slot
+            // to get the argv[0] string pointer, then copy the string itself.
+            if !argv_ptr.is_null() {
+                if let Ok(first) = bpf_probe_read_user::<*const u8>(argv_ptr) {
+                    if !first.is_null() {
+                        let buf: &mut [u8] = &mut (*ptr).argv0;
+                        let _ = bpf_probe_read_user_str_bytes(first, buf);
+                    }
+                }
             }
         }
         entry.submit(0);
