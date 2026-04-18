@@ -123,9 +123,12 @@ pub fn coronarium_openat(_ctx: TracePointContext) -> u32 {
 
 #[cgroup_sock_addr(connect4)]
 pub fn coronarium_connect4(ctx: SockAddrContext) -> i32 {
+    let sa = ctx.sock_addr as *const aya_ebpf::bindings::bpf_sock_addr;
     let (daddr, dport) = unsafe {
-        let sa = &*ctx.sock_addr;
-        (sa.user_ip4, sa.user_port as u16)
+        (
+            core::ptr::read_volatile(&(*sa).user_ip4),
+            core::ptr::read_volatile(&(*sa).user_port) as u16,
+        )
     };
     let verdict = lookup_net4(daddr, dport);
 
@@ -157,16 +160,35 @@ pub fn coronarium_connect4(ctx: SockAddrContext) -> i32 {
 // ---------------------------------------------------------------------------
 // cgroup connect6
 // ---------------------------------------------------------------------------
+//
+// We read the 16-byte user_ip6 as four individual u32 loads via
+// read_volatile. A compiler-generated 16-byte memcpy from the ctx is
+// rejected by the verifier ("dereference of modified ctx ptr"); splitting
+// into four fixed-offset word reads keeps each load inside the
+// cgroup_sock_addr ctx whitelist.
 
 #[cgroup_sock_addr(connect6)]
 pub fn coronarium_connect6(ctx: SockAddrContext) -> i32 {
-    let (daddr_words, dport) = unsafe {
-        let sa = &*ctx.sock_addr;
-        (sa.user_ip6, sa.user_port as u16)
+    let sa = ctx.sock_addr as *const aya_ebpf::bindings::bpf_sock_addr;
+    let (w0, w1, w2, w3, dport) = unsafe {
+        (
+            core::ptr::read_volatile(&(*sa).user_ip6[0]),
+            core::ptr::read_volatile(&(*sa).user_ip6[1]),
+            core::ptr::read_volatile(&(*sa).user_ip6[2]),
+            core::ptr::read_volatile(&(*sa).user_ip6[3]),
+            core::ptr::read_volatile(&(*sa).user_port) as u16,
+        )
     };
-    // Transmute [u32;4] → [u8;16] in one shot instead of looping (smaller
-    // program, easier on the verifier).
-    let daddr: [u8; 16] = unsafe { core::mem::transmute(daddr_words) };
+
+    let mut daddr = [0u8; 16];
+    let b0 = w0.to_ne_bytes();
+    let b1 = w1.to_ne_bytes();
+    let b2 = w2.to_ne_bytes();
+    let b3 = w3.to_ne_bytes();
+    daddr[0..4].copy_from_slice(&b0);
+    daddr[4..8].copy_from_slice(&b1);
+    daddr[8..12].copy_from_slice(&b2);
+    daddr[12..16].copy_from_slice(&b3);
 
     let verdict = lookup_net6(&daddr, dport);
 
