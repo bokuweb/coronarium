@@ -23,6 +23,8 @@
 #![cfg_attr(not(windows), allow(unused))]
 
 #[cfg(windows)]
+mod firewall;
+#[cfg(windows)]
 mod win;
 
 #[cfg(windows)]
