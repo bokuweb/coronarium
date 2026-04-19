@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::deps::{CheckArgs, CheckReport, check};
 
-use super::{Debouncer, Notifier, format::format_violation};
+use super::{Debouncer, Notifier, ViolationHandler, format::format_violation};
 
 /// A pluggable source of "this lockfile may have changed" events.
 pub trait EventSource {
@@ -23,9 +23,10 @@ pub trait EventSource {
     fn poll(&mut self, timeout: Duration) -> Vec<PathBuf>;
 }
 
-pub struct WatchLoop<'a, S: EventSource, N: Notifier + ?Sized> {
+pub struct WatchLoop<'a, S: EventSource, N: Notifier + ?Sized, H: ViolationHandler + ?Sized> {
     pub source: S,
     pub notifier: &'a N,
+    pub handler: &'a H,
     pub debouncer: Debouncer,
     pub min_age: Duration,
     pub ignore: Vec<String>,
@@ -36,7 +37,9 @@ pub struct WatchLoop<'a, S: EventSource, N: Notifier + ?Sized> {
     pub now: fn() -> Instant,
 }
 
-impl<'a, S: EventSource, N: Notifier + ?Sized> WatchLoop<'a, S, N> {
+impl<'a, S: EventSource, N: Notifier + ?Sized, H: ViolationHandler + ?Sized>
+    WatchLoop<'a, S, N, H>
+{
     /// Run exactly one iteration: poll the source, debounce, check any
     /// settled lockfiles, notify on violations. Returns how many
     /// notifications were emitted in this tick (useful for tests).
@@ -66,10 +69,33 @@ impl<'a, S: EventSource, N: Notifier + ?Sized> WatchLoop<'a, S, N> {
         if report.violations == 0 {
             return Ok(0);
         }
-        let n = format_violation(lockfile, &report);
+
+        // Always try the handler first so the notification body can
+        // report what (if anything) was done.
+        let outcome = match self.handler.handle(lockfile, &report) {
+            Ok(o) => o,
+            Err(e) => super::action::HandlerOutcome {
+                reverted: false,
+                message: format!("handler error: {e:#}"),
+            },
+        };
+
+        let mut n = format_violation(lockfile, &report);
+        n.body.push('\n');
+        n.body.push_str(&outcome.message);
+        if outcome.reverted {
+            n.title = format!("coronarium: reverted {}", short_name(lockfile));
+        }
         self.notifier.notify(&n.title, &n.body)?;
         Ok(1)
     }
+}
+
+fn short_name(p: &Path) -> String {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("(lockfile)")
+        .to_string()
 }
 
 /// An [`EventSource`] backed by the `notify` crate's FS-event stream.
@@ -184,12 +210,14 @@ mod tests {
         let lf = write_cargo_lock(&d);
 
         let notifier = CollectingNotifier::new();
+        let handler = crate::deps::watch::NotifyOnly;
         let base = Instant::now();
-        let mut wl = WatchLoop::<FakeSource, CollectingNotifier> {
+        let mut wl = WatchLoop::<FakeSource, CollectingNotifier, crate::deps::watch::NotifyOnly> {
             source: FakeSource {
                 chunks: vec![vec![lf.clone()]].into(),
             },
             notifier: &notifier,
+            handler: &handler,
             debouncer: Debouncer::new(Duration::from_millis(0)),
             min_age: Duration::from_secs(0),
             ignore: vec![],
@@ -210,11 +238,13 @@ mod tests {
         let lf = write_cargo_lock(&d);
 
         let notifier = CollectingNotifier::new();
-        let mut wl = WatchLoop::<FakeSource, CollectingNotifier> {
+        let handler = crate::deps::watch::NotifyOnly;
+        let mut wl = WatchLoop::<FakeSource, CollectingNotifier, crate::deps::watch::NotifyOnly> {
             source: FakeSource {
                 chunks: vec![vec![lf.clone()], vec![], vec![]].into(),
             },
             notifier: &notifier,
+            handler: &handler,
             // Very long debounce — events should never settle in this test.
             debouncer: Debouncer::new(Duration::from_secs(3600)),
             min_age: Duration::from_secs(0),

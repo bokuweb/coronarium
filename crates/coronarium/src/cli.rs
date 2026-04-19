@@ -70,12 +70,30 @@ pub struct DepsWatchArgs {
     /// prints to stderr — good for launchctl log redirects.
     #[arg(long, value_enum, default_value = "mac")]
     pub notifier: DepsNotifier,
+    /// What to do when a violation is detected.
+    ///
+    /// - `notify` (default): just post a notification. The lockfile is
+    ///   left as-is; nothing is blocked.
+    /// - `prompt` (macOS only): show a Keep/Revert modal. Only useful
+    ///   **after** the install has already completed, so this is
+    ///   detection, not prevention — see README "Limitations".
+    /// - `revert`: silently restore the lockfile to `HEAD` via git.
+    ///   Destructive. Requires the lockfile to be git-tracked.
+    #[arg(long, value_enum, default_value = "notify")]
+    pub action: DepsAction,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum DepsNotifier {
     Mac,
     Stdout,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum DepsAction {
+    Notify,
+    Prompt,
+    Revert,
 }
 
 #[derive(Debug, Parser)]
@@ -190,6 +208,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 notifier: match args.notifier {
                     DepsNotifier::Mac => coronarium_core::deps::cli::WatchNotifierKind::Mac,
                     DepsNotifier::Stdout => coronarium_core::deps::cli::WatchNotifierKind::Stdout,
+                },
+                action: match args.action {
+                    DepsAction::Notify => coronarium_core::deps::cli::WatchActionKind::Notify,
+                    DepsAction::Prompt => coronarium_core::deps::cli::WatchActionKind::Prompt,
+                    DepsAction::Revert => coronarium_core::deps::cli::WatchActionKind::Revert,
                 },
                 user_agent: None,
             })?;

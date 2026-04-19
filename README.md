@@ -12,8 +12,13 @@ dedicated cgroup v2, observes (and optionally denies) its:
 It can run locally as a CLI, or be installed into a GitHub Actions workflow
 as a composite action.
 
-> **Platform:** Linux only (eBPF). macOS / Windows builds compile as a
-> passthrough supervisor for development convenience.
+> **Platforms:**
+> - **Linux** — eBPF supervisor (network kernel-block, file tripwire, exec audit).
+> - **Windows** — ETW supervisor (ETW audit, kernel network deny via
+>   dynamic Defender Firewall rules).
+> - **macOS** — `deps check` + `deps watch` (supply-chain guard). The
+>   supervised-child runtime is Linux/Windows only; macOS is the
+>   developer-desktop home.
 
 ## Architecture
 
@@ -343,7 +348,7 @@ capabilities issue), `coronarium run` logs a warning and falls through to
 events are captured. Watch for `eBPF attach failed, running in passthrough`
 in the step log.
 
-## Supply-chain: `deps check` (minimum release age)
+## Supply-chain: `deps check` + `deps watch` (minimum release age)
 
 Supply-chain attacks typically live in the gap between a malicious
 version being published to a registry and the community detecting + yanking
@@ -390,6 +395,73 @@ Typical GitHub Actions shape:
 - run: $CORONARIUM_BIN deps check --min-age 7d Cargo.lock
 - run: cargo test   # only reached if the check passed
 ```
+
+### Comparison with pnpm's `minimumReleaseAge`
+
+pnpm 10.x ships a built-in setting of the same name, but with
+meaningfully different semantics:
+
+| | pnpm `minimumReleaseAge` | `coronarium deps check` |
+|---|---|---|
+| Ecosystems | npm only (pnpm's own resolver) | npm, cargo, pypi, nuget |
+| When it runs | Inside the resolver, during install | Before or after install, as a separate CLI step |
+| On violation | Filters too-young versions out of the candidate set, silently picks the newest in-range version that's old enough. **Install succeeds on an older dep.** | Prints the violation and exits 1. **Your install step fails.** You edit the version range or wait. |
+| On "no acceptable version" | `ERR_PNPM_NO_MATCHING_VERSION_FOUND` | Same effect — the CI step that would have installed never runs. |
+| Requires a proxy / extra tooling | No (built into pnpm) | No (CLI + registry HTTP GET) |
+
+**Practical upshot**: pnpm's flavour is nicer UX (builds don't
+break, they just use older deps) but locked to npm. coronarium's
+flavour is strictly more noisy but covers the other three major
+ecosystems. Auto-fallback for coronarium is a roadmap item — see
+[CLAUDE.md § "Known limitations"](CLAUDE.md#we-do-not-auto-fallback-like-pnpms-minimumreleaseage)
+— it would require writing a custom resolver for each ecosystem.
+
+### Desktop watch mode (macOS)
+
+`coronarium deps watch <dir>` runs as a long-lived daemon, typically
+under launchd at login. It subscribes to FS events on lockfiles in
+`<dir>` and reruns `deps check` after each change settles. See
+[packaging/macos/README.md](packaging/macos/README.md) for the
+launchd plist install.
+
+```bash
+# One-off (Ctrl-C to quit)
+coronarium deps watch ~/code --min-age 7d
+
+# With modal prompts (Keep / Revert via osascript)
+coronarium deps watch ~/code --min-age 7d --action prompt
+
+# Stdout logging, e.g. for tmux / screen
+coronarium deps watch ~/code --min-age 7d --notifier stdout
+```
+
+`--action` controls what happens on violation:
+
+| value | behaviour |
+|---|---|
+| `notify` (default) | Post a desktop notification. Lockfile untouched. Nothing blocked. |
+| `prompt` (macOS only) | Show a modal "Keep / Revert" dialog via osascript. On **Revert**, run `git checkout HEAD -- <lockfile>`. On **Keep** or timeout, do nothing. |
+| `revert` | Silently restore the lockfile to `HEAD` via git. Destructive; the file must be tracked. |
+
+> **Important — watch is detection, not prevention.** The FS event
+> fires *after* the package manager finishes writing the lockfile,
+> which means `preinstall` / `install` / `postinstall` scripts
+> (npm, pip) have already run. Reverting the lockfile cannot undo
+> side effects from those scripts (stolen SSH keys, modified
+> crontab, etc.). Even on cargo / nuget, auto-build tools like
+> rust-analyzer or OmniSharp often close the "between add and
+> build" window automatically.
+>
+> The **only** way to reliably prevent install-time attacks is to
+> check *before* `install` is invoked. Two options:
+>
+> 1. In CI, run `coronarium deps check` **before** the install step
+>    (see example above).
+> 2. On desktop, use the pre-commit / pre-push hook at
+>    [packaging/git-hooks/pre-commit](packaging/git-hooks/pre-commit)
+>    to refuse commits whose lockfile has too-young deps. A future
+>    release will ship a `coronarium install-gate` wrapper that sits
+>    in front of `npm install` / `cargo add` / `pip install`.
 
 ## Limitations
 
