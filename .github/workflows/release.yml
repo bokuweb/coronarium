@@ -9,7 +9,7 @@ permissions:
   contents: write # needed to create the release + upload assets
 
 jobs:
-  build:
+  build-linux:
     strategy:
       matrix:
         include:
@@ -21,7 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- userspace (static musl) ---
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -32,7 +31,7 @@ jobs:
       - name: Build userspace binary
         run: cargo build --release -p coronarium --target ${{ matrix.target }}
 
-      # --- eBPF object (arch-independent ELF, but rebuild per runner for determinism) ---
+      # eBPF object (arch-independent ELF but rebuilt per runner for reproducibility)
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -46,9 +45,7 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: cargo build --release --target bpfel-unknown-none -Z build-std=core
 
-      # --- package ---
       - name: Package tarball
-        id: pkg
         run: |
           set -euo pipefail
           name="coronarium-${{ matrix.target }}"
@@ -59,7 +56,6 @@ jobs:
           cp README.md LICENSE-MIT LICENSE-APACHE "${staging}/" 2>/dev/null || true
           tar -czf "${name}.tar.gz" -C staging "${name}"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
-          echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -68,8 +64,39 @@ jobs:
             coronarium-${{ matrix.target }}.tar.gz
             coronarium-${{ matrix.target }}.tar.gz.sha256
 
+  build-windows:
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build coronarium-win
+        working-directory: crates/coronarium-win
+        run: cargo build --release
+
+      - name: Package tarball
+        shell: pwsh
+        run: |
+          $name = "coronarium-$env:TARGET"
+          $staging = "staging\$name"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "crates\coronarium-win\target\release\coronarium-win.exe" "$staging\coronarium-win.exe"
+          Copy-Item README.md "$staging\" -ErrorAction SilentlyContinue
+          tar -czf "$name.tar.gz" -C staging $name
+          $hash = (Get-FileHash "$name.tar.gz" -Algorithm SHA256).Hash.ToLower()
+          # Match `sha256sum` format so the same verify line works cross-arch.
+          "$hash  $name.tar.gz" | Out-File -Encoding ascii "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-x86_64-pc-windows-msvc
+          path: |
+            coronarium-x86_64-pc-windows-msvc.tar.gz
+            coronarium-x86_64-pc-windows-msvc.tar.gz.sha256
+
   publish:
-    needs: build
+    needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,15 +112,13 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes="Release ${TAG}. Assets: userspace binary + coronarium.bpf.o per target."
+          notes="Release ${TAG}. Assets: Linux (coronarium + coronarium.bpf.o) and Windows (coronarium-win.exe) per target."
           gh release create "${TAG}" \
             --title "${TAG}" \
             --notes "${notes}" \
             dist/*.tar.gz dist/*.sha256
 
   moving-tag:
-    # Update the floating `v<MAJOR>` tag so consumers can pin `@v0` and get
-    # the newest v0.x.y automatically. Skipped for pre-release tags.
     needs: publish
     runs-on: ubuntu-latest
     if: "!contains(github.ref_name, '-')"

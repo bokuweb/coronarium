@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use crate::{events::Event, loader::Stats, policy::Policy};
+use crate::{events::Event, policy::Policy, stats::Stats};
 
 /// Render the full report. The result is a complete `<!DOCTYPE html>`
 /// document.

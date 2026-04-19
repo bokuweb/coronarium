@@ -4,11 +4,8 @@ mod cgroup;
 mod cli;
 mod enforcer;
 mod events;
-mod html;
 mod loader;
-mod matcher;
 mod policy;
-mod report;
 mod resolve;
 
 use anyhow::Result;

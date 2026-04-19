@@ -260,6 +260,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "coronarium-common",
+ "coronarium-core",
  "env_logger",
  "futures",
  "hickory-resolver",
@@ -281,6 +282,19 @@ dependencies = [
  "aya",
  "bytemuck",
  "serde",
+]
+
+[[package]]
+name = "coronarium-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "coronarium-common",
+ "log",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

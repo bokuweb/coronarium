@@ -1,0 +1,124 @@
+name: windows-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/windows-audit]
+  pull_request:
+    paths:
+      - "crates/coronarium-win/**"
+      - "crates/coronarium-core/**"
+      - ".github/workflows/windows-smoke.yml"
+
+jobs:
+  audit-parity:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Show runner privileges
+        shell: pwsh
+        run: |
+          whoami
+          ([Security.Principal.WindowsPrincipal] `
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+      - name: Build coronarium-win
+        working-directory: crates/coronarium-win
+        run: cargo build --release
+
+      - name: audit-mode e2e (captures exec/open/connect)
+        shell: pwsh
+        working-directory: crates/coronarium-win
+        run: |
+          $exe = "target\release\coronarium-win.exe"
+          $policy = "$env:RUNNER_TEMP\policy.yml"
+          @"
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+          "@ | Out-File -Encoding utf8 $policy
+
+          $log = "$env:RUNNER_TEMP\log.json"
+          $html = "$env:RUNNER_TEMP\report.html"
+          & $exe --policy $policy --log $log --html $html -- `
+             powershell -Command "Invoke-WebRequest -UseBasicParsing https://example.com -OutFile $env:TEMP\ex.html -ErrorAction SilentlyContinue; Get-ChildItem C:\Windows | Select -First 3"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "coronarium-win exited $LASTEXITCODE in audit mode (should be child's exit = 0)"
+            exit 1
+          }
+
+          Write-Host "--- JSON log (head) ---"
+          Get-Content $log | Select-Object -First 80
+          Write-Host "--- HTML head ---"
+          Get-Content $html -TotalCount 5
+
+          $json = Get-Content $log -Raw | ConvertFrom-Json
+          Write-Host "observed=$($json.observed) denied=$($json.denied) lost=$($json.lost)"
+          $kinds = @{}
+          foreach ($s in $json.samples) {
+            if ($kinds.ContainsKey($s.kind)) { $kinds[$s.kind] += 1 } else { $kinds[$s.kind] = 1 }
+          }
+          Write-Host "sample kinds:"
+          $kinds | ConvertTo-Json
+
+          # Exec is guaranteed to fire (the child itself is a process).
+          if (-not $kinds.ContainsKey("exec")) {
+            Write-Error "expected at least one exec event"
+            exit 1
+          }
+
+      - name: block-mode e2e (deny_exec tags whoami as denied, then exit 1)
+        shell: pwsh
+        working-directory: crates/coronarium-win
+        run: |
+          $exe = "target\release\coronarium-win.exe"
+          $policy = "$env:RUNNER_TEMP\block.yml"
+          @"
+          mode: block
+          network:
+            default: allow
+          file:
+            default: allow
+          process:
+            deny_exec:
+              - whoami
+          "@ | Out-File -Encoding utf8 $policy
+
+          $log = "$env:RUNNER_TEMP\block.json"
+          & $exe --policy $policy --log $log -- whoami
+          $rc = $LASTEXITCODE
+          Write-Host "coronarium-win exit=$rc"
+          Get-Content $log -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 4
+          $json = Get-Content $log -Raw | ConvertFrom-Json
+          # Expect coronarium to exit 1 because deny_exec matched.
+          if ($rc -eq 0) {
+            Write-Error "block mode should have exited non-zero when a matching exec was seen"
+            exit 1
+          }
+          $hit = $false
+          foreach ($s in $json.samples) {
+            if ($s.kind -eq "exec" -and $s.denied -eq $true) { $hit = $true; break }
+          }
+          if (-not $hit) {
+            Write-Error "no exec event tagged denied=true"
+            exit 1
+          }
+          Write-Host "✓ block mode correctly flagged the denied exec"
+          # Explicit success — coronarium-win exited non-zero by design
+          # (that's the *expected* outcome in block mode), but pwsh
+          # otherwise inherits $LASTEXITCODE and fails the step.
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-audit-report
+          path: |
+            ${{ runner.temp }}\log.json
+            ${{ runner.temp }}\report.html
+            ${{ runner.temp }}\block.json
