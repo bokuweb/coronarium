@@ -56,7 +56,12 @@ runs:
         # locally. Only emitted when the caller tells us the artifact name.
         oneliner=""
         if [[ -n "${{ inputs.artifact-name }}" ]]; then
-          oneliner="gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n ${{ inputs.artifact-name }} -D /tmp/coronarium && (open /tmp/coronarium/${{ inputs.html-filename }} 2>/dev/null || xdg-open /tmp/coronarium/${{ inputs.html-filename }} 2>/dev/null || echo \"open file:///tmp/coronarium/${{ inputs.html-filename }}\")"
+          # Scope destination by run-id so re-runs / parallel PRs don't clobber
+          # each other, and `rm -rf` first so `gh run download` (which refuses
+          # to overwrite existing files) works on the second+ invocation.
+          dir="/tmp/coronarium-${GITHUB_RUN_ID}"
+          html="${dir}/${{ inputs.html-filename }}"
+          oneliner="rm -rf ${dir} && gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n ${{ inputs.artifact-name }} -D ${dir} && (open ${html} 2>/dev/null || xdg-open ${html} 2>/dev/null || echo \"open file://${html}\")"
         fi
 
         body=$(ONELINER="${oneliner}" python3 - "${LOG}" "${MARKER}" "${TITLE}" <<'PY'

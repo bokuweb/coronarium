@@ -273,8 +273,12 @@ The resulting PR comment looks like:
 > <details><summary>📊 <b>Open the full HTML report locally</b></summary>
 >
 > ```bash
-> gh run download 12345678 -R owner/repo -n coronarium-report -D /tmp/coronarium && (open /tmp/coronarium/coronarium-report.html 2>/dev/null || xdg-open /tmp/coronarium/coronarium-report.html 2>/dev/null || echo "open file:///tmp/coronarium/coronarium-report.html")
+> rm -rf /tmp/coronarium-12345678 && gh run download 12345678 -R owner/repo -n coronarium-report -D /tmp/coronarium-12345678 && (open /tmp/coronarium-12345678/coronarium-report.html 2>/dev/null || xdg-open /tmp/coronarium-12345678/coronarium-report.html 2>/dev/null || echo "open file:///tmp/coronarium-12345678/coronarium-report.html")
 > ```
+>
+> The destination is scoped by run-id and cleared first, so re-running the
+> same line doesn't trip on `file exists` and different PRs don't clobber
+> each other.
 >
 > </details>
 
