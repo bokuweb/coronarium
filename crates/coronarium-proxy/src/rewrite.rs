@@ -31,12 +31,23 @@ pub struct RewriteStats {
 }
 
 /// Minimal subset of each index line we need to make a decision. We
-/// deserialise only `name` + `vers`; everything else is preserved
-/// byte-for-byte by keeping the original line.
+/// deserialise only `name` + `vers` + `pubtime`; everything else is
+/// preserved byte-for-byte by keeping the original line.
+///
+/// `pubtime` was added to the crates.io sparse-index schema in 2024
+/// (ISO-8601 string). When present, it is authoritative and lets us
+/// skip the per-version oracle round trip — which matters a lot,
+/// because a popular crate's index can list 300+ versions and going
+/// through the oracle sends 300+ blocking HTTP calls to crates.io,
+/// turning a single `cargo fetch` into a multi-minute stall.
 #[derive(Deserialize)]
 struct IndexLine<'a> {
     name: &'a str,
     vers: &'a str,
+    /// Publish time as emitted by the sparse index (`"2024-12-27T20:42:01Z"`).
+    /// Optional because older lines / older index snapshots may omit it.
+    #[serde(default, borrow)]
+    pubtime: Option<&'a str>,
 }
 
 /// Filter a crates.io sparse-index JSONL body in place, dropping lines
@@ -64,7 +75,13 @@ pub fn rewrite_crates_index_jsonl(
         }
         match serde_json::from_slice::<IndexLine>(trimmed) {
             Ok(parsed) => {
-                let decision = decider.decide(Ecosystem::Crates, parsed.name, parsed.vers, now);
+                // Fast path: when the index line carries pubtime, decide
+                // inline without calling the oracle. Avoids N sequential
+                // HTTPS round-trips per `cargo fetch`.
+                let decision = match parsed.pubtime.and_then(parse_pubtime) {
+                    Some(published) => decide_inline(published, decider.min_age, now, &parsed),
+                    None => decider.decide(Ecosystem::Crates, parsed.name, parsed.vers, now),
+                };
                 match decision {
                     Decision::Allow => {
                         out.extend_from_slice(line);
@@ -110,6 +127,42 @@ fn split_lines_keep_terminator(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
+/// Parse the sparse-index `pubtime` string. Accepts RFC 3339 with a
+/// `Z` or an explicit offset. Returns `None` on malformed input so we
+/// fall through to the oracle rather than silently mis-deciding.
+fn parse_pubtime(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Age-check a line whose publish time we already know. Duplicates the
+/// Allow/Deny-reason shape of [`Decider::decide`] so the log output is
+/// indistinguishable whether the fast or slow path fired.
+fn decide_inline(
+    published: DateTime<Utc>,
+    min_age: std::time::Duration,
+    now: DateTime<Utc>,
+    parsed: &IndexLine<'_>,
+) -> Decision {
+    let age = now - published;
+    let cutoff = chrono::Duration::from_std(min_age).unwrap_or_default();
+    if age < cutoff {
+        let hours = age.num_hours().max(0);
+        Decision::Deny {
+            reason: format!(
+                "coronarium: crates/{}@{} was published {}h ago (< min-age {}h)",
+                parsed.name,
+                parsed.vers,
+                hours,
+                min_age.as_secs() / 3600,
+            ),
+        }
+    } else {
+        Decision::Allow
+    }
+}
+
 fn trim_trailing_newline(line: &[u8]) -> &[u8] {
     let mut end = line.len();
     if end > 0 && line[end - 1] == b'\n' {
@@ -128,7 +181,22 @@ mod tests {
     use anyhow::Result;
     use chrono::TimeZone;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Oracle that panics / bumps a counter when called. Use to prove
+    /// the fast path really skips it.
+    struct CountingOracle {
+        calls: Arc<AtomicUsize>,
+        answer: Option<DateTime<Utc>>,
+    }
+    impl AgeOracle for CountingOracle {
+        fn published(&self, _: Ecosystem, _: &str, _: &str) -> Result<Option<DateTime<Utc>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.answer)
+        }
+    }
 
     /// Oracle keyed on (name, version). Unknown keys return `None`.
     #[derive(Default)]
@@ -277,6 +345,89 @@ mod tests {
         // The kept line retains its CRLF terminator.
         assert!(out.ends_with("\r\n"));
         assert_eq!(stats.dropped, 1);
+    }
+
+    #[test]
+    fn pubtime_fast_path_skips_oracle() {
+        // Both lines carry pubtime. Oracle MUST NOT be called.
+        let now = utc(2025, 1, 10);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decider = Decider {
+            oracle: Box::new(CountingOracle {
+                calls: calls.clone(),
+                answer: None,
+            }) as Box<dyn AgeOracle>,
+            min_age: Duration::from_secs(168 * 3600),
+            fail_on_missing: false,
+        };
+
+        let body = concat!(
+            r#"{"name":"a","vers":"1.0.0","pubtime":"2024-12-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"name":"a","vers":"9.9.9","pubtime":"2025-01-09T23:00:00Z"}"#,
+            "\n",
+        );
+        let (out, stats) = rewrite_crates_index_jsonl(body.as_bytes(), &decider, now);
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.contains("1.0.0"));
+        assert!(!out.contains("9.9.9"));
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "oracle should not be called when pubtime is present"
+        );
+    }
+
+    #[test]
+    fn missing_pubtime_falls_back_to_oracle() {
+        // One line has pubtime (fast path), one doesn't (oracle).
+        let now = utc(2025, 1, 10);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decider = Decider {
+            oracle: Box::new(CountingOracle {
+                calls: calls.clone(),
+                answer: Some(now - chrono::Duration::days(30)),
+            }) as Box<dyn AgeOracle>,
+            min_age: Duration::from_secs(168 * 3600),
+            fail_on_missing: false,
+        };
+
+        let body = concat!(
+            r#"{"name":"a","vers":"1.0.0","pubtime":"2024-06-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"name":"a","vers":"2.0.0"}"#,
+            "\n",
+        );
+        let (_out, stats) = rewrite_crates_index_jsonl(body.as_bytes(), &decider, now);
+        assert_eq!(stats.kept, 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "oracle called exactly once, for the pubtime-less line"
+        );
+    }
+
+    #[test]
+    fn malformed_pubtime_falls_back_to_oracle() {
+        let now = utc(2025, 1, 10);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decider = Decider {
+            oracle: Box::new(CountingOracle {
+                calls: calls.clone(),
+                answer: Some(now - chrono::Duration::days(30)),
+            }) as Box<dyn AgeOracle>,
+            min_age: Duration::from_secs(168 * 3600),
+            fail_on_missing: false,
+        };
+
+        let body = r#"{"name":"a","vers":"1.0.0","pubtime":"not-a-date"}
+"#;
+        let (_out, stats) = rewrite_crates_index_jsonl(body.as_bytes(), &decider, now);
+        assert_eq!(stats.kept, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
