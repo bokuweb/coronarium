@@ -199,35 +199,63 @@ fn handle_process_event(
     stats: &Mutex<Stats>,
     exec_matcher: &ExecMatcher,
 ) {
-    // One-time log of what event IDs this provider emits, so debugging
-    // doesn't require guesswork about the manifest.
     debug_log_event_id("process", record.event_id());
-
-    // Accept both the "traditional" process-start (1) and any other event
-    // that has a non-empty ImageName — some Windows builds fire slightly
-    // different ids.
+    if record.event_id() != 1 {
+        return;
+    }
     let Ok(schema) = schema_locator.event_schema(record) else {
         return;
     };
     let parser = EtwParser::create(record, &schema);
 
-    let filename: String = parser.try_parse("ImageName").unwrap_or_default();
-    if filename.is_empty() {
+    // Field names vary between Windows builds. Try the ones we've seen:
+    let filename = try_string(&parser, &["ImageName", "Image", "ImageFileName", "FileName"]);
+    let argv0 = try_string(&parser, &["CommandLine", "Commandline", "Args"]);
+    let pid: u32 = parser
+        .try_parse::<u32>("ProcessID")
+        .or_else(|_| parser.try_parse::<u32>("PID"))
+        .unwrap_or(0);
+
+    debug_log_process_start(&filename, &argv0, pid);
+
+    if filename.is_empty() && argv0.is_empty() {
         return;
     }
-    let argv0: String = parser.try_parse("CommandLine").unwrap_or_default();
-    let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
 
     let denied = exec_matcher.is_denied(&filename, &argv0);
     let ev = Event::Exec {
         pid,
-        uid: 0, // Windows doesn't have POSIX uid; keep field for schema compat.
-        comm: basename(&filename),
+        uid: 0,
+        comm: basename(if filename.is_empty() { &argv0 } else { &filename }),
         filename,
         argv0,
         denied,
     };
     stats.lock().unwrap().ingest(ev);
+}
+
+fn try_string(parser: &EtwParser, names: &[&str]) -> String {
+    for n in names {
+        if let Ok(s) = parser.try_parse::<String>(n) {
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    String::new()
+}
+
+fn debug_log_process_start(filename: &str, argv0: &str, pid: u32) {
+    use std::sync::OnceLock;
+    static LOGGED: OnceLock<std::sync::Mutex<bool>> = OnceLock::new();
+    let m = LOGGED.get_or_init(|| std::sync::Mutex::new(false));
+    let mut seen = m.lock().unwrap();
+    if !*seen {
+        *seen = true;
+        eprintln!(
+            "coronarium-win: first ProcessStart event: pid={pid} filename={filename:?} argv0={argv0:?}"
+        );
+    }
 }
 
 fn handle_network_event(record: &EventRecord, schema_locator: &SchemaLocator, stats: &Mutex<Stats>) {
