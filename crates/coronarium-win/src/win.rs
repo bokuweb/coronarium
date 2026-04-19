@@ -483,6 +483,7 @@ fn run_deps(raw: &[String]) -> Result<()> {
                 debounce_ms: args.debounce_ms,
                 tick_ms: args.tick_ms,
                 notifier: coronarium_core::deps::cli::WatchNotifierKind::Stdout,
+                action: coronarium_core::deps::cli::WatchActionKind::Notify,
                 user_agent: None,
             })?;
             Ok(())

@@ -36,6 +36,7 @@ pub struct WatchCliArgs {
     pub debounce_ms: u64,
     pub tick_ms: u64,
     pub notifier: WatchNotifierKind,
+    pub action: WatchActionKind,
     pub user_agent: Option<String>,
 }
 
@@ -45,6 +46,17 @@ pub enum WatchNotifierKind {
     Mac,
     /// Plain stderr logging (useful in tmux / screen / headless dev).
     Stdout,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WatchActionKind {
+    /// Post a notification and do nothing else (lockfile stays as-is).
+    Notify,
+    /// Modal dialog (macOS osascript) asking the user Keep/Revert.
+    /// Falls back to Notify on non-macOS.
+    Prompt,
+    /// Silently revert the lockfile to `HEAD` via git (opt-in; destructive).
+    Revert,
 }
 
 pub fn run_watch(args: WatchCliArgs) -> Result<()> {
@@ -99,9 +111,37 @@ pub fn run_watch(args: WatchCliArgs) -> Result<()> {
         }
     };
 
+    // Pick the violation handler backend.
+    let notify_only;
+    let revert;
+    #[cfg(target_os = "macos")]
+    let prompt;
+    let handler_ref: &dyn super::watch::ViolationHandler = match args.action {
+        WatchActionKind::Notify => {
+            notify_only = super::watch::NotifyOnly;
+            &notify_only
+        }
+        WatchActionKind::Revert => {
+            revert = super::watch::GitRevert::new();
+            &revert
+        }
+        #[cfg(target_os = "macos")]
+        WatchActionKind::Prompt => {
+            prompt = super::watch::Prompt::new(Box::new(super::watch::OsaScriptPrompter::new()));
+            &prompt
+        }
+        #[cfg(not(target_os = "macos"))]
+        WatchActionKind::Prompt => {
+            log::warn!("--action=prompt is macOS-only; falling back to notify");
+            notify_only = super::watch::NotifyOnly;
+            &notify_only
+        }
+    };
+
     let mut wl = WatchLoop {
         source,
         notifier: notifier_ref,
+        handler: handler_ref,
         debouncer: Debouncer::new(std::time::Duration::from_millis(args.debounce_ms)),
         min_age,
         ignore: args.ignore,

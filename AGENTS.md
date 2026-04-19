@@ -1,0 +1,66 @@
+# AGENTS.md — guide for automated agents
+
+Companion to [CLAUDE.md](CLAUDE.md). That file is long-form context
+and rationale; this one is the short checklist an agent follows
+when acting on the repo.
+
+## Before touching anything
+
+1. Read `CLAUDE.md` §"Known limitations". Changing those requires
+   a design discussion with the human, not a drive-by patch.
+2. Skim `.github/workflows/ci.yml` to see what the smoke job
+   asserts — if your change risks one of those assertions, flag it
+   in the PR description.
+
+## Preferred workflow
+
+1. `git checkout -b <kind>/<short-desc>` — e.g. `feat/install-gate`,
+   `fix/watch-debounce`, `chore/deps`.
+2. **Write tests first.** The codebase intentionally designs IO
+   behind traits (Prompter, Notifier, EventSource, ViolationHandler)
+   so unit tests can pin behaviour without spawning real processes.
+3. Run the fast local loop:
+   ```bash
+   cargo test -p coronarium-core           # pure-Rust core
+   cargo clippy --workspace --all-targets -- -D warnings
+   cargo fmt --all -- --check
+   ```
+4. Open a PR, let CI cover the Linux+Windows+consumer-smoke runs.
+5. Tag `v0.X.Y` on main to release; `release.yml` owns the rest.
+
+## Conventions
+
+- **Commits**: conventional-ish (`feat:`, `fix:`, `chore:`, `test:`,
+  `docs:`, `refactor:`). Body in the imperative mood. Include a
+  `Co-Authored-By: Claude …` trailer when an LLM authored most of it.
+- **No cowboy destructive defaults.** Anything that mutates user
+  files (like `GitRevert`) ships behind an opt-in flag and posts a
+  notification explaining what happened.
+- **Honest docs > aspirational docs.** README/CLAUDE.md call out
+  known gaps (`deps watch` timing, pnpm auto-fallback, etc.). When
+  you change behaviour, update the matching limitation text.
+- **Error strings**: prefer actionable ("pass `--fail-on-missing`…")
+  over pretty.
+
+## What NOT to do autonomously
+
+- Don't delete branches that aren't yours (`git push --delete`).
+- Don't edit the `v0` floating tag. Let `release.yml` own it.
+- Don't upgrade `aya` / `aya-ebpf` without a paired bump in
+  `coronarium-ebpf/Cargo.toml` and a full Linux smoke run.
+- Don't add a new registry integration without a fixture and a
+  per-ecosystem CI assertion.
+
+## Quick ecosystem-add checklist
+
+If adding a new package ecosystem to `deps check`:
+
+- [ ] Parser under `crates/coronarium-core/src/deps/lockfile/<name>.rs`
+- [ ] Registry client under `.../registry/<name>.rs`
+- [ ] Wire both into `deps::lockfile::detect` and `deps::check`
+- [ ] Fixture at `tests/fixtures/` (a small, real, stable lockfile)
+- [ ] Per-ecosystem json-shape assertion in `.github/workflows/ci.yml`
+- [ ] Update the "supported ecosystems" table in README
+- [ ] Add a row to CLAUDE.md's "Known limitations" if the
+      ecosystem has install-time script execution (pretty much
+      everything except cargo/nuget).
