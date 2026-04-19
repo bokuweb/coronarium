@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 coronarium-common = { path = "../coronarium-common", features = ["user"] }
 coronarium-core = { path = "../coronarium-core" }
+coronarium-proxy = { path = "../coronarium-proxy" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

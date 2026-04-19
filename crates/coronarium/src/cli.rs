@@ -4,8 +4,32 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use coronarium_core::report::ReportArgs;
+use std::time::Duration;
 
 use crate::{loader, policy};
+
+/// Parse a simple `<N><unit>` duration (e.g. `7d`, `12h`, `30m`, `3600s`).
+/// Bare numbers default to days. Used by proxy/watch-style CLI flags
+/// where pulling in humantime feels overkill.
+fn parse_simple_duration(s: &str) -> anyhow::Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration");
+    }
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c),
+        _ => (s, 'd'),
+    };
+    let n: u64 = num.parse()?;
+    let secs = match unit {
+        'd' | 'D' => n * 86400,
+        'h' | 'H' => n * 3600,
+        'm' | 'M' => n * 60,
+        's' | 'S' => n,
+        _ => anyhow::bail!("unknown duration unit {unit:?}"),
+    };
+    Ok(Duration::from_secs(secs))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +58,38 @@ pub enum Command {
         #[command(subcommand)]
         cmd: DepsCommand,
     },
+    /// Transparent HTTPS MITM proxy that enforces minimum-release-age
+    /// at the registry fetch layer. Experimental — see CLAUDE.md.
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProxyCommand {
+    /// Start the proxy. Prints the root CA's install instructions on
+    /// first run.
+    Start(ProxyStartArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct ProxyStartArgs {
+    /// Address the proxy listens on. Clients set `HTTPS_PROXY` /
+    /// `HTTP_PROXY` to this.
+    #[arg(long, default_value = "127.0.0.1:8910")]
+    pub listen: std::net::SocketAddr,
+    /// Minimum age a package must have, same grammar as `deps check`.
+    #[arg(long, default_value = "7d")]
+    pub min_age: String,
+    /// Treat unknown publish dates as a deny (default: fail-open /
+    /// allow through).
+    #[arg(long)]
+    pub fail_on_missing: bool,
+    /// Override the CA/config directory. Defaults to
+    /// `$XDG_CONFIG_HOME/coronarium` (or `~/.config/coronarium`).
+    #[arg(long)]
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,6 +249,25 @@ pub async fn run(cli: Cli) -> Result<()> {
                 user_agent: None,
             })?;
             std::process::exit(exit);
+        }
+        Command::Proxy {
+            cmd: ProxyCommand::Start(args),
+        } => {
+            let min_age = parse_simple_duration(&args.min_age)?;
+            let ca_files = match args.config_dir {
+                Some(dir) => coronarium_proxy::ca::CaFiles::at(dir.join("coronarium")),
+                None => coronarium_proxy::ca::CaFiles::at_default_location()?,
+            };
+            let cfg = coronarium_proxy::ProxyConfig {
+                listen: args.listen,
+                min_age,
+                fail_on_missing: args.fail_on_missing,
+                ca_files,
+                user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
+                oracle: None,
+            };
+            coronarium_proxy::run(cfg).await?;
+            Ok(())
         }
         Command::Deps {
             cmd: DepsCommand::Watch(args),
