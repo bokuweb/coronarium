@@ -118,6 +118,12 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
     }
 
     if stats.denied > 0 && matches!(mode, policy::Mode::Block) {
+        // GitHub Actions error annotation — renders as a red banner on the
+        // step UI so block-mode failures don't hide in the log.
+        eprintln!(
+            "::error title=coronarium::policy violation: {} events denied in block mode",
+            stats.denied
+        );
         std::process::exit(1);
     }
     std::process::exit(exit);

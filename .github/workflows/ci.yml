@@ -236,6 +236,35 @@ jobs:
               print(json.dumps(log['samples'][:5], indent=2))
               sys.exit(1)
           PY
+      - name: block mode refuses passthrough when BPF attach fails
+        env:
+          RUST_LOG: info
+        run: |
+          cat > /tmp/block-strict.yml <<'EOF'
+          mode: block
+          network: {}
+          EOF
+          # Point at a nonexistent BPF object so load_bpf definitely fails.
+          set +e
+          sudo -E env CORONARIUM_BPF_OBJ=/does/not/exist \
+            ./bin/coronarium run \
+              --policy /tmp/block-strict.yml \
+              --log /tmp/coronarium-strict.log.json \
+              -- /bin/true 2> /tmp/strict.stderr
+          rc=$?
+          set -e
+          echo "--- stderr ---"
+          cat /tmp/strict.stderr
+          echo "--- rc=${rc} ---"
+          if [ "$rc" = "0" ]; then
+            echo "::error::block mode silently passed through despite BPF attach failure"
+            exit 1
+          fi
+          grep -q "::error title=coronarium::" /tmp/strict.stderr \
+            || { echo "::error::missing GitHub Actions error annotation"; exit 1; }
+          grep -q "refusing passthrough" /tmp/strict.stderr \
+            || { echo "::error::missing refuse-passthrough explanation"; exit 1; }
+          echo "✓ block mode correctly refused to run without BPF"
       - name: process.deny_exec audit (flags /usr/bin/whoami)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium

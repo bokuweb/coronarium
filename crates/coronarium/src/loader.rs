@@ -78,7 +78,23 @@ impl Supervisor {
             match load_bpf(&policy, mode, cgroup.as_ref(), &resolver).await {
                 Ok(b) => Some(Arc::new(Mutex::new(b))),
                 Err(err) => {
-                    log::warn!("eBPF attach failed, running in passthrough: {err:#}");
+                    // In block mode we refuse to passthrough: the whole point
+                    // is enforcement, and silently running the child without
+                    // BPF protection is a security footgun. Bail hard so CI
+                    // turns red with an obvious error.
+                    if matches!(mode, Mode::Block) {
+                        // Emit a GitHub Actions error annotation so the
+                        // failure surfaces on the run UI, not just in logs.
+                        eprintln!(
+                            "::error title=coronarium::eBPF programs failed to attach in block mode; refusing to run unprotected. {err:#}"
+                        );
+                        return Err(err).context(
+                            "eBPF attach failed in `mode: block`; refusing passthrough. \
+                             Check kernel config / CAP_BPF / CAP_SYS_ADMIN. \
+                             Re-run with `--mode audit` to diagnose without enforcement.",
+                        );
+                    }
+                    log::warn!("eBPF attach failed, running in passthrough (audit mode): {err:#}");
                     None
                 }
             }

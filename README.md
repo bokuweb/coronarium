@@ -359,11 +359,29 @@ Honesty about what this does and doesn't do:
 
 **`audit`** — everything is allowed; denied events are logged but the
 program is not interrupted. Use this first to validate the rule set
-without breaking builds.
+without breaking builds. If eBPF programs fail to attach (kernel /
+capability issue), coronarium falls back to passthrough and prints a
+warning, but the child still runs.
 
-**`block`** — the cgroup program returns `EPERM` for denied connects, so
-the child sees `Connection refused`. File / exec block requires
-`bpf_override_return` and is on the roadmap.
+**`block`** — the cgroup program returns `EPERM` for denied connects,
+so the child sees `Connection refused`. File / exec block requires
+`bpf_override_return` and is on the roadmap (see Limitations).
+
+### How block mode fails CI
+
+`coronarium run --mode block` exits non-zero and emits a GitHub Actions
+`::error::` annotation in **two** situations, either of which fails the
+step (and therefore the job):
+
+1. **Policy violation observed.** `denied > 0` → exit 1. Works even
+   when the denial is audit-only (file / exec), so forgotten `file.deny`
+   rules still break the build.
+2. **eBPF programs couldn't attach.** In block mode coronarium refuses
+   to run unprotected; it returns an error instead of silently falling
+   back to passthrough. This prevents a misconfigured kernel / missing
+   `CAP_BPF` from giving you a false sense of security. (Audit mode
+   still passes through in this case, by design — so you can at least
+   run the diagnostic.)
 
 ## Development
 
