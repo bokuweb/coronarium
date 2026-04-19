@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/coronarium", "crates/coronarium-common", "crates/coronarium-core"]
+members = [
+    "crates/coronarium",
+    "crates/coronarium-common",
+    "crates/coronarium-core",
+    "crates/coronarium-proxy",
+]
 # NOTE: crates/coronarium-ebpf is built separately with a bpf target via xtask.
 # crates/coronarium-win is Windows-only; has its own workspace.
 exclude = ["crates/coronarium-ebpf", "crates/coronarium-win"]
