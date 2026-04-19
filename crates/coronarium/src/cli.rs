@@ -53,6 +53,12 @@ pub struct RunArgs {
     #[arg(long, env = "GITHUB_STEP_SUMMARY")]
     pub summary: Option<PathBuf>,
 
+    /// Optional path to write a self-contained HTML audit report. Open
+    /// directly in a browser; designed to be uploaded as a workflow
+    /// artifact.
+    #[arg(long)]
+    pub html: Option<PathBuf>,
+
     /// Command + args to execute under supervision.
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -92,11 +98,24 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         args.command
     );
 
-    let supervised = loader::Supervisor::start(policy, mode).await?;
+    let supervised = loader::Supervisor::start(policy.clone(), mode).await?;
     let exit = supervised.run_child(&args.command).await?;
     let stats = supervised.shutdown().await?;
 
     report::write(&args, &stats)?;
+
+    if let Some(path) = &args.html {
+        let command_str = args.command.join(" ");
+        let meta = crate::html::ReportMeta {
+            title: command_str.as_str(),
+            mode,
+            command: command_str.as_str(),
+        };
+        let html = crate::html::render(&policy, &stats, meta);
+        std::fs::write(path, html)
+            .with_context(|| format!("writing HTML report to {}", path.display()))?;
+        log::info!("HTML report written to {}", path.display());
+    }
 
     if stats.denied > 0 && matches!(mode, policy::Mode::Block) {
         std::process::exit(1);

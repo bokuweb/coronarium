@@ -39,11 +39,21 @@ jobs:
           sudo -E "$CORONARIUM_BIN" run \
             --policy /tmp/policy.yml \
             --log coronarium.log.json \
+            --html coronarium-report.html \
             --summary "$GITHUB_STEP_SUMMARY" \
-            -- /bin/sh -c 'cat /etc/shadow >/dev/null 2>&1 || true; cat /etc/hostname >/dev/null'
+            -- /bin/sh -c 'cat /etc/shadow >/dev/null 2>&1 || true; cat /etc/hostname >/dev/null; curl -s -o /dev/null https://example.com || true'
           cat coronarium.log.json | head -60
           observed=$(python3 -c 'import json;print(json.load(open("coronarium.log.json"))["observed"])')
           test "$observed" -gt 0
+          test -f coronarium-report.html
+
+      # Upload both so the comment's one-liner can pull the HTML.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coronarium-report
+          path: |
+            coronarium-report.html
+            coronarium.log.json
 
       # Only meaningful on pull_request events — on release/dispatch this
       # step no-ops (the sub-action bails early).
@@ -51,6 +61,8 @@ jobs:
         if: github.event_name == 'pull_request'
         with:
           log: coronarium.log.json
+          artifact-name: coronarium-report
+          html-filename: coronarium-report.html
 
       - name: Verify PR comment was posted
         if: github.event_name == 'pull_request'

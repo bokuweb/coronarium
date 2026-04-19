@@ -88,6 +88,7 @@ jobs:
           sudo -E ./bin/coronarium run \
             --policy /tmp/audit.yml \
             --log /tmp/coronarium.log.json \
+            --html /tmp/coronarium-report.html \
             -- /bin/sh -c 'echo hello from coronarium; curl -s -o /dev/null -m 5 https://example.com || true' \
             2> /tmp/coronarium.stderr
           echo "--- stderr ---"
@@ -268,12 +269,13 @@ jobs:
               print(json.dumps([s for s in log['samples'] if s['kind'] == 'exec'], indent=2))
               sys.exit(1)
           PY
-      - name: Upload audit logs
+      - name: Upload audit logs + HTML report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-audit-log
+          name: coronarium-report
           path: |
+            /tmp/coronarium-report.html
             /tmp/coronarium.log.json
             /tmp/coronarium-block.log.json
             /tmp/coronarium-file.log.json

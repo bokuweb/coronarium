@@ -19,6 +19,14 @@ inputs:
     description: "Heading shown at the top of the comment."
     required: false
     default: "coronarium report"
+  artifact-name:
+    description: "Name of the uploaded artifact that contains report.html. When set, the comment includes a one-liner to download + open it."
+    required: false
+    default: ""
+  html-filename:
+    description: "File name of the HTML report inside the artifact."
+    required: false
+    default: "coronarium-report.html"
 
 runs:
   using: composite
@@ -44,10 +52,18 @@ runs:
         fi
 
         # Render the markdown body.
-        body=$(python3 - "${LOG}" "${MARKER}" "${TITLE}" <<'PY'
-        import json, sys, collections
+        # Build the one-liner that downloads the HTML artifact and opens it
+        # locally. Only emitted when the caller tells us the artifact name.
+        oneliner=""
+        if [[ -n "${{ inputs.artifact-name }}" ]]; then
+          oneliner="gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n ${{ inputs.artifact-name }} -D /tmp/coronarium && (open /tmp/coronarium/${{ inputs.html-filename }} 2>/dev/null || xdg-open /tmp/coronarium/${{ inputs.html-filename }} 2>/dev/null || echo \"open file:///tmp/coronarium/${{ inputs.html-filename }}\")"
+        fi
+
+        body=$(ONELINER="${oneliner}" python3 - "${LOG}" "${MARKER}" "${TITLE}" <<'PY'
+        import json, os, sys, collections
 
         log_path, marker, title = sys.argv[1], sys.argv[2], sys.argv[3]
+        oneliner = os.environ.get("ONELINER", "")
         log = json.load(open(log_path))
 
         kinds = collections.Counter()
@@ -92,6 +108,17 @@ runs:
 
         if log.get("lost", 0) > 0:
             parts.append(f"> ⚠️ {log['lost']} events dropped (ring-buffer overflow); totals may undercount.")
+            parts.append("")
+
+        if oneliner:
+            parts.append("<details><summary>📊 <b>Open the full HTML report locally</b></summary>")
+            parts.append("")
+            parts.append("```bash")
+            parts.append(oneliner)
+            parts.append("```")
+            parts.append("")
+            parts.append("Requires the [`gh` CLI](https://cli.github.com). The command downloads the workflow artifact and opens the self-contained HTML report in your browser.")
+            parts.append("</details>")
 
         print("\n".join(parts))
         PY

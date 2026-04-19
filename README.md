@@ -219,38 +219,75 @@ Install step outputs:
 A human-readable summary is appended to `$GITHUB_STEP_SUMMARY` when you
 pass `--summary`. Full JSON events go to `--log`.
 
-### Posting the report as a PR comment
+### HTML report (modern, self-contained)
 
-The companion sub-action `bokuweb/coronarium/comment@v0` reads the JSON
-log and upserts a single pull-request comment (keyed by an HTML marker,
-so re-runs update the existing comment instead of appending):
+Pass `--html <path>` to `coronarium run` and you get a single-file HTML
+report — no external CSS/JS, dark-mode aware, with a filter box and
+tabs for Exec / Open / Connect / Denied-only. Upload it as a workflow
+artifact and open straight from `file://`.
 
 ```yaml
-- uses: actions/checkout@v4
-- uses: bokuweb/coronarium@v0
 - run: |
     sudo -E "$CORONARIUM_BIN" run \
       --policy .github/coronarium.yml \
       --log coronarium.log.json \
+      --html coronarium-report.html \
       -- cargo test
 
-# Posts/updates a comment on the PR with observed/denied counts,
-# breakdown by kind, and the first 10 denied samples.
+- uses: actions/upload-artifact@v4
+  with:
+    name: coronarium-report
+    path: |
+      coronarium-report.html
+      coronarium.log.json
+```
+
+### Posting the report as a PR comment
+
+`bokuweb/coronarium/comment@v0` reads the JSON log and upserts a single
+pull-request comment (keyed by an HTML marker, so re-runs edit in place
+instead of appending). Pass the artifact name and it also embeds a
+ready-to-paste `gh` one-liner that downloads + opens the HTML report on
+your machine:
+
+```yaml
 - uses: bokuweb/coronarium/comment@v0
   if: github.event_name == 'pull_request'
   with:
     log: coronarium.log.json
-    fail-on-denied: "true"   # optional: make this step fail if denied>0
+    artifact-name: coronarium-report        # same name used in upload-artifact
+    html-filename: coronarium-report.html   # inside the artifact
+    # fail-on-denied: "true"                # optional: exit non-zero when denied > 0
 ```
+
+The resulting PR comment looks like:
+
+> ### coronarium report
+>
+> | metric | count |
+> |---|---:|
+> | observed | **91** |
+> | denied   | **1**  |
+> | lost     | 0      |
+>
+> <details><summary>📊 <b>Open the full HTML report locally</b></summary>
+>
+> ```bash
+> gh run download 12345678 -R owner/repo -n coronarium-report -D /tmp/coronarium && (open /tmp/coronarium/coronarium-report.html 2>/dev/null || xdg-open /tmp/coronarium/coronarium-report.html 2>/dev/null || echo "open file:///tmp/coronarium/coronarium-report.html")
+> ```
+>
+> </details>
 
 Comment step inputs:
 
 | input | default | description |
 |---|---|---|
-| `log` | `coronarium.log.json` | path to the JSON log written by `coronarium run` |
-| `marker` | `<!-- coronarium-report -->` | HTML marker used for upsert; change only if you post multiple reports |
+| `log` | `coronarium.log.json` | JSON log written by `coronarium run` |
+| `marker` | `<!-- coronarium-report -->` | HTML marker used for upsert |
 | `fail-on-denied` | `false` | if `true`, exit non-zero after posting when `denied > 0` |
 | `title` | `coronarium report` | heading shown at the top of the comment |
+| `artifact-name` | *(empty)* | name of the HTML artifact; when set, the comment embeds a `gh` download one-liner |
+| `html-filename` | `coronarium-report.html` | file name inside the artifact |
 
 The step needs `pull-requests: write` in `permissions:` (or the default
 `GITHUB_TOKEN` with that scope).
