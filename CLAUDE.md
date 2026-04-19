@@ -86,9 +86,23 @@ older deps.
   the response; it passes through unchanged. pip fall-back to
   tarball-level `files.pythonhosted.org` deny still catches those
   installs fail-hard.
-- **nuget** — still fail-hard. NuGet uses versioned flat-container
-  URLs (`api.nuget.org/v3-flatcontainer/<id>/index.json`); same
-  pattern as the others, just one more ecosystem to wire.
+- **nuget** — ✅ implemented for the **registration** endpoints
+  (`api.nuget.org/v3/registration<X>*/<id>/index.json` and the
+  paged `.../page/<lower>/<upper>.json`). Leaves whose
+  `catalogEntry.published` is too young are dropped from every
+  page's `items[]`; `count` fields are rewritten so they stay
+  consistent. Pages that reference a separate URL instead of
+  carrying inline items are left alone — the re-fetch is a new
+  request and goes through the same rewriter.
+
+  The **flat-container index** (`/v3-flatcontainer/<id>/index.json`
+  — a plain `{"versions":[...]}` with no dates) is **not** yet
+  silently filtered; we'd need an out-of-band lookup to the
+  registration endpoint to get dates. Until we do, dotnet restore
+  paths through flat-container still hit the existing nupkg
+  download deny at `api.nuget.org/v3-flatcontainer/<id>/<version>/…`
+  — fail-hard, not silent. This is the last remaining roadmap
+  item for the four-ecosystem sweep.
 
 For ecosystems without rewriting, `deps check` (CI) or the proxy's
 hard-deny (desktop) is still the defense — just not silent.
@@ -127,9 +141,12 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 2. **HTTPS registry proxy** — same idea but transparent: set
    `HTTPS_PROXY` system-wide, filter fetch traffic. No shell
    aliasing required, but MITM cert management is a UX chore.
-3. **pnpm-style auto-fallback for nuget** — crates.io (v0.15),
-   npm (v0.16) and pypi (v0.17) already work. NuGet's
-   flat-container index is the last of the four to wire.
+3. **NuGet flat-container auto-fallback** — NuGet registration
+   pages are rewritten as of v0.18. The last silent-fallback gap
+   is the flat-container `/v3-flatcontainer/<id>/index.json`
+   endpoint, which carries no publish dates inline. Fix needs
+   an out-of-band lookup to the registration endpoint (cached)
+   to learn dates, then filter the version list.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.

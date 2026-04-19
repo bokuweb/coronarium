@@ -23,6 +23,7 @@ use crate::decision::{AgeOracle, Decider, Decision};
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
 use crate::rewrite::rewrite_crates_index_jsonl;
 use crate::rewrite_npm::rewrite_npm_packument;
+use crate::rewrite_nuget::rewrite_nuget_registration;
 use crate::rewrite_pypi::{rewrite_pypi_json_api, rewrite_pypi_simple_json};
 
 pub struct ProxyConfig {
@@ -273,6 +274,18 @@ impl HttpHandler for CoronariumHandler {
                 }
                 out
             }
+            RewriteTarget::NugetRegistration => {
+                let (out, stats) =
+                    rewrite_nuget_registration(&collected, self.decider.min_age, now);
+                if stats.dropped > 0 {
+                    log::info!(
+                        "nuget-rewrite: dropped {} version(s), kept {}",
+                        stats.dropped,
+                        stats.kept
+                    );
+                }
+                out
+            }
         };
 
         // Strip Content-Length so hyper recomputes it from the new body.
@@ -290,6 +303,7 @@ enum RewriteTarget {
     NpmPackument,
     PypiJsonApi,
     PypiSimpleJson,
+    NugetRegistration,
 }
 
 /// Match the in-flight `(host, path)` to a rewriter. Returning `None`
@@ -320,7 +334,34 @@ fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTa
             return Some(RewriteTarget::PypiSimpleJson);
         }
     }
+    if host.eq_ignore_ascii_case("api.nuget.org") && is_nuget_registration_path(path) {
+        return Some(RewriteTarget::NugetRegistration);
+    }
     None
+}
+
+/// NuGet registration endpoints:
+/// - `/v3/registration<X>*/<id>/index.json` (top-level index)
+/// - `/v3/registration<X>*/<id>/page/<lower>/<upper>.json` (paged)
+///
+/// `<X>*` is one of the many versioned URL bases NuGet publishes
+/// (`registration5-semver1`, `registration5-gz-semver2`, …). We match
+/// any prefix starting with `registration` so new endpoints added by
+/// NuGet don't require a code change.
+fn is_nuget_registration_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = match path.strip_prefix("/v3/") {
+        Some(r) => r,
+        None => return false,
+    };
+    let mut parts = rest.splitn(2, '/');
+    let base = parts.next().unwrap_or("");
+    let tail = parts.next().unwrap_or("");
+    if !base.starts_with("registration") {
+        return false;
+    }
+    // index.json or page/<lower>/<upper>.json anywhere in the tail.
+    tail.ends_with("/index.json") || (tail.contains("/page/") && tail.ends_with(".json"))
 }
 
 /// `GET /pypi/<pkg>/json` — the Warehouse legacy JSON API.
@@ -441,6 +482,25 @@ mod tests {
     }
 
     #[test]
+    fn nuget_registration_path_matches_index_and_page_shapes() {
+        assert!(is_nuget_registration_path(
+            "/v3/registration5-semver1/newtonsoft.json/index.json"
+        ));
+        assert!(is_nuget_registration_path(
+            "/v3/registration5-gz-semver2/serilog/index.json"
+        ));
+        assert!(is_nuget_registration_path(
+            "/v3/registration5-semver1/pkg/page/1.0.0/9.9.9.json"
+        ));
+        // Not registration.
+        assert!(!is_nuget_registration_path(
+            "/v3-flatcontainer/pkg/index.json"
+        ));
+        assert!(!is_nuget_registration_path("/v3/search-query"));
+        assert!(!is_nuget_registration_path("/"));
+    }
+
+    #[test]
     fn classify_response_routes_to_correct_rewriter() {
         assert_eq!(
             classify_response(Some("index.crates.io"), Some("/anything")),
@@ -468,6 +528,22 @@ mod tests {
             Some(RewriteTarget::PypiSimpleJson)
         );
         assert_eq!(classify_response(Some("pypi.org"), Some("/")), None);
+        // NuGet registration.
+        assert_eq!(
+            classify_response(
+                Some("api.nuget.org"),
+                Some("/v3/registration5-semver1/newtonsoft.json/index.json")
+            ),
+            Some(RewriteTarget::NugetRegistration)
+        );
+        // NuGet flat-container is NOT rewritten yet.
+        assert_eq!(
+            classify_response(
+                Some("api.nuget.org"),
+                Some("/v3-flatcontainer/newtonsoft.json/index.json")
+            ),
+            None
+        );
         // unrecognised host
         assert_eq!(
             classify_response(Some("evil.example.com"), Some("/foo")),
