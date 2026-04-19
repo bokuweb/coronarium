@@ -212,15 +212,24 @@ fn prompt_body(lockfile: &Path, report: &CheckReport) -> String {
         report.min_age_hours, report.checked
     )];
     for p in report.packages.iter().filter(|p| p.too_new).take(5) {
-        let age = p.age_hours.map(|h| format!("{h}h")).unwrap_or_else(|| "?".into());
-        lines.push(format!("• {}/{}@{} ({age})", p.ecosystem, p.name, p.version));
+        let age = p
+            .age_hours
+            .map(|h| format!("{h}h"))
+            .unwrap_or_else(|| "?".into());
+        lines.push(format!(
+            "• {}/{}@{} ({age})",
+            p.ecosystem, p.name, p.version
+        ));
     }
     let extra = report.violations.saturating_sub(5);
     if extra > 0 {
         lines.push(format!("+{extra} more"));
     }
     lines.push(String::new());
-    lines.push(format!("Revert restores {} to HEAD via git.", short(lockfile)));
+    lines.push(format!(
+        "Revert restores {} to HEAD via git.",
+        short(lockfile)
+    ));
     lines.join("\n")
 }
 
@@ -382,11 +391,7 @@ mod tests {
             .handle(&d.join("Cargo.lock"), &dummy_report())
             .unwrap();
         assert!(!out.reverted);
-        assert!(
-            out.message.contains("no action"),
-            "got {:?}",
-            out.message
-        );
+        assert!(out.message.contains("no action"), "got {:?}", out.message);
     }
 
     #[test]
@@ -400,7 +405,11 @@ mod tests {
         assert!(std::fs::read_to_string(&lf).unwrap().contains("BAD NEW"));
 
         let out = GitRevert::new().handle(&lf, &dummy_report()).unwrap();
-        assert!(out.reverted, "expected reverted=true, got {:?}", out.message);
+        assert!(
+            out.reverted,
+            "expected reverted=true, got {:?}",
+            out.message
+        );
         assert!(out.message.contains("reverted"), "got {:?}", out.message);
         assert_eq!(std::fs::read_to_string(&lf).unwrap(), original);
     }
