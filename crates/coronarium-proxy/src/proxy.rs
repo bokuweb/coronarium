@@ -163,11 +163,7 @@ impl HttpHandler for CoronariumHandler {
         }
     }
 
-    async fn handle_response(
-        &mut self,
-        _ctx: &HttpContext,
-        res: Response<Body>,
-    ) -> Response<Body> {
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         // Only rewrite the crates.io sparse index. Other hosts flow
         // through untouched so we don't risk corrupting binary tarballs
         // or metadata we haven't specifically handled.
