@@ -1,5 +1,7 @@
 pub mod crates;
 pub mod npm;
+pub mod nuget;
+pub mod pypi;
 
 use std::time::Duration;
 

@@ -38,6 +38,67 @@ jobs:
           target/release/coronarium deps check --min-age 1d --no-cache --format json Cargo.lock \
             | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['violations']==0; assert d['checked']>100; print(f\"ok violations=0 checked={d['checked']}\")"
 
+      - name: deps check — PyPI fixture (requirements.txt)
+        run: |
+          target/release/coronarium deps check \
+            --min-age 1d --no-cache --format json tests/fixtures/requirements.txt \
+            | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['violations'] == 0, d
+          assert d['checked'] == 2, d
+          labels = {p['ecosystem'] for p in d['packages']}
+          assert labels == {'pypi'}, labels
+          print('ok pypi', d['checked'])
+          "
+      - name: deps check — NuGet fixture (packages.lock.json)
+        run: |
+          target/release/coronarium deps check \
+            --min-age 1d --no-cache --format json tests/fixtures/packages.lock.json \
+            | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['violations'] == 0, d
+          assert d['checked'] == 1, d
+          labels = {p['ecosystem'] for p in d['packages']}
+          assert labels == {'nuget'}, labels
+          print('ok nuget', d['checked'])
+          "
+      - name: deps check — npm fixture (package-lock.json)
+        run: |
+          target/release/coronarium deps check \
+            --min-age 1d --no-cache --format json tests/fixtures/package-lock.json \
+            | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['violations'] == 0, d
+          assert d['checked'] == 1, d
+          labels = {p['ecosystem'] for p in d['packages']}
+          assert labels == {'npm'}, labels
+          print('ok npm', d['checked'])
+          "
+      - name: deps check — all 4 ecosystems in one invocation
+        run: |
+          set +e
+          target/release/coronarium deps check --min-age 3650d --no-cache \
+            Cargo.lock \
+            tests/fixtures/requirements.txt \
+            tests/fixtures/packages.lock.json \
+            tests/fixtures/package-lock.json \
+            > /tmp/mixed.txt
+          rc=$?
+          set -e
+          head -10 /tmp/mixed.txt
+          if [ "$rc" = "0" ]; then
+            echo "::error::min-age=3650d should have failed across all ecosystems"
+            exit 1
+          fi
+          # Confirm all four ecosystem labels appear among the violations.
+          for label in crates pypi nuget npm; do
+            grep -q "${label}/" /tmp/mixed.txt || { echo "::error::no ${label} violations surfaced"; exit 1; }
+          done
+          echo "✓ all 4 ecosystems produced violations at --min-age 3650d"
+
   ebpf:
     runs-on: ubuntu-latest
     steps:

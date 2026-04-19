@@ -374,6 +374,8 @@ coronarium deps check --min-age 7d --format json Cargo.lock
 |---|---|---|
 | cargo | `Cargo.lock` | crates.io `/api/v1/crates/<name>` |
 | npm | `package-lock.json` (lockfileVersion ≥ 2) | registry.npmjs.org |
+| pypi | `uv.lock`, `poetry.lock`, `requirements.txt` (exact `==` pins only) | pypi.org `/pypi/<name>/<version>/json` |
+| nuget | `packages.lock.json` (central-package-management) | api.nuget.org `/v3/registration5-{semver1,gz-semver2}/…` |
 
 Exit codes: `0` = all packages meet the threshold, `1` = at least one
 violation, `2` = parse/I/O error. A single on-disk cache at

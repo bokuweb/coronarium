@@ -65,10 +65,6 @@ impl Cache {
     }
 
     fn key(eco: &Ecosystem, name: &str, version: &str) -> String {
-        let eco_str = match eco {
-            Ecosystem::Npm => "npm",
-            Ecosystem::Crates => "crates",
-        };
-        format!("{eco_str}/{name}@{version}")
+        format!("{}/{}@{}", eco.label(), name, version)
     }
 }

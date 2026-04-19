@@ -33,6 +33,19 @@ use cache::Cache;
 pub enum Ecosystem {
     Npm,
     Crates,
+    Pypi,
+    Nuget,
+}
+
+impl Ecosystem {
+    pub fn label(self) -> &'static str {
+        match self {
+            Ecosystem::Npm => "npm",
+            Ecosystem::Crates => "crates",
+            Ecosystem::Pypi => "pypi",
+            Ecosystem::Nuget => "nuget",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,10 +121,7 @@ pub fn check(args: CheckArgs<'_>) -> Result<CheckReport> {
             continue;
         }
         report.checked += 1;
-        let eco_label = match pkg.ecosystem {
-            Ecosystem::Npm => "npm",
-            Ecosystem::Crates => "crates",
-        };
+        let eco_label = pkg.ecosystem.label();
 
         let fetched = fetch_published(
             &pkg.ecosystem,
@@ -194,6 +204,8 @@ fn fetch_published(
     let result = match eco {
         Ecosystem::Npm => registry::npm::published(name, version, user_agent)?,
         Ecosystem::Crates => registry::crates::published(name, version, user_agent)?,
+        Ecosystem::Pypi => registry::pypi::published(name, version, user_agent)?,
+        Ecosystem::Nuget => registry::nuget::published(name, version, user_agent)?,
     };
     if let (Some(dt), Some(c)) = (result, cache) {
         c.put(eco, name, version, dt);
