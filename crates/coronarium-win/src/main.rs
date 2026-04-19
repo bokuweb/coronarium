@@ -73,16 +73,20 @@ fn main() -> Result<()> {
 
     // `start_and_process` opens the NT Kernel Logger session and spawns
     // the ETW processing thread. Drop (or .stop()) ends the trace.
+    // ferrisetw's TraceError doesn't impl std::error::Error, so convert
+    // manually instead of using `.context`.
     let _trace = KernelTrace::new()
         .named("coronarium-win".to_string())
         .enable(process_provider)
         .enable(tcpip_provider)
         .enable(fileio_provider)
         .start_and_process()
-        .context(
-            "failed to start NT Kernel Logger ETW session \
-             (requires Administrator; on hosted runners the shell is elevated by default)",
-        )?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to start NT Kernel Logger ETW session: {e:?} \
+                 (requires Administrator; hosted runners are elevated by default)"
+            )
+        })?;
 
     // Give the session a moment to warm up so we don't race the first
     // child events.
