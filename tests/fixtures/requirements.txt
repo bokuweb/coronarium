@@ -1,0 +1,4 @@
+# Tiny fixture: old, well-known pins that will always pass a 1-day age check.
+# Used by the deps-check smoke job.
+requests==2.25.0
+Django==3.2.0
