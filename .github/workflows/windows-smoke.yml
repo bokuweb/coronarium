@@ -1,0 +1,52 @@
+name: windows-smoke
+
+# Experimental: audit-mode MVP on windows-latest via ETW.
+# Runs on pushes to the windows-audit branch and manual dispatch so we
+# can iterate without blocking the main Linux CI.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/windows-audit]
+  pull_request:
+    paths:
+      - "crates/coronarium-win/**"
+      - ".github/workflows/windows-smoke.yml"
+
+jobs:
+  audit-mvp:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Show runner privileges
+        shell: pwsh
+        run: |
+          whoami
+          # GitHub-hosted windows-latest runs as an admin; this should be True.
+          ([Security.Principal.WindowsPrincipal] `
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+      - name: Build coronarium-win
+        working-directory: crates/coronarium-win
+        run: cargo build --release
+
+      - name: Run audit against `cmd /C dir`
+        shell: pwsh
+        working-directory: crates/coronarium-win
+        run: |
+          $exe = "target\release\coronarium-win.exe"
+          $out = & $exe cmd /C dir
+          Write-Host "--- output ---"
+          Write-Host $out
+          $json = $out | ConvertFrom-Json
+          Write-Host "process_events=$($json.process_events)"
+          Write-Host "tcpip_events=$($json.tcpip_events)"
+          Write-Host "fileio_events=$($json.fileio_events)"
+          if ($json.process_events -lt 1) {
+            Write-Error "expected at least one Process ETW event for the child"
+            exit 1
+          }
