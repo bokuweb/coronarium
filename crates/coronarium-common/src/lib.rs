@@ -12,7 +12,6 @@ pub const COMM_LEN: usize = 16;
 pub const PATH_LEN: usize = 256;
 pub const ARGV0_LEN: usize = 128;
 
-
 pub const EVENT_KIND_EXEC: u32 = 1;
 pub const EVENT_KIND_CONNECT4: u32 = 2;
 pub const EVENT_KIND_CONNECT6: u32 = 3;
