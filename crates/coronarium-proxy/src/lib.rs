@@ -3,6 +3,7 @@
 
 pub mod ca;
 pub mod decision;
+pub mod install;
 pub mod parser;
 pub mod proxy;
 

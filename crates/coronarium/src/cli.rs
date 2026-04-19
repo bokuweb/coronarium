@@ -8,6 +8,16 @@ use std::time::Duration;
 
 use crate::{loader, policy};
 
+/// Resolve the CA directory either from the `--config-dir` override or
+/// the default location. Centralised so every `proxy …` subcommand
+/// uses the same layout.
+fn ca_files_for(dir: Option<PathBuf>) -> anyhow::Result<coronarium_proxy::ca::CaFiles> {
+    Ok(match dir {
+        Some(d) => coronarium_proxy::ca::CaFiles::at(d.join("coronarium")),
+        None => coronarium_proxy::ca::CaFiles::at_default_location()?,
+    })
+}
+
 /// Parse a simple `<N><unit>` duration (e.g. `7d`, `12h`, `30m`, `3600s`).
 /// Bare numbers default to days. Used by proxy/watch-style CLI flags
 /// where pulling in humantime feels overkill.
@@ -71,6 +81,19 @@ pub enum ProxyCommand {
     /// Start the proxy. Prints the root CA's install instructions on
     /// first run.
     Start(ProxyStartArgs),
+    /// Add the proxy's root CA to the OS trust store (sudo required on
+    /// macOS/Linux; admin PowerShell on Windows). Prints the exact
+    /// command when we can't run it ourselves.
+    InstallCa(ProxyCaArgs),
+    /// Remove the proxy's root CA from the OS trust store.
+    UninstallCa(ProxyCaArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct ProxyCaArgs {
+    /// Override the CA/config directory.
+    #[arg(long)]
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -251,13 +274,60 @@ pub async fn run(cli: Cli) -> Result<()> {
             std::process::exit(exit);
         }
         Command::Proxy {
+            cmd: ProxyCommand::InstallCa(args),
+        } => {
+            let ca_files = ca_files_for(args.config_dir)?;
+            // Ensure the CA exists first so the install command has
+            // something to point at.
+            coronarium_proxy::ca::ensure_ca(&ca_files)?;
+            let r = coronarium_proxy::install::install_ca(&ca_files)?;
+            use coronarium_proxy::install::InstallOutcome;
+            match r.outcome {
+                InstallOutcome::Installed => {
+                    println!(
+                        "✓ coronarium root CA installed into the system trust store\n  ({})",
+                        ca_files.cert_pem.display()
+                    );
+                }
+                InstallOutcome::NeedsPrivilege => {
+                    println!(
+                        "Need elevated privileges to install the CA. Run:\n\n  {}\n",
+                        r.command_hint
+                    );
+                }
+                InstallOutcome::Manual => {
+                    println!("{}", r.command_hint);
+                }
+            }
+            Ok(())
+        }
+        Command::Proxy {
+            cmd: ProxyCommand::UninstallCa(args),
+        } => {
+            let ca_files = ca_files_for(args.config_dir)?;
+            let r = coronarium_proxy::install::uninstall_ca(&ca_files)?;
+            use coronarium_proxy::install::InstallOutcome;
+            match r.outcome {
+                InstallOutcome::Installed => {
+                    println!("✓ coronarium root CA removed from the system trust store");
+                }
+                InstallOutcome::NeedsPrivilege => {
+                    println!(
+                        "Need elevated privileges to remove the CA. Run:\n\n  {}\n",
+                        r.command_hint
+                    );
+                }
+                InstallOutcome::Manual => {
+                    println!("{}", r.command_hint);
+                }
+            }
+            Ok(())
+        }
+        Command::Proxy {
             cmd: ProxyCommand::Start(args),
         } => {
             let min_age = parse_simple_duration(&args.min_age)?;
-            let ca_files = match args.config_dir {
-                Some(dir) => coronarium_proxy::ca::CaFiles::at(dir.join("coronarium")),
-                None => coronarium_proxy::ca::CaFiles::at_default_location()?,
-            };
+            let ca_files = ca_files_for(args.config_dir)?;
             let cfg = coronarium_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,

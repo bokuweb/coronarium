@@ -172,11 +172,19 @@ mod tests {
     #[test]
     fn should_intercept_matches_known_hosts_case_insensitively() {
         let ps = default_parsers();
-        assert!(should_intercept("crates.io", &ps));
-        assert!(should_intercept("CRATES.IO", &ps));
-        assert!(should_intercept("index.crates.io", &ps));
-        assert!(!should_intercept("registry.npmjs.org", &ps));
-        assert!(!should_intercept("evil.example.com", &ps));
+        for host in [
+            "crates.io",
+            "CRATES.IO",
+            "index.crates.io",
+            "registry.npmjs.org",
+            "files.pythonhosted.org",
+            "api.nuget.org",
+        ] {
+            assert!(should_intercept(host, &ps), "should intercept {host}");
+        }
+        for host in ["evil.example.com", "pypi.org", "www.nuget.org"] {
+            assert!(!should_intercept(host, &ps), "should NOT intercept {host}");
+        }
     }
 
     #[test]
