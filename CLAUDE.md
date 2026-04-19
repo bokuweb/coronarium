@@ -60,19 +60,22 @@ silently resolving to the newest in-range version that also meets
 the age requirement. Builds don't break; they just use slightly
 older deps.
 
-**Status (v0.15):**
+**Status (v0.16):**
 - **crates.io** — ✅ implemented via the proxy. `coronarium
   proxy serve` rewrites `index.crates.io` sparse-index responses on
   the fly, dropping JSONL lines whose `(name, vers)` publish time is
   < `--min-age`. cargo's resolver sees only acceptable versions and
-  naturally picks the newest older-in-range. No error; no user
-  action required beyond running cargo through the proxy.
-- **npm / pypi / nuget** — still fail-hard. The proxy returns 403
-  on a too-young pinned fetch; the install stops. Sparse-index-like
-  rewriting for these ecosystems is the next roadmap item. The
-  blockers are format-specific (npm's registry returns one JSON doc
-  listing *all* versions; PyPI has a JSON API and a separate simple
-  index; NuGet uses versioned flat-container URLs).
+  naturally picks the newest older-in-range.
+- **npm** — ✅ implemented. The proxy rewrites the packument
+  endpoint (`registry.npmjs.org/<pkg>`): too-young entries are
+  removed from both `versions` and `time`, and any `dist-tags`
+  (notably `latest`) that pointed at a removed version is
+  retargeted to the highest remaining semver. npm's resolver then
+  picks the newest in-range surviving version — no error.
+- **pypi / nuget** — still fail-hard. The proxy returns 403 on a
+  too-young pinned fetch; the install stops. PyPI has a JSON API
+  plus a separate simple index; NuGet uses flat-container URLs.
+  Same pattern as npm/crates, just per-ecosystem format work.
 
 For ecosystems without rewriting, `deps check` (CI) or the proxy's
 hard-deny (desktop) is still the defense — just not silent.
@@ -111,10 +114,10 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 2. **HTTPS registry proxy** — same idea but transparent: set
    `HTTPS_PROXY` system-wide, filter fetch traffic. No shell
    aliasing required, but MITM cert management is a UX chore.
-3. **pnpm-style auto-fallback for npm/pypi/nuget** — crates.io
-   already works via sparse-index rewrite (v0.15). Extend to the
-   other three: npm packument filtering, PyPI simple-index /
-   JSON-API filtering, NuGet flat-container index filtering.
+3. **pnpm-style auto-fallback for pypi/nuget** — crates.io (v0.15)
+   and npm (v0.16) already work. Extend to the remaining two:
+   PyPI simple-index / JSON-API filtering, NuGet flat-container
+   index filtering.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.

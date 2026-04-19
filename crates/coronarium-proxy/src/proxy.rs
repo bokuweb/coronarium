@@ -22,6 +22,7 @@ use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
 use crate::rewrite::rewrite_crates_index_jsonl;
+use crate::rewrite_npm::rewrite_npm_packument;
 
 pub struct ProxyConfig {
     pub listen: SocketAddr,
@@ -79,6 +80,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         parsers: Arc::new(default_parsers()),
         decider,
         last_host: None,
+        last_path: None,
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -116,6 +118,10 @@ struct CoronariumHandler {
     /// `handle_response` knows whether to rewrite the body. hudsucker
     /// guarantees the same handler instance sees the matching pair.
     last_host: Option<String>,
+    /// Path of the in-flight request. Used to decide whether an
+    /// `registry.npmjs.org` response is a packument (bare `/<pkg>`) —
+    /// per-version endpoints and tarballs must be left untouched.
+    last_path: Option<String>,
 }
 
 impl HttpHandler for CoronariumHandler {
@@ -136,6 +142,7 @@ impl HttpHandler for CoronariumHandler {
             .to_string();
         if !should_intercept(&host, &self.parsers) {
             self.last_host = None;
+            self.last_path = None;
             return RequestOrResponse::Request(req);
         }
         self.last_host = Some(host.clone());
@@ -144,6 +151,7 @@ impl HttpHandler for CoronariumHandler {
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/");
+        self.last_path = Some(path.to_string());
         match parse_for_host(&self.parsers, &host, path) {
             ParseResult::Pinned {
                 ecosystem,
@@ -164,58 +172,122 @@ impl HttpHandler for CoronariumHandler {
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        // Only rewrite the crates.io sparse index. Other hosts flow
-        // through untouched so we don't risk corrupting binary tarballs
-        // or metadata we haven't specifically handled.
-        let is_sparse_index = matches!(self.last_host.as_deref(), Some("index.crates.io"));
-        if !is_sparse_index {
+        // Decide whether and how to rewrite based on host + path. Only
+        // endpoints we specifically understand get touched; everything
+        // else flows through byte-for-byte.
+        let Some(target) = classify_response(self.last_host.as_deref(), self.last_path.as_deref())
+        else {
             return res;
-        }
+        };
         // 2xx only — preserve 404 / 304 / etc. as-is.
         if !res.status().is_success() {
             return res;
         }
 
         use http_body_util::BodyExt;
-        let (parts, body) = res.into_parts();
+        let (mut parts, body) = res.into_parts();
         let collected = match body.collect().await {
             Ok(c) => c.to_bytes(),
             Err(e) => {
-                log::warn!("sparse-rewrite: failed to buffer response body: {e}");
-                // Best effort: return an empty body — safer than
-                // forwarding a half-read stream.
+                log::warn!("rewrite: failed to buffer response body: {e}");
                 return Response::from_parts(parts, Body::empty());
             }
         };
 
-        let now = Utc::now();
-        let (rewritten, stats) = rewrite_crates_index_jsonl(&collected, &self.decider, now);
-        if stats.dropped > 0 {
-            log::info!(
-                "sparse-rewrite: dropped {} version(s), kept {} (crates.io)",
-                stats.dropped,
-                stats.kept
-            );
-        }
-
-        // Rebuild response with the new body. Strip Content-Length —
-        // hyper will set it from the new Full body, and leaving a stale
-        // length would confuse the client.
-        let mut parts = parts;
-        parts.headers.remove(http::header::CONTENT_LENGTH);
-        // If the upstream used gzip/br etc. the filter already saw
-        // plaintext (hudsucker doesn't auto-decode), so refuse to rewrite
-        // encoded bodies — punt and return original.
+        // If the upstream used gzip/br etc. the filter would see
+        // opaque bytes (hudsucker doesn't auto-decode), so refuse to
+        // rewrite encoded bodies — pass them through instead.
         if let Some(enc) = parts.headers.get(http::header::CONTENT_ENCODING)
             && !enc.as_bytes().eq_ignore_ascii_case(b"identity")
         {
-            log::debug!("sparse-rewrite: skipping non-identity Content-Encoding");
+            log::debug!("rewrite: skipping non-identity Content-Encoding");
             return Response::from_parts(parts, Body::from(http_body_util::Full::new(collected)));
         }
+
+        let now = Utc::now();
+        let rewritten = match target {
+            RewriteTarget::CratesSparse => {
+                let (out, stats) = rewrite_crates_index_jsonl(&collected, &self.decider, now);
+                if stats.dropped > 0 {
+                    log::info!(
+                        "sparse-rewrite: dropped {} version(s), kept {} (crates.io)",
+                        stats.dropped,
+                        stats.kept
+                    );
+                }
+                out
+            }
+            RewriteTarget::NpmPackument => {
+                let (out, stats) = rewrite_npm_packument(&collected, self.decider.min_age, now);
+                if stats.dropped > 0 {
+                    log::info!(
+                        "npm-rewrite: dropped {} version(s), kept {}, retargeted {} tag(s)",
+                        stats.dropped,
+                        stats.kept,
+                        stats.retargeted_tags
+                    );
+                }
+                out
+            }
+        };
+
+        // Strip Content-Length so hyper recomputes it from the new body.
+        parts.headers.remove(http::header::CONTENT_LENGTH);
         Response::from_parts(
             parts,
             Body::from(http_body_util::Full::new(bytes::Bytes::from(rewritten))),
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewriteTarget {
+    CratesSparse,
+    NpmPackument,
+}
+
+/// Match the in-flight `(host, path)` to a rewriter. Returning `None`
+/// means "pass the response through unchanged".
+///
+/// For npm we only rewrite the bare packument endpoint `/<pkg>` or
+/// `/@scope/<pkg>`. Per-version manifests (`/<pkg>/<version>`) and
+/// tarballs (`/<pkg>/-/<tgz>`) are not packuments and would be
+/// corrupted by packument-shaped filtering.
+fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTarget> {
+    let host = host?;
+    let path = path?;
+    if host.eq_ignore_ascii_case("index.crates.io") {
+        return Some(RewriteTarget::CratesSparse);
+    }
+    if host.eq_ignore_ascii_case("registry.npmjs.org") && is_npm_packument_path(path) {
+        return Some(RewriteTarget::NpmPackument);
+    }
+    None
+}
+
+fn is_npm_packument_path(path: &str) -> bool {
+    // Strip query string and trim trailing slash.
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    let trimmed = match path.strip_prefix('/') {
+        Some(p) => p,
+        None => return false,
+    };
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Scoped packages: "/@scope/name" — exactly one slash after the
+    // leading "@". Unscoped packages: "/name" — zero slashes.
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        // "scope/name" — exactly one remaining '/', no further path parts
+        let mut parts = rest.splitn(3, '/');
+        let scope = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        let extra = parts.next();
+        !scope.is_empty() && !name.is_empty() && extra.is_none()
+    } else {
+        // Unscoped: must not contain any '/'
+        !trimmed.contains('/')
     }
 }
 
@@ -248,6 +320,54 @@ mod tests {
         for host in ["evil.example.com", "pypi.org", "www.nuget.org"] {
             assert!(!should_intercept(host, &ps), "should NOT intercept {host}");
         }
+    }
+
+    #[test]
+    fn npm_packument_path_matches_unscoped_and_scoped_names_only() {
+        // Packument endpoints.
+        assert!(is_npm_packument_path("/lodash"));
+        assert!(is_npm_packument_path("/lodash/"));
+        assert!(is_npm_packument_path("/@types/node"));
+        assert!(is_npm_packument_path("/@types/node/"));
+
+        // Per-version manifests — NOT packuments.
+        assert!(!is_npm_packument_path("/lodash/4.17.21"));
+        assert!(!is_npm_packument_path("/@types/node/20.0.0"));
+
+        // Tarballs — NOT packuments.
+        assert!(!is_npm_packument_path("/lodash/-/lodash-4.17.21.tgz"));
+        assert!(!is_npm_packument_path("/@types/node/-/node-20.0.0.tgz"));
+
+        // Malformed.
+        assert!(!is_npm_packument_path(""));
+        assert!(!is_npm_packument_path("/"));
+        assert!(!is_npm_packument_path("/@scope"));
+    }
+
+    #[test]
+    fn classify_response_routes_to_correct_rewriter() {
+        assert_eq!(
+            classify_response(Some("index.crates.io"), Some("/anything")),
+            Some(RewriteTarget::CratesSparse)
+        );
+        assert_eq!(
+            classify_response(Some("registry.npmjs.org"), Some("/lodash")),
+            Some(RewriteTarget::NpmPackument)
+        );
+        // tarball path — npm but not a packument
+        assert_eq!(
+            classify_response(
+                Some("registry.npmjs.org"),
+                Some("/lodash/-/lodash-4.17.21.tgz")
+            ),
+            None
+        );
+        // unrecognised host
+        assert_eq!(
+            classify_response(Some("evil.example.com"), Some("/foo")),
+            None
+        );
+        assert_eq!(classify_response(None, Some("/foo")), None);
     }
 
     #[test]
