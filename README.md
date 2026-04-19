@@ -343,6 +343,52 @@ capabilities issue), `coronarium run` logs a warning and falls through to
 events are captured. Watch for `eBPF attach failed, running in passthrough`
 in the step log.
 
+## Supply-chain: `deps check` (minimum release age)
+
+Supply-chain attacks typically live in the gap between a malicious
+version being published to a registry and the community detecting + yanking
+it (usually 24–72 hours). If your CI only ever installs packages older
+than N days, you dodge most of that window.
+
+`pnpm` has [`minimumReleaseAge`](https://pnpm.io/next/settings#minimumreleaseage)
+for exactly this. coronarium offers the same idea, **cross-ecosystem**
+and **cross-platform** (Linux + Windows), as a lockfile-level check you
+can run before `npm install` / `cargo build` / etc.
+
+```bash
+# Fail if any resolved dep was published less than 7 days ago.
+coronarium deps check --min-age 7d Cargo.lock package-lock.json
+
+# Different thresholds per ecosystem? Run twice.
+coronarium deps check --min-age 14d Cargo.lock
+coronarium deps check --min-age  3d package-lock.json
+
+# Ignore first-party packages you publish yourself.
+coronarium deps check --min-age 7d --ignore '@my-org/*' package-lock.json
+
+# Machine-readable output for CI gating.
+coronarium deps check --min-age 7d --format json Cargo.lock
+```
+
+| ecosystem | lockfile | registry |
+|---|---|---|
+| cargo | `Cargo.lock` | crates.io `/api/v1/crates/<name>` |
+| npm | `package-lock.json` (lockfileVersion ≥ 2) | registry.npmjs.org |
+
+Exit codes: `0` = all packages meet the threshold, `1` = at least one
+violation, `2` = parse/I/O error. A single on-disk cache at
+`$XDG_CACHE_HOME/coronarium/deps-cache.json` (or `%LOCALAPPDATA%\coronarium\…`
+on Windows) keeps repeated runs fast; publish dates are immutable so
+there's no TTL.
+
+Typical GitHub Actions shape:
+
+```yaml
+- uses: bokuweb/coronarium@v0
+- run: $CORONARIUM_BIN deps check --min-age 7d Cargo.lock
+- run: cargo test   # only reached if the check passed
+```
+
 ## Limitations
 
 Honesty about what this does and doesn't do — per-OS:

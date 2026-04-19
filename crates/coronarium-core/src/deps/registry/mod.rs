@@ -1,0 +1,11 @@
+pub mod crates;
+pub mod npm;
+
+use std::time::Duration;
+
+pub(crate) fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(15))
+        .build()
+}
