@@ -193,33 +193,28 @@ pub fn run() -> Result<()> {
 // ETW event handlers
 // ---------------------------------------------------------------------------
 
-/// Microsoft-Windows-Kernel-Process "ProcessStart" event id.
-const EVT_PROCESS_START: u16 = 1;
-/// Microsoft-Windows-Kernel-Network TCP connect (IPv4 + IPv6 combined).
-/// IDs 12/14 = connect v4/v6. We accept both.
-const EVT_TCP_CONNECT_V4: u16 = 12;
-const EVT_TCP_CONNECT_V6: u16 = 14;
-/// Microsoft-Windows-Kernel-File Create/Open. IDs vary by OS build; 12 &
-/// 30 are the common "NameCreate / Create" ones. Accept a small whitelist
-/// so we're resilient across runner images.
-const EVT_FILE_CREATE: u16 = 12;
-const EVT_FILE_OPEN: u16 = 30;
-
 fn handle_process_event(
     record: &EventRecord,
     schema_locator: &SchemaLocator,
     stats: &Mutex<Stats>,
     exec_matcher: &ExecMatcher,
 ) {
-    if record.event_id() != EVT_PROCESS_START {
-        return;
-    }
+    // One-time log of what event IDs this provider emits, so debugging
+    // doesn't require guesswork about the manifest.
+    debug_log_event_id("process", record.event_id());
+
+    // Accept both the "traditional" process-start (1) and any other event
+    // that has a non-empty ImageName — some Windows builds fire slightly
+    // different ids.
     let Ok(schema) = schema_locator.event_schema(record) else {
         return;
     };
     let parser = EtwParser::create(record, &schema);
 
     let filename: String = parser.try_parse("ImageName").unwrap_or_default();
+    if filename.is_empty() {
+        return;
+    }
     let argv0: String = parser.try_parse("CommandLine").unwrap_or_default();
     let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
 
@@ -236,20 +231,28 @@ fn handle_process_event(
 }
 
 fn handle_network_event(record: &EventRecord, schema_locator: &SchemaLocator, stats: &Mutex<Stats>) {
-    let id = record.event_id();
-    if id != EVT_TCP_CONNECT_V4 && id != EVT_TCP_CONNECT_V6 {
-        return;
-    }
+    debug_log_event_id("network", record.event_id());
     let Ok(schema) = schema_locator.event_schema(record) else {
         return;
     };
     let parser = EtwParser::create(record, &schema);
 
-    let pid: u32 = parser.try_parse("PID").unwrap_or(0);
-    let dport: u16 = parser.try_parse("dport").unwrap_or(0);
+    // Some events have "daddr", others "DestinationAddress". Try both.
     let daddr: String = parser
         .try_parse::<String>("daddr")
-        .unwrap_or_else(|_| "unknown".into());
+        .or_else(|_| parser.try_parse::<String>("DestinationAddress"))
+        .unwrap_or_default();
+    if daddr.is_empty() {
+        return;
+    }
+    let pid: u32 = parser
+        .try_parse::<u32>("PID")
+        .or_else(|_| parser.try_parse::<u32>("ProcessID"))
+        .unwrap_or(0);
+    let dport: u16 = parser
+        .try_parse::<u16>("dport")
+        .or_else(|_| parser.try_parse::<u16>("DestinationPort"))
+        .unwrap_or(0);
 
     let ev = Event::Connect {
         pid,
@@ -257,8 +260,7 @@ fn handle_network_event(record: &EventRecord, schema_locator: &SchemaLocator, st
         comm: String::new(),
         daddr,
         dport,
-        protocol: 6, // TCP — the network provider fires for TCP; UDP has a
-                      // separate opcode range we don't subscribe to yet.
+        protocol: 6,
         denied: false,
     };
     stats.lock().unwrap().ingest(ev);
@@ -270,16 +272,15 @@ fn handle_file_event(
     stats: &Mutex<Stats>,
     file_matcher: &FileMatcher,
 ) {
-    let id = record.event_id();
-    if id != EVT_FILE_CREATE && id != EVT_FILE_OPEN {
-        return;
-    }
     let Ok(schema) = schema_locator.event_schema(record) else {
         return;
     };
     let parser = EtwParser::create(record, &schema);
 
     let filename: String = parser.try_parse("FileName").unwrap_or_default();
+    if filename.is_empty() {
+        return;
+    }
     let pid: u32 = parser.try_parse("ProcessID").unwrap_or(0);
 
     // Normalise Windows path to forward-slash so policy entries written
@@ -301,4 +302,19 @@ fn handle_file_event(
 
 fn basename(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
+/// Logs each distinct event id a provider emits exactly once. Helps debug
+/// when a provider doesn't fire the events we expect — cheap and bounded.
+fn debug_log_event_id(tag: &'static str, id: u16) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    type Seen = Mutex<std::collections::HashMap<&'static str, std::collections::HashSet<u16>>>;
+    static SEEN: OnceLock<Seen> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(Default::default()));
+    let mut guard = seen.lock().unwrap();
+    let set = guard.entry(tag).or_default();
+    if set.insert(id) {
+        eprintln!("coronarium-win: provider={tag} first-seen event_id={id}");
+    }
 }
