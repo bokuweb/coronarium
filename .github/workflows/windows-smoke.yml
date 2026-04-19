@@ -1,9 +1,5 @@
 name: windows-smoke
 
-# Experimental: audit-mode MVP on windows-latest via ETW.
-# Runs on pushes to the windows-audit branch and manual dispatch so we
-# can iterate without blocking the main Linux CI.
-
 on:
   workflow_dispatch:
   push:
@@ -11,21 +7,20 @@ on:
   pull_request:
     paths:
       - "crates/coronarium-win/**"
+      - "crates/coronarium-core/**"
       - ".github/workflows/windows-smoke.yml"
 
 jobs:
-  audit-mvp:
+  audit-parity:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Show runner privileges
         shell: pwsh
         run: |
           whoami
-          # GitHub-hosted windows-latest runs as an admin; this should be True.
           ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -34,51 +29,92 @@ jobs:
         working-directory: crates/coronarium-win
         run: cargo build --release
 
-      - name: Run audit against `cmd /C dir`
+      - name: audit-mode e2e (captures exec/open/connect)
         shell: pwsh
         working-directory: crates/coronarium-win
         run: |
           $exe = "target\release\coronarium-win.exe"
-          # Writes JSON summary to $sum; child's stdout passes through.
-          $sum = "$env:RUNNER_TEMP\win-summary.json"
-          & $exe --json $sum -- cmd /C dir
-          Write-Host "--- summary ---"
-          Get-Content $sum
-          $json = Get-Content $sum | ConvertFrom-Json
-          Write-Host "process_events=$($json.process_events)"
-          Write-Host "tcpip_events=$($json.tcpip_events)"
-          Write-Host "fileio_events=$($json.fileio_events)"
-          Write-Host "child_exit=$($json.child_exit)"
-          if ($json.process_events -lt 1) {
-            Write-Error "expected at least one Process ETW event"
-            exit 1
-          }
-          if ($json.child_exit -ne 0) {
-            Write-Error "child should have exited 0 (dir succeeded)"
+          $policy = "$env:RUNNER_TEMP\policy.yml"
+          @"
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+          "@ | Out-File -Encoding utf8 $policy
+
+          $log = "$env:RUNNER_TEMP\log.json"
+          $html = "$env:RUNNER_TEMP\report.html"
+          & $exe --policy $policy --log $log --html $html -- `
+             powershell -Command "Invoke-WebRequest -UseBasicParsing https://example.com -OutFile $env:TEMP\ex.html -ErrorAction SilentlyContinue; Get-ChildItem C:\Windows | Select -First 3"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "coronarium-win exited $LASTEXITCODE in audit mode (should be child's exit = 0)"
             exit 1
           }
 
-      - name: Run audit against a curl (exercise TcpIp)
+          Write-Host "--- JSON log (head) ---"
+          Get-Content $log | Select-Object -First 80
+          Write-Host "--- HTML head ---"
+          Get-Content $html -TotalCount 5
+
+          $json = Get-Content $log -Raw | ConvertFrom-Json
+          Write-Host "observed=$($json.observed) denied=$($json.denied) lost=$($json.lost)"
+          $kinds = @{}
+          foreach ($s in $json.samples) {
+            if ($kinds.ContainsKey($s.kind)) { $kinds[$s.kind] += 1 } else { $kinds[$s.kind] = 1 }
+          }
+          Write-Host "sample kinds:"
+          $kinds | ConvertTo-Json
+
+          # Exec is guaranteed to fire (the child itself is a process).
+          if (-not $kinds.ContainsKey("exec")) {
+            Write-Error "expected at least one exec event"
+            exit 1
+          }
+
+      - name: block-mode e2e (deny_exec tags whoami as denied, then exit 1)
         shell: pwsh
         working-directory: crates/coronarium-win
         run: |
           $exe = "target\release\coronarium-win.exe"
-          $sum = "$env:RUNNER_TEMP\win-summary-curl.json"
-          & $exe --json $sum -- curl.exe -sS -o NUL https://example.com
-          Write-Host "--- summary ---"
-          Get-Content $sum
-          $json = Get-Content $sum | ConvertFrom-Json
-          Write-Host "process_events=$($json.process_events) tcpip_events=$($json.tcpip_events) fileio_events=$($json.fileio_events)"
-          # TcpIp provider fires on TCP connects. curl to example.com should
-          # produce at least one event — if not, we surface it as a warning
-          # (FileIo is known to sometimes require extra trace flags; keep
-          # this step informational for now).
-          if ($json.tcpip_events -lt 1) {
-            Write-Host "::warning::no TcpIp events captured — needs investigation"
+          $policy = "$env:RUNNER_TEMP\block.yml"
+          @"
+          mode: block
+          network:
+            default: allow
+          file:
+            default: allow
+          process:
+            deny_exec:
+              - whoami
+          "@ | Out-File -Encoding utf8 $policy
+
+          $log = "$env:RUNNER_TEMP\block.json"
+          & $exe --policy $policy --log $log -- whoami
+          $rc = $LASTEXITCODE
+          Write-Host "coronarium-win exit=$rc"
+          Get-Content $log -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 4
+          $json = Get-Content $log -Raw | ConvertFrom-Json
+          # Expect coronarium to exit 1 because deny_exec matched.
+          if ($rc -eq 0) {
+            Write-Error "block mode should have exited non-zero when a matching exec was seen"
+            exit 1
           }
+          $hit = $false
+          foreach ($s in $json.samples) {
+            if ($s.kind -eq "exec" -and $s.denied -eq $true) { $hit = $true; break }
+          }
+          if (-not $hit) {
+            Write-Error "no exec event tagged denied=true"
+            exit 1
+          }
+          Write-Host "✓ block mode correctly flagged the denied exec"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-audit-summaries
-          path: ${{ runner.temp }}\win-summary*.json
+          name: windows-audit-report
+          path: |
+            ${{ runner.temp }}\log.json
+            ${{ runner.temp }}\report.html
+            ${{ runner.temp }}\block.json

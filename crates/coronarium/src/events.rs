@@ -1,5 +1,5 @@
-//! Decoding ring-buffer frames produced by the eBPF side into tagged userspace
-//! events that we can pretty-print, count, and serialize.
+//! Decoding ring-buffer frames produced by the eBPF side into [`Event`].
+//! The enum itself lives in `coronarium-core` so Windows shares it.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -7,56 +7,7 @@ use coronarium_common::{
     Connect4Event, Connect6Event, EVENT_KIND_CONNECT4, EVENT_KIND_CONNECT6, EVENT_KIND_EXEC,
     EVENT_KIND_OPEN, EventHeader, ExecEvent, OpenEvent, VERDICT_DENY,
 };
-use serde::Serialize;
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Event {
-    Exec {
-        pid: u32,
-        uid: u32,
-        comm: String,
-        filename: String,
-        argv0: String,
-        denied: bool,
-    },
-    Connect {
-        pid: u32,
-        uid: u32,
-        comm: String,
-        daddr: String,
-        dport: u16,
-        protocol: u16,
-        denied: bool,
-    },
-    Open {
-        pid: u32,
-        uid: u32,
-        comm: String,
-        filename: String,
-        flags: u32,
-        denied: bool,
-    },
-}
-
-impl Event {
-    pub fn denied(&self) -> bool {
-        match self {
-            Event::Exec { denied, .. }
-            | Event::Connect { denied, .. }
-            | Event::Open { denied, .. } => *denied,
-        }
-    }
-
-    /// Compact discriminant used to bucket events by kind for sampling.
-    pub fn kind_tag(&self) -> u8 {
-        match self {
-            Event::Exec { .. } => 0,
-            Event::Connect { .. } => 1,
-            Event::Open { .. } => 2,
-        }
-    }
-}
+pub use coronarium_core::events::Event;
 
 /// Decode a ring-buffer frame. Returns `None` if the buffer is too short or
 /// the tag is unknown (forward-compatibility for future event kinds).

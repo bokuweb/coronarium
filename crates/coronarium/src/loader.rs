@@ -12,6 +12,8 @@ use std::{
 use anyhow::{Context, Result};
 use tokio::{process::Command, sync::Mutex};
 
+pub use coronarium_core::Stats;
+
 use crate::{
     cgroup::Cgroup,
     events::{self, Event},
@@ -22,14 +24,6 @@ use crate::{
 
 #[cfg(target_os = "linux")]
 use crate::enforcer::Enforcer;
-
-#[derive(Debug, Default, Clone)]
-pub struct Stats {
-    pub observed: u64,
-    pub denied: u64,
-    pub lost: u64,
-    pub samples: Vec<Event>,
-}
 
 pub struct Supervisor {
     policy: Policy,
@@ -289,17 +283,5 @@ pub(crate) fn ingest(
         _ => {}
     }
 
-    stats.observed += 1;
-    if ev.denied() {
-        stats.denied += 1;
-    }
-    const PER_KIND_CAP: usize = 64;
-    let existing = stats
-        .samples
-        .iter()
-        .filter(|s| s.kind_tag() == ev.kind_tag())
-        .count();
-    if existing < PER_KIND_CAP && stats.samples.len() < 256 {
-        stats.samples.push(ev);
-    }
+    stats.ingest(ev);
 }

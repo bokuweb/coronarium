@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::{loader, policy, report};
+use coronarium_core::report::ReportArgs;
+
+use crate::{loader, policy};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -102,20 +104,16 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
     let exit = supervised.run_child(&args.command).await?;
     let stats = supervised.shutdown().await?;
 
-    report::write(&args, &stats)?;
-
-    if let Some(path) = &args.html {
-        let command_str = args.command.join(" ");
-        let meta = crate::html::ReportMeta {
-            title: command_str.as_str(),
-            mode,
-            command: command_str.as_str(),
-        };
-        let html = crate::html::render(&policy, &stats, meta);
-        std::fs::write(path, html)
-            .with_context(|| format!("writing HTML report to {}", path.display()))?;
-        log::info!("HTML report written to {}", path.display());
-    }
+    let command_str = args.command.join(" ");
+    let report_args = ReportArgs {
+        log: &args.log,
+        summary: args.summary.as_deref(),
+        html: args.html.as_deref(),
+        command: command_str.as_str(),
+        mode,
+        policy: &policy,
+    };
+    coronarium_core::report::write(&report_args, &stats)?;
 
     if stats.denied > 0 && matches!(mode, policy::Mode::Block) {
         // GitHub Actions error annotation — renders as a red banner on the

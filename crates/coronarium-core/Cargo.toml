@@ -1,0 +1,18 @@
+[package]
+name = "coronarium-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pure-Rust, platform-neutral: everything coronarium (Linux) and
+# coronarium-win share — Event / Stats schema, Policy parsing, file &
+# exec matchers, JSON / HTML / summary writers.
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+coronarium-common = { path = "../coronarium-common", features = ["user"] }

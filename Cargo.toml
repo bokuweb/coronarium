@@ -1,7 +1,8 @@
 [workspace]
-members = ["crates/coronarium", "crates/coronarium-common"]
+members = ["crates/coronarium", "crates/coronarium-common", "crates/coronarium-core"]
 # NOTE: crates/coronarium-ebpf is built separately with a bpf target via xtask.
-exclude = ["crates/coronarium-ebpf"]
+# crates/coronarium-win is Windows-only; has its own workspace.
+exclude = ["crates/coronarium-ebpf", "crates/coronarium-win"]
 resolver = "2"
 
 [workspace.package]
