@@ -133,11 +133,29 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 
 ## Roadmap (what to build next, in priority order)
 
-1. **`coronarium install-gate` wrapper** — shell alias intercepts
-   `npm install X` / `cargo add X` / `pip install X`, runs the
-   registry-query portion of `deps check` BEFORE invoking the real
-   tool, refuses on violations. This closes the script-attack
-   window on desktop.
+1. **`coronarium install-gate`** — ✅ implemented in v0.19. Three
+   subcommands:
+   - `shellenv` — emits a shell-specific snippet that exports
+     `HTTPS_PROXY` + `CARGO_HTTP_CAINFO` / `PIP_CERT` /
+     `NODE_EXTRA_CA_CERTS` / `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`
+     pointing at the proxy's CA bundle, so tools that don't honour
+     the system trust store still validate the MITM certs.
+   - `install` — appends `eval "$(coronarium install-gate shellenv)"`
+     to the detected shell rc file, bracketed with idempotent
+     sentinels so repeated runs don't duplicate.
+   - `uninstall` — strips the block.
+
+   After this, every `npm install` / `cargo add` / `pip install` /
+   `dotnet add package` in a new shell routes through
+   `coronarium proxy`. Because the proxy now does pnpm-style
+   silent fallback for all four ecosystems (v0.15–0.18), the user
+   sees no error on "install something young" — they just get the
+   newest safe version. For an unhandled path or a tarball pin to
+   a young version, the proxy returns 403 and the install stops.
+
+   Caveat: the proxy has to be running. `install-gate install`
+   prints a reminder; long-term we'll wire launchd / systemd
+   user units so the proxy auto-starts.
 2. **HTTPS registry proxy** — same idea but transparent: set
    `HTTPS_PROXY` system-wide, filter fetch traffic. No shell
    aliasing required, but MITM cert management is a UX chore.

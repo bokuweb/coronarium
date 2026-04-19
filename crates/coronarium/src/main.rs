@@ -4,6 +4,7 @@ mod cgroup;
 mod cli;
 mod enforcer;
 mod events;
+mod install_gate;
 mod loader;
 mod policy;
 mod resolve;

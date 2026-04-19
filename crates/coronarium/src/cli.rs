@@ -74,6 +74,67 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ProxyCommand,
     },
+    /// Route the user's shell through `coronarium proxy` so every
+    /// `npm install` / `cargo add` / `pip install` / `dotnet add`
+    /// goes through the minimum-release-age filter automatically.
+    #[command(name = "install-gate")]
+    InstallGate {
+        #[command(subcommand)]
+        cmd: InstallGateCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InstallGateCommand {
+    /// Print the shell snippet to `eval` at shell startup. Output is
+    /// shell-specific; the `install` subcommand uses this too.
+    Shellenv(InstallGateShellenvArgs),
+    /// Append an `eval`-style line to the shell rc file so every new
+    /// shell picks up the proxy env. Idempotent.
+    Install(InstallGateInstallArgs),
+    /// Reverse of `install` — strip the block from the shell rc file.
+    Uninstall(InstallGateInstallArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct InstallGateShellenvArgs {
+    /// Proxy listen address the shell env should point at. Default
+    /// matches the `proxy start` default.
+    #[arg(long, default_value = "127.0.0.1:8910")]
+    pub listen: std::net::SocketAddr,
+    /// Override the shell syntax flavour. Defaults to auto-detect
+    /// from `$SHELL`.
+    #[arg(long, value_enum)]
+    pub shell: Option<InstallGateShell>,
+}
+
+#[derive(Debug, Parser)]
+pub struct InstallGateInstallArgs {
+    /// Explicit rc file path. Defaults to the conventional one for
+    /// the detected shell (e.g. `~/.zshrc`).
+    #[arg(long)]
+    pub rc: Option<PathBuf>,
+    /// Override the shell flavour. Defaults to auto-detect from
+    /// `$SHELL`.
+    #[arg(long, value_enum)]
+    pub shell: Option<InstallGateShell>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum InstallGateShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl From<InstallGateShell> for crate::install_gate::Shell {
+    fn from(s: InstallGateShell) -> Self {
+        match s {
+            InstallGateShell::Bash => crate::install_gate::Shell::Bash,
+            InstallGateShell::Zsh => crate::install_gate::Shell::Zsh,
+            InstallGateShell::Fish => crate::install_gate::Shell::Fish,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -363,7 +424,99 @@ pub async fn run(cli: Cli) -> Result<()> {
             })?;
             Ok(())
         }
+        Command::InstallGate {
+            cmd: InstallGateCommand::Shellenv(args),
+        } => {
+            let shell = args
+                .shell
+                .map(crate::install_gate::Shell::from)
+                .unwrap_or_else(crate::install_gate::detect_shell_from_env);
+            print!(
+                "{}",
+                crate::install_gate::render_shellenv(shell, args.listen)
+            );
+            Ok(())
+        }
+        Command::InstallGate {
+            cmd: InstallGateCommand::Install(args),
+        } => run_install_gate_install(args),
+        Command::InstallGate {
+            cmd: InstallGateCommand::Uninstall(args),
+        } => run_install_gate_uninstall(args),
     }
+}
+
+fn run_install_gate_install(args: InstallGateInstallArgs) -> Result<()> {
+    let shell = args
+        .shell
+        .map(crate::install_gate::Shell::from)
+        .unwrap_or_else(crate::install_gate::detect_shell_from_env);
+    let rc = resolve_rc_path(args.rc, shell)?;
+    // Ensure parent dir exists (fish's config.fish lives under
+    // `~/.config/fish/` which may not exist on a fresh system).
+    if let Some(parent) = rc.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let before = std::fs::read_to_string(&rc).unwrap_or_default();
+    let after = crate::install_gate::install_block(&before, shell);
+    if before == after {
+        println!(
+            "coronarium: install-gate already present in {}",
+            rc.display()
+        );
+        return Ok(());
+    }
+    std::fs::write(&rc, &after).with_context(|| format!("writing {}", rc.display()))?;
+    println!(
+        "coronarium: install-gate appended to {}\n\n\
+         Open a new shell (or `source {}`) and make sure the proxy \
+         is running:\n\n    coronarium proxy start &\n    coronarium proxy install-ca\n",
+        rc.display(),
+        rc.display(),
+    );
+    Ok(())
+}
+
+fn run_install_gate_uninstall(args: InstallGateInstallArgs) -> Result<()> {
+    let shell = args
+        .shell
+        .map(crate::install_gate::Shell::from)
+        .unwrap_or_else(crate::install_gate::detect_shell_from_env);
+    let rc = resolve_rc_path(args.rc, shell)?;
+    let before = match std::fs::read_to_string(&rc) {
+        Ok(s) => s,
+        Err(_) => {
+            println!(
+                "coronarium: nothing to do — {} does not exist",
+                rc.display()
+            );
+            return Ok(());
+        }
+    };
+    if !crate::install_gate::has_block(&before) {
+        println!(
+            "coronarium: no install-gate block found in {}",
+            rc.display()
+        );
+        return Ok(());
+    }
+    let after = crate::install_gate::strip_block(&before);
+    std::fs::write(&rc, &after).with_context(|| format!("writing {}", rc.display()))?;
+    println!("coronarium: install-gate removed from {}", rc.display());
+    Ok(())
+}
+
+fn resolve_rc_path(
+    explicit: Option<PathBuf>,
+    shell: crate::install_gate::Shell,
+) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is unset; pass --rc explicitly"))?;
+    Ok(crate::install_gate::default_rc_path(&home, shell))
 }
 
 async fn run_supervised(args: RunArgs) -> Result<()> {
