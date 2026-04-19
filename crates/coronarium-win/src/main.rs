@@ -92,6 +92,14 @@ fn main() -> Result<()> {
 
     // `start_and_process` opens the NT Kernel Logger session and spawns
     // the ETW processing thread. Drop (or .stop()) ends the trace.
+    // NT Kernel Logger is a Windows-wide singleton. A crashed previous run
+    // can leave the session registered, then start_and_process fails with
+    // AlreadyExist. Ask the OS to stop any lingering session first — ignore
+    // failure (means it wasn't running, which is fine).
+    let _ = Command::new("logman")
+        .args(["stop", "NT Kernel Logger", "-ets"])
+        .output();
+
     // ferrisetw's TraceError doesn't impl std::error::Error, so convert
     // manually instead of using `.context`.
     let _trace = KernelTrace::new()
