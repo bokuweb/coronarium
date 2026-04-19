@@ -39,14 +39,46 @@ jobs:
         working-directory: crates/coronarium-win
         run: |
           $exe = "target\release\coronarium-win.exe"
-          $out = & $exe cmd /C dir
-          Write-Host "--- output ---"
-          Write-Host $out
-          $json = $out | ConvertFrom-Json
+          # Writes JSON summary to $sum; child's stdout passes through.
+          $sum = "$env:RUNNER_TEMP\win-summary.json"
+          & $exe --json $sum -- cmd /C dir
+          Write-Host "--- summary ---"
+          Get-Content $sum
+          $json = Get-Content $sum | ConvertFrom-Json
           Write-Host "process_events=$($json.process_events)"
           Write-Host "tcpip_events=$($json.tcpip_events)"
           Write-Host "fileio_events=$($json.fileio_events)"
+          Write-Host "child_exit=$($json.child_exit)"
           if ($json.process_events -lt 1) {
-            Write-Error "expected at least one Process ETW event for the child"
+            Write-Error "expected at least one Process ETW event"
             exit 1
           }
+          if ($json.child_exit -ne 0) {
+            Write-Error "child should have exited 0 (dir succeeded)"
+            exit 1
+          }
+
+      - name: Run audit against a curl (exercise TcpIp)
+        shell: pwsh
+        working-directory: crates/coronarium-win
+        run: |
+          $exe = "target\release\coronarium-win.exe"
+          $sum = "$env:RUNNER_TEMP\win-summary-curl.json"
+          & $exe --json $sum -- curl.exe -sS -o NUL https://example.com
+          Write-Host "--- summary ---"
+          Get-Content $sum
+          $json = Get-Content $sum | ConvertFrom-Json
+          Write-Host "process_events=$($json.process_events) tcpip_events=$($json.tcpip_events) fileio_events=$($json.fileio_events)"
+          # TcpIp provider fires on TCP connects. curl to example.com should
+          # produce at least one event — if not, we surface it as a warning
+          # (FileIo is known to sometimes require extra trace flags; keep
+          # this step informational for now).
+          if ($json.tcpip_events -lt 1) {
+            Write-Host "::warning::no TcpIp events captured — needs investigation"
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-audit-summaries
+          path: ${{ runner.temp }}\win-summary*.json

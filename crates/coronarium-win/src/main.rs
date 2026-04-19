@@ -43,11 +43,30 @@ struct Summary {
 }
 
 fn main() -> Result<()> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Very small hand-rolled arg parsing so we don't pull clap in yet.
+    //   coronarium-win [--json <path>] <cmd> [args...]
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut json_out: Option<String> = None;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--json" => {
+                i += 1;
+                json_out = Some(raw.get(i).cloned().unwrap_or_default());
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    let argv: Vec<String> = raw[i..].to_vec();
     if argv.is_empty() {
         anyhow::bail!(
-            "usage: coronarium-win <cmd> [args...]\n\
-             e.g.  coronarium-win cmd /C dir"
+            "usage: coronarium-win [--json <path>] <cmd> [args...]\n\
+             e.g.  coronarium-win --json out.json cmd /C dir"
         );
     }
 
@@ -109,7 +128,18 @@ fn main() -> Result<()> {
         notes:
             "audit-only MVP. counts only — field-level parsing / JSON events / HTML report come next.",
     };
-    println!("{}", serde_json::to_string_pretty(&summary)?);
+    let serialized = serde_json::to_string_pretty(&summary)?;
+    match json_out {
+        Some(path) => {
+            std::fs::write(&path, &serialized)
+                .with_context(|| format!("writing {path}"))?;
+            eprintln!("coronarium-win: summary written to {path}");
+        }
+        None => {
+            // No --json given: print to *stderr* so child stdout stays clean.
+            eprintln!("{serialized}");
+        }
+    }
 
     std::process::exit(status.code().unwrap_or(1));
 }
