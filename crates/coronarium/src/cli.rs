@@ -28,6 +28,50 @@ pub enum Command {
         #[arg(long, short = 'p')]
         policy: PathBuf,
     },
+    /// Supply-chain hardening: fail if any package in the given lockfile(s)
+    /// was published less than `--min-age` ago.
+    Deps {
+        #[command(subcommand)]
+        cmd: DepsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DepsCommand {
+    /// Check publish ages against all dependencies in the given lockfile(s).
+    Check(DepsCheckArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct DepsCheckArgs {
+    /// Lockfiles to inspect. Currently: package-lock.json, Cargo.lock.
+    #[arg(required = true)]
+    pub lockfiles: Vec<PathBuf>,
+    /// Minimum age a package must have. Units: `d` (default), `h`, `m`, `s`.
+    #[arg(long, default_value = "7d")]
+    pub min_age: String,
+    /// Don't check packages whose name matches this pattern. Accepts plain
+    /// names, `prefix*`, `*suffix`, or scope globs like `@types/*`. Repeat.
+    #[arg(long)]
+    pub ignore: Vec<String>,
+    /// Treat missing publish-date lookups as violations instead of warnings.
+    #[arg(long)]
+    pub fail_on_missing: bool,
+    /// Skip the on-disk cache of publish dates entirely.
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Override the default cache path.
+    #[arg(long)]
+    pub cache: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: DepsFormat,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum DepsFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -78,6 +122,24 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Run(args) => run_supervised(args).await,
+        Command::Deps {
+            cmd: DepsCommand::Check(args),
+        } => {
+            let exit = coronarium_core::deps::cli::run(coronarium_core::deps::cli::CliArgs {
+                lockfiles: args.lockfiles,
+                min_age: args.min_age,
+                ignore: args.ignore,
+                fail_on_missing: args.fail_on_missing,
+                no_cache: args.no_cache,
+                cache_path: args.cache,
+                format: match args.format {
+                    DepsFormat::Text => coronarium_core::deps::cli::Format::Text,
+                    DepsFormat::Json => coronarium_core::deps::cli::Format::Json,
+                },
+                user_agent: None,
+            })?;
+            std::process::exit(exit);
+        }
     }
 }
 

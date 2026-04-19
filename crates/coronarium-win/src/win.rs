@@ -73,6 +73,14 @@ pub struct Cli {
 
 pub fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Simple top-level dispatch for the `deps` subcommand — keeps the
+    // existing audit-run CLI shape untouched.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(|s| s.as_str()) == Some("deps") {
+        return run_deps(&raw);
+    }
+
     let cli = Cli::parse();
 
     let policy = match &cli.policy {
@@ -384,6 +392,65 @@ fn handle_file_event(
 
 fn basename(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
+/// `coronarium-win deps check ...` — parses a small clap struct and
+/// forwards to the shared implementation in coronarium-core.
+fn run_deps(raw: &[String]) -> Result<()> {
+    #[derive(Debug, Parser)]
+    #[command(name = "coronarium-win deps", no_binary_name = true)]
+    struct DepsCli {
+        #[command(subcommand)]
+        cmd: DepsCmd,
+    }
+    #[derive(Debug, clap::Subcommand)]
+    enum DepsCmd {
+        /// Check publish ages against all dependencies in the given lockfile(s).
+        Check(DepsCheckArgs),
+    }
+    #[derive(Debug, Parser)]
+    struct DepsCheckArgs {
+        #[arg(required = true)]
+        lockfiles: Vec<std::path::PathBuf>,
+        #[arg(long, default_value = "7d")]
+        min_age: String,
+        #[arg(long)]
+        ignore: Vec<String>,
+        #[arg(long)]
+        fail_on_missing: bool,
+        #[arg(long)]
+        no_cache: bool,
+        #[arg(long)]
+        cache: Option<std::path::PathBuf>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: DepsFormatArg,
+    }
+    #[derive(Debug, Clone, ValueEnum)]
+    enum DepsFormatArg {
+        Text,
+        Json,
+    }
+
+    // Drop argv[0] (binary) and argv[1] ("deps") so clap sees just the
+    // subcommand tokens.
+    let remainder: Vec<&str> = raw.iter().skip(2).map(|s| s.as_str()).collect();
+    let parsed = DepsCli::try_parse_from(remainder).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let DepsCmd::Check(args) = parsed.cmd;
+
+    let exit = coronarium_core::deps::cli::run(coronarium_core::deps::cli::CliArgs {
+        lockfiles: args.lockfiles,
+        min_age: args.min_age,
+        ignore: args.ignore,
+        fail_on_missing: args.fail_on_missing,
+        no_cache: args.no_cache,
+        cache_path: args.cache,
+        format: match args.format {
+            DepsFormatArg::Text => coronarium_core::deps::cli::Format::Text,
+            DepsFormatArg::Json => coronarium_core::deps::cli::Format::Json,
+        },
+        user_agent: None,
+    })?;
+    std::process::exit(exit);
 }
 
 /// Logs each distinct event id a provider emits exactly once. Helps debug
