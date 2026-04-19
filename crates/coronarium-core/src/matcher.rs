@@ -61,15 +61,40 @@ impl ExecMatcher {
         self.patterns.is_empty()
     }
 
-    /// Returns true when an exec of `filename` (absolute path from the kernel
-    /// tracepoint) or `argv0` matches any deny pattern. Exact string equality
-    /// with a directory-boundary-aware prefix — same rules as the file
-    /// matcher.
+    /// Returns true when an exec of `filename` (absolute path) or `argv0`
+    /// matches any deny pattern. Two matching modes based on the pattern:
+    ///
+    /// - **Pattern with `/` or `\\`** (e.g. `/usr/bin/nc`) — directory-
+    ///   boundary-aware prefix match on both `filename` and `argv0`.
+    /// - **Pattern without a separator** (e.g. `whoami`, `nc`) — basename
+    ///   match, case-insensitive, `.exe` tolerated. Makes
+    ///   `...\\System32\\whoami.exe` match `whoami`.
     pub fn is_denied(&self, filename: &str, argv0: &str) -> bool {
         self.patterns
             .iter()
-            .any(|p| prefix_match(filename, p) || prefix_match(argv0, p))
+            .any(|p| exec_one_match(filename, argv0, p))
     }
+}
+
+fn exec_one_match(filename: &str, argv0: &str, pattern: &str) -> bool {
+    let has_sep = pattern.contains('/') || pattern.contains('\\');
+    if has_sep {
+        return prefix_match(filename, pattern) || prefix_match(argv0, pattern);
+    }
+    basename_match(filename, pattern) || basename_match(argv0, pattern)
+}
+
+fn basename_match(path: &str, pattern: &str) -> bool {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if base.eq_ignore_ascii_case(pattern) {
+        return true;
+    }
+    if let Some(stripped) = base.strip_suffix(".exe")
+        && stripped.eq_ignore_ascii_case(pattern)
+    {
+        return true;
+    }
+    false
 }
 
 fn prefix_match(path: &str, pattern: &str) -> bool {
@@ -144,5 +169,23 @@ mod tests {
         let em = em(&["/usr/bin/nc"]);
         assert!(!em.is_denied("/usr/bin/ncat", ""));
         assert!(!em.is_denied("/bin/bash", "bash"));
+    }
+
+    #[test]
+    fn exec_basename_match_is_case_insensitive_and_exe_tolerant() {
+        let em = em(&["whoami"]);
+        // Windows: full NT path with .exe suffix should still match.
+        assert!(em.is_denied(r"\Device\HarddiskVolume4\Windows\System32\whoami.exe", ""));
+        // Case-insensitive.
+        assert!(em.is_denied("/usr/bin/WHOAMI", ""));
+        // Doesn't match substrings.
+        assert!(!em.is_denied("/usr/bin/whoamimisc", ""));
+    }
+
+    #[test]
+    fn exec_full_path_pattern_keeps_prefix_semantics() {
+        let em = em(&["/usr/bin/nc"]);
+        assert!(em.is_denied("/usr/bin/nc", ""));
+        assert!(!em.is_denied("/usr/bin/ncat", ""));
     }
 }
