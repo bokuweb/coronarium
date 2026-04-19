@@ -75,3 +75,40 @@ jobs:
             --jq '.[] | .body' | grep -q "coronarium-report" \
             || { echo "::error::comment not found on PR"; exit 1; }
           echo "✓ coronarium-report comment is on PR #${pr}"
+
+  block-as-action:
+    # Complement the audit-mode happy path with a block-mode run that
+    # asserts the published action actually makes CI fail when a deny
+    # happens. Runs alongside use-as-action (doesn't need its results).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bokuweb/coronarium@v0
+        with:
+          mode: block
+      - name: Block-mode run should fail with a denied connect
+        run: |
+          cat > /tmp/block.yml <<'EOF'
+          mode: block
+          network: {}
+          EOF
+          set +e
+          sudo -E "$CORONARIUM_BIN" run \
+            --policy /tmp/block.yml \
+            --log /tmp/block.log.json \
+            -- /bin/sh -c 'curl -sS -o /dev/null -m 5 http://93.184.216.34 2> /tmp/curl.stderr; echo curl_rc=$? > /tmp/child'
+          rc=$?
+          set -e
+          echo "coronarium rc=${rc}"
+          cat /tmp/child
+          cat /tmp/curl.stderr
+          cat /tmp/block.log.json | head -40
+          if [ "$rc" = "0" ]; then
+            echo "::error::released action did not fail in block mode"
+            exit 1
+          fi
+          grep -q "curl_rc=0" /tmp/child && {
+            echo "::error::kernel did not actually deny the connect"
+            exit 1
+          } || true
+          echo "✓ released action fails CI on block + deny, and curl itself was blocked"
