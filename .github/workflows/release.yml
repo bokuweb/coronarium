@@ -65,39 +65,44 @@ jobs:
             coronarium-${{ matrix.target }}.tar.gz.sha256
 
   build-macos:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-13     # Intel
-          - target: aarch64-apple-darwin
-            runner: macos-14     # Apple Silicon
-    runs-on: ${{ matrix.runner }}
+    # Build both Apple Silicon and Intel targets on a single macos-14
+    # (aarch64) runner — the Intel matrix spot (`macos-13`) is under
+    # increasing runner pressure at GitHub and was queueing for >30min.
+    # Apple Silicon hosts cross-compile both directions with just
+    # `rustup target add x86_64-apple-darwin`.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Build coronarium (macOS)
-        run: cargo build --release -p coronarium --target ${{ matrix.target }}
-      - name: Package tarball
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Build both macOS targets
         run: |
           set -euo pipefail
-          name="coronarium-${{ matrix.target }}"
-          staging="staging/${name}"
-          mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/coronarium" "${staging}/coronarium"
-          cp README.md "${staging}/" 2>/dev/null || true
-          cp packaging/macos/dev.coronarium.watch.plist "${staging}/" 2>/dev/null || true
-          cp packaging/macos/README.md "${staging}/macos-README.md" 2>/dev/null || true
-          tar -czf "${name}.tar.gz" -C staging "${name}"
-          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            echo "=== ${target} ==="
+            cargo build --release -p coronarium --target "${target}"
+          done
+      - name: Package tarballs
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            name="coronarium-${target}"
+            staging="staging/${name}"
+            mkdir -p "${staging}"
+            cp "target/${target}/release/coronarium" "${staging}/coronarium"
+            cp README.md "${staging}/" 2>/dev/null || true
+            cp packaging/macos/dev.coronarium.watch.plist "${staging}/" 2>/dev/null || true
+            cp packaging/macos/README.md "${staging}/macos-README.md" 2>/dev/null || true
+            tar -czf "${name}.tar.gz" -C staging "${name}"
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.target }}
+          name: release-macos
           path: |
-            coronarium-${{ matrix.target }}.tar.gz
-            coronarium-${{ matrix.target }}.tar.gz.sha256
+            coronarium-*-apple-darwin.tar.gz
+            coronarium-*-apple-darwin.tar.gz.sha256
 
   build-windows:
     runs-on: windows-latest
