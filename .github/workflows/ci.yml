@@ -17,10 +17,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace --release
       - run: cargo test --workspace
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coronarium-bin
-          path: target/release/coronarium
 
   ebpf:
     runs-on: ubuntu-latest
@@ -48,13 +44,22 @@ jobs:
 
   smoke:
     needs: [userspace, ebpf]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: coronarium-bin
-          path: bin
+      - uses: dtolnay/rust-toolchain@stable
+      # Build the userspace binary natively on this runner's arch.
+      - name: Build coronarium (${{ matrix.arch }})
+        run: cargo build --release -p coronarium
+      # eBPF object is arch-independent (bpfel-unknown-none) — reuse.
       - uses: actions/download-artifact@v4
         with:
           name: coronarium-bpf
@@ -66,8 +71,10 @@ jobs:
           ls -la /sys/fs/cgroup | head -20
       - name: Prepare binary
         run: |
+          mkdir -p bin
+          cp target/release/coronarium bin/coronarium
           chmod +x bin/coronarium
-          ls -la bpf
+          ls -la bpf bin
       - name: policy dry-run
         run: |
           ./bin/coronarium check-policy -p examples/coronarium.yml
@@ -99,8 +106,6 @@ jobs:
           fi
           echo "--- audit log ---"
           cat /tmp/coronarium.log.json
-          # Sanity: we expect at least one event (execve / connect) to have
-          # been observed when the programs actually loaded.
           python3 - <<'PY'
           import json, sys
           log = json.load(open("/tmp/coronarium.log.json"))
@@ -115,7 +120,6 @@ jobs:
                   missing.append(k)
           if missing:
               print(f"::warning::no samples for: {missing}")
-              # Only fail hard on exec (guaranteed to fire for /bin/sh).
               if "exec" in missing:
                   sys.exit(1)
           PY
@@ -124,18 +128,10 @@ jobs:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
           RUST_LOG: info
         run: |
-          # No `default:` — implicit deny. Forgotten network sections
-          # must fail closed; the whole point of the sensible default.
           cat > /tmp/block.yml <<'EOF'
           mode: block
           network: {}
           EOF
-
-          # Bypass coronarium's block-mode exit logic by wrapping the curl
-          # in a shell that captures its *own* exit code. That way we can
-          # distinguish "coronarium exited 1 because it counted denies"
-          # (weak evidence) from "curl itself got EPERM from the kernel"
-          # (real evidence of enforcement).
           set +e
           sudo -E ./bin/coronarium run \
             --policy /tmp/block.yml \
@@ -146,44 +142,25 @@ jobs:
             '
           coro_rc=$?
           set -e
-
           echo "--- coronarium rc=${coro_rc} ---"
-          echo "--- child result ---"
           cat /tmp/child.result
-          echo "--- curl stderr ---"
           cat /tmp/curl.stderr
-          echo "--- audit log ---"
           cat /tmp/coronarium-block.log.json
-
           python3 - <<'PY'
           import json, re, sys
-
-          # 1. coronarium signalled a violation
           log = json.load(open("/tmp/coronarium-block.log.json"))
           if log['denied'] == 0:
               print("::error::block: no denied events recorded in JSON log")
               sys.exit(1)
-
-          # 2. curl itself failed — this is the real proof that the kernel
-          # enforced the deny. We connect to a literal IP (skipping DNS) so
-          # the failure mode is unambiguous: 'Couldn't connect' / EPERM.
-          child = dict(
-              line.split("=", 1) for line in open("/tmp/child.result") if "=" in line
-          )
+          child = dict(line.split("=", 1) for line in open("/tmp/child.result") if "=" in line)
           curl_rc = int(child.get("curl_rc", "0").strip())
           if curl_rc == 0:
               print("::error::block: curl succeeded — kernel did NOT enforce deny")
               sys.exit(1)
-
           stderr = open("/tmp/curl.stderr").read()
-          # curl surfaces EPERM from connect() as "Couldn't connect to server"
-          # or "Failed to connect". Accept either.
           if not re.search(r"(connect|denied|permission)", stderr, re.I):
               print(f"::error::block: curl failed (rc={curl_rc}) but stderr doesn't look like a network block:\n{stderr}")
               sys.exit(1)
-
-          # 3. At least one sample should be a connect tagged denied to the
-          # address we tried to reach.
           bad = [
               s for s in log['samples']
               if s.get('kind') == 'connect'
@@ -194,11 +171,8 @@ jobs:
               print(f"::error::no denied connect event for 93.184.216.34 in samples")
               print(json.dumps([s for s in log['samples'] if s['kind']=='connect'], indent=2))
               sys.exit(1)
-
-          print(f"OK: coronarium_rc={log['denied']} denied events, curl rc={curl_rc}, stderr confirms kernel-level block")
+          print(f"OK: {log['denied']} denied events, curl rc={curl_rc}, stderr confirms kernel-level block")
           PY
-
-          # Coronarium should have exited non-zero because denies happened.
           if [ "$coro_rc" = "0" ]; then
             echo "::error::coronarium exit=0 despite denied>0"
             exit 1
@@ -244,7 +218,6 @@ jobs:
           mode: block
           network: {}
           EOF
-          # Point at a nonexistent BPF object so load_bpf definitely fails.
           set +e
           sudo -E env CORONARIUM_BPF_OBJ=/does/not/exist \
             ./bin/coronarium run \
@@ -253,9 +226,7 @@ jobs:
               -- /bin/true 2> /tmp/strict.stderr
           rc=$?
           set -e
-          echo "--- stderr ---"
           cat /tmp/strict.stderr
-          echo "--- rc=${rc} ---"
           if [ "$rc" = "0" ]; then
             echo "::error::block mode silently passed through despite BPF attach failure"
             exit 1
@@ -302,7 +273,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coronarium-report
+          name: coronarium-report-${{ matrix.arch }}
           path: |
             /tmp/coronarium-report.html
             /tmp/coronarium.log.json
