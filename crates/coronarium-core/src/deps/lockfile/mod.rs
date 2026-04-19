@@ -35,3 +35,41 @@ pub fn parse(eco: Ecosystem, path: &Path) -> Result<Vec<Package>> {
         Ecosystem::Nuget => nuget::parse(path),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn detect_returns_expected_ecosystem_for_each_filename() {
+        assert_eq!(
+            detect(&PathBuf::from("some/dir/package-lock.json")).unwrap(),
+            Ecosystem::Npm
+        );
+        assert_eq!(
+            detect(&PathBuf::from("Cargo.lock")).unwrap(),
+            Ecosystem::Crates
+        );
+        assert_eq!(detect(&PathBuf::from("uv.lock")).unwrap(), Ecosystem::Pypi);
+        assert_eq!(
+            detect(&PathBuf::from("poetry.lock")).unwrap(),
+            Ecosystem::Pypi
+        );
+        assert_eq!(
+            detect(&PathBuf::from("requirements.txt")).unwrap(),
+            Ecosystem::Pypi
+        );
+        assert_eq!(
+            detect(&PathBuf::from("packages.lock.json")).unwrap(),
+            Ecosystem::Nuget
+        );
+    }
+
+    #[test]
+    fn detect_rejects_unknown_filenames() {
+        assert!(detect(&PathBuf::from("Gemfile.lock")).is_err());
+        assert!(detect(&PathBuf::from("go.sum")).is_err());
+        assert!(detect(&PathBuf::from("foo.txt")).is_err());
+    }
+}

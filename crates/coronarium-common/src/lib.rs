@@ -99,6 +99,34 @@ pub struct Ipv6Key {
 pub const POLICY_ALLOW: u8 = 1;
 pub const POLICY_DENY: u8 = 2;
 
+/// Fixed-size prefix entry for the kernel-side file deny map. The first
+/// `len` bytes of `bytes` are compared against the opened filename;
+/// `len == 0` means the slot is empty and skipped.
+///
+/// Sized at 64 bytes (4 + 60) so the in-kernel scan stays well under
+/// the verifier's instruction-count budget even when fully unrolled.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "user", derive(Debug))]
+pub struct FileDenyPrefix {
+    pub len: u32,
+    pub bytes: [u8; FILE_DENY_PREFIX_LEN],
+}
+
+// bytemuck's derive doesn't cover `[T; N]` for non-default N (60 here)
+// on the version pinned in the workspace; impl manually. The layout is
+// trivially POD: `#[repr(C)]`, all fields are Pod, no padding.
+#[cfg(feature = "user")]
+unsafe impl bytemuck::Zeroable for FileDenyPrefix {}
+#[cfg(feature = "user")]
+unsafe impl bytemuck::Pod for FileDenyPrefix {}
+
+pub const FILE_DENY_PREFIX_LEN: usize = 60;
+/// Maximum number of kernel-side deny prefixes. Beyond this, entries
+/// fall through to userspace-only tagging (which still sets
+/// `denied: true` in the JSON log but doesn't kill the process).
+pub const FILE_DENY_MAX_ENTRIES: u32 = 8;
+
 /// Globally-scoped knobs readable from eBPF via an `Array` map at index 0.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -131,3 +159,5 @@ unsafe impl aya::Pod for Ipv4Key {}
 unsafe impl aya::Pod for Ipv6Key {}
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for Settings {}
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for FileDenyPrefix {}

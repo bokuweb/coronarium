@@ -258,6 +258,65 @@ jobs:
             echo "::error::coronarium exit=0 despite denied>0"
             exit 1
           fi
+      - name: file block e2e (kernel kills on denied open)
+        env:
+          CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
+          RUST_LOG: info
+        run: |
+          cat > /tmp/file-block.yml <<'EOF'
+          mode: block
+          network:
+            default: allow
+          file:
+            default: allow
+            deny:
+              - /etc/shadow
+          EOF
+          set +e
+          sudo -E ./bin/coronarium run \
+            --policy /tmp/file-block.yml \
+            --log /tmp/file-block.log.json \
+            -- /bin/sh -c 'cat /etc/shadow 2>/tmp/cat.stderr; echo cat_rc=$? > /tmp/cat.result'
+          coro_rc=$?
+          set -e
+          echo "--- coronarium rc=${coro_rc} ---"
+          echo "--- cat result ---"
+          cat /tmp/cat.result 2>/dev/null || echo "(no result file — process was killed before writing)"
+          echo "--- cat stderr ---"
+          cat /tmp/cat.stderr 2>/dev/null || true
+          echo "--- log ---"
+          head -40 /tmp/file-block.log.json
+          # The /bin/sh child got SIGKILL'd on the denied open. Either:
+          # (a) the result file is missing (killed mid-command), or
+          # (b) cat_rc is 137/128+9 (SIGKILL).
+          if [ -f /tmp/cat.result ]; then
+            rc=$(grep -oE 'cat_rc=[0-9]+' /tmp/cat.result | cut -d= -f2)
+            echo "cat_rc=$rc"
+            # cat killed by SIGKILL → 137; coronarium also surfaces violation.
+            if [ "$rc" = "0" ]; then
+              echo "::error::cat succeeded reading /etc/shadow — kernel block didn't fire"
+              exit 1
+            fi
+          fi
+          if [ "$coro_rc" = "0" ]; then
+            echo "::error::coronarium exit=0 despite denied open in block mode"
+            exit 1
+          fi
+          # Cross-check: the JSON log should have at least one denied open.
+          python3 - <<'PY'
+          import json, sys
+          log = json.load(open("/tmp/file-block.log.json"))
+          hit = any(
+              s.get("kind") == "open"
+              and s.get("denied") is True
+              and s.get("filename", "").startswith("/etc/shadow")
+              for s in log["samples"]
+          )
+          if not hit:
+              print("::error::no denied open event for /etc/shadow in the log")
+              sys.exit(1)
+          print(f"✓ denied={log['denied']} — kernel-side file block fired")
+          PY
       - name: file-prefix audit (flags /etc/shadow reads as denied)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium

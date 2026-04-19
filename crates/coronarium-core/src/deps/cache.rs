@@ -68,3 +68,60 @@ impl Cache {
         format!("{}/{}@{}", eco.label(), name, version)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("coronarium-cache-{id}/deps.json"))
+    }
+
+    #[test]
+    fn empty_cache_returns_none() {
+        let c = Cache::open(&tmp()).unwrap();
+        let dt: chrono::DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+        assert!(c.get(&Ecosystem::Crates, "serde", "1.0.0").is_none());
+        let _ = dt;
+    }
+
+    #[test]
+    fn put_then_get_roundtrip_and_persists() {
+        let path = tmp();
+        let when: chrono::DateTime<Utc> = "2020-06-15T09:00:00Z".parse().unwrap();
+        {
+            let mut c = Cache::open(&path).unwrap();
+            assert!(c.get(&Ecosystem::Npm, "foo", "1.2.3").is_none());
+            c.put(&Ecosystem::Npm, "foo", "1.2.3", when);
+            assert_eq!(c.get(&Ecosystem::Npm, "foo", "1.2.3"), Some(when));
+            c.save().unwrap();
+        }
+        let c2 = Cache::open(&path).unwrap();
+        assert_eq!(c2.get(&Ecosystem::Npm, "foo", "1.2.3"), Some(when));
+        // Different ecosystem key doesn't collide.
+        assert!(c2.get(&Ecosystem::Crates, "foo", "1.2.3").is_none());
+    }
+
+    #[test]
+    fn corrupt_cache_file_is_tolerated() {
+        let path = tmp();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not valid json").unwrap();
+        let c = Cache::open(&path).unwrap();
+        assert!(c.get(&Ecosystem::Npm, "x", "1").is_none());
+    }
+
+    #[test]
+    fn save_is_noop_when_not_dirty() {
+        let path = tmp();
+        let c = Cache::open(&path).unwrap();
+        c.save().unwrap();
+        // File shouldn't have been created (no parent mkdir either).
+        assert!(!path.exists());
+    }
+}

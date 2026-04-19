@@ -131,10 +131,60 @@ async fn resolve_all(
 }
 
 #[cfg(target_os = "linux")]
-fn populate_file_maps(_bpf: &mut aya::Ebpf, _policy: &Policy) -> anyhow::Result<()> {
-    // File policy is evaluated entirely in userspace (see
-    // `FileMatcher` in the loader). The eBPF tracepoint only ships the
-    // filename; doing prefix matching in the kernel blew the verifier's
-    // instruction-count budget once the scan got unrolled.
+fn populate_file_maps(bpf: &mut aya::Ebpf, policy: &Policy) -> anyhow::Result<()> {
+    use coronarium_common::{FILE_DENY_MAX_ENTRIES, FILE_DENY_PREFIX_LEN, FileDenyPrefix};
+
+    // Mirror the first `FILE_DENY_MAX_ENTRIES` policy.file.deny entries
+    // into the kernel-side FILE_DENY_PREFIX map. Matches there trigger
+    // bpf_send_signal(SIGKILL) on the offending process (in block mode).
+    // Beyond this cap, entries still fire `denied: true` tags via the
+    // userspace FileMatcher but won't kill the child.
+    let Some(map) = bpf.map_mut("FILE_DENY_PREFIX") else {
+        // Older BPF ELFs may not include this map; skip silently.
+        return Ok(());
+    };
+    let mut m: aya::maps::Array<_, FileDenyPrefix> = aya::maps::Array::try_from(map)?;
+
+    // Pre-compute zero'd entries for every slot so stale rules from a
+    // re-used map don't match.
+    let empty = FileDenyPrefix {
+        len: 0,
+        bytes: [0; FILE_DENY_PREFIX_LEN],
+    };
+    for i in 0..FILE_DENY_MAX_ENTRIES {
+        m.set(i, empty, 0)?;
+    }
+
+    let mut idx: u32 = 0;
+    for pat in &policy.file.deny {
+        if idx >= FILE_DENY_MAX_ENTRIES {
+            log::warn!(
+                "file.deny has more than {FILE_DENY_MAX_ENTRIES} entries — remaining are \
+                 audit-tagged only, not kernel-blocked."
+            );
+            break;
+        }
+        let bytes = pat.as_bytes();
+        if bytes.len() > FILE_DENY_PREFIX_LEN {
+            log::warn!(
+                "file.deny entry {:?} exceeds kernel prefix cap ({} bytes); only the first \
+                 {} bytes are enforced in-kernel (userspace match still covers the full string).",
+                pat,
+                bytes.len(),
+                FILE_DENY_PREFIX_LEN
+            );
+        }
+        let n = bytes.len().min(FILE_DENY_PREFIX_LEN);
+        let mut entry = FileDenyPrefix {
+            len: n as u32,
+            bytes: [0; FILE_DENY_PREFIX_LEN],
+        };
+        entry.bytes[..n].copy_from_slice(&bytes[..n]);
+        m.set(idx, entry, 0)?;
+        idx += 1;
+    }
+    log::info!(
+        "populated {idx}/{FILE_DENY_MAX_ENTRIES} file-deny prefix slots for kernel-side block"
+    );
     Ok(())
 }

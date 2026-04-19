@@ -68,3 +68,72 @@ pub fn parse(path: &Path) -> Result<Vec<Package>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(body: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("coronarium-nuget-{id}.lock.json"));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn unions_across_target_frameworks_skips_project_refs() {
+        let body = r#"{
+  "version": 1,
+  "dependencies": {
+    "net6.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "resolved": "13.0.1",
+        "contentHash": "x"
+      },
+      "MySolutionLib": {
+        "type": "Project"
+      }
+    },
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "resolved": "13.0.1",
+        "contentHash": "x"
+      },
+      "Serilog": {
+        "type": "Transitive",
+        "resolved": "3.1.0",
+        "contentHash": "y"
+      }
+    }
+  }
+}"#;
+        let p = tmp(body);
+        let pkgs = parse(&p).unwrap();
+        // Sort for stable comparison (may appear dup'd across TFMs).
+        let mut names: Vec<String> = pkgs.iter().map(|p| p.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Newtonsoft.Json".to_string(),
+                "Newtonsoft.Json".to_string(),
+                "Serilog".to_string(),
+            ]
+        );
+        assert!(pkgs.iter().all(|p| p.ecosystem == Ecosystem::Nuget));
+        assert!(pkgs.iter().all(|p| !p.version.is_empty()));
+    }
+
+    #[test]
+    fn missing_resolved_is_skipped() {
+        let body = r#"{"version":1,"dependencies":{"net6.0":{"Foo":{"type":"Direct"}}}}"#;
+        let p = tmp(body);
+        assert!(parse(&p).unwrap().is_empty());
+    }
+}

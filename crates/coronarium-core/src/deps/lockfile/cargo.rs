@@ -48,3 +48,57 @@ pub fn parse(path: &Path) -> Result<Vec<Package>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str, body: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("coronarium-cargo-{id}-{name}"));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn picks_up_registry_entries_skips_workspace_and_git() {
+        let body = r#"
+version = 3
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "my-ws-crate"
+version = "0.1.0"
+# workspace member: no `source`
+
+[[package]]
+name = "some-git-dep"
+version = "0.1.0"
+source = "git+https://github.com/x/y.git#abcdef"
+
+[[package]]
+name = "sparse-dep"
+version = "2.0.0"
+source = "sparse+https://index.crates.io/"
+"#;
+        let p = tmp("Cargo.lock", body);
+        let pkgs = parse(&p).unwrap();
+        let names: Vec<String> = pkgs.iter().map(|x| x.name.clone()).collect();
+        assert_eq!(names, vec!["serde".to_string(), "sparse-dep".to_string()]);
+        assert!(pkgs.iter().all(|p| p.ecosystem == Ecosystem::Crates));
+    }
+
+    #[test]
+    fn empty_lockfile_is_ok() {
+        let p = tmp("Cargo.lock-empty", "version = 3\n");
+        assert!(parse(&p).unwrap().is_empty());
+    }
+}

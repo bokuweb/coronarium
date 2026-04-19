@@ -25,8 +25,8 @@
 use aya_ebpf::{
     bindings::BPF_F_NO_PREALLOC,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_probe_read_user,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes, bpf_send_signal,
     },
     macros::{cgroup_sock_addr, map, tracepoint},
     maps::{Array, HashMap, RingBuf},
@@ -34,9 +34,15 @@ use aya_ebpf::{
 };
 use coronarium_common::{
     COMM_LEN, Connect4Event, Connect6Event, EVENT_KIND_CONNECT4, EVENT_KIND_CONNECT6,
-    EVENT_KIND_EXEC, EVENT_KIND_OPEN, EventHeader, ExecEvent, Ipv4Key, Ipv6Key, OpenEvent,
-    POLICY_ALLOW, POLICY_DENY, Settings, VERDICT_ALLOW, VERDICT_DENY,
+    EVENT_KIND_EXEC, EVENT_KIND_OPEN, EventHeader, ExecEvent, FILE_DENY_MAX_ENTRIES,
+    FILE_DENY_PREFIX_LEN, FileDenyPrefix, Ipv4Key, Ipv6Key, OpenEvent, POLICY_ALLOW, POLICY_DENY,
+    Settings, VERDICT_ALLOW, VERDICT_DENY,
 };
+
+/// POSIX signal number for SIGKILL. bpf_send_signal queues this for
+/// delivery on syscall return, which kills the offending process before
+/// it can consume whatever `openat` would have returned.
+const SIGKILL: u32 = 9;
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -49,6 +55,14 @@ static NET4: HashMap<Ipv4Key, u8> = HashMap::with_max_entries(1024, BPF_F_NO_PRE
 
 #[map]
 static NET6: HashMap<Ipv6Key, u8> = HashMap::with_max_entries(1024, BPF_F_NO_PREALLOC);
+
+/// Small, bounded prefix map for kernel-side file block. Userspace
+/// populates this with the first `FILE_DENY_MAX_ENTRIES` entries from
+/// `policy.file.deny`; anything beyond falls through to userspace-only
+/// tagging.
+#[map]
+static FILE_DENY_PREFIX: Array<FileDenyPrefix> =
+    Array::with_max_entries(FILE_DENY_MAX_ENTRIES, 0);
 
 #[inline(always)]
 fn settings() -> Settings {
@@ -148,11 +162,33 @@ pub fn coronarium_openat(ctx: TracePointContext) -> u32 {
     };
     let flags: u32 = unsafe { ctx.read_at::<u32>(32).unwrap_or(0) };
 
+    // Copy the filename to a local bounded buffer for the deny check.
+    let mut scratch = [0u8; FILE_DENY_PREFIX_LEN];
+    let mut scratch_len: usize = 0;
+    if !filename_ptr.is_null() {
+        unsafe {
+            if let Ok(read) = bpf_probe_read_user_str_bytes(filename_ptr, &mut scratch) {
+                scratch_len = read.len();
+            }
+        }
+    }
+
+    let denied = scratch_len > 0 && file_deny_matches(&scratch, scratch_len);
+    if denied && settings().mode == 1 {
+        // Kill the offending process. bpf_send_signal runs against
+        // the current task (which is the one calling openat); SIGKILL
+        // gets queued and delivered when the syscall returns.
+        let _ = unsafe { bpf_send_signal(SIGKILL) };
+    }
+
     if let Some(mut entry) = EVENTS.reserve::<OpenEvent>(0) {
         let ptr = entry.as_mut_ptr();
         unsafe {
             core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<OpenEvent>());
-            (*ptr).header = make_header(EVENT_KIND_OPEN, VERDICT_ALLOW);
+            (*ptr).header = make_header(
+                EVENT_KIND_OPEN,
+                if denied { VERDICT_DENY } else { VERDICT_ALLOW },
+            );
             (*ptr).flags = flags;
             if !filename_ptr.is_null() {
                 let buf: &mut [u8] = &mut (*ptr).filename;
@@ -162,6 +198,37 @@ pub fn coronarium_openat(ctx: TracePointContext) -> u32 {
         entry.submit(0);
     }
     0
+}
+
+/// Linear scan of the FILE_DENY_PREFIX map. `FILE_DENY_MAX_ENTRIES = 8`
+/// keeps the unrolled program well within the verifier's instruction
+/// count budget even after in-lining the per-byte compare loop.
+#[inline(always)]
+fn file_deny_matches(path: &[u8; FILE_DENY_PREFIX_LEN], path_len: usize) -> bool {
+    let mut i: u32 = 0;
+    let mut hit = false;
+    while i < FILE_DENY_MAX_ENTRIES {
+        if !hit
+            && let Some(slot) = unsafe { FILE_DENY_PREFIX.get(i) }
+        {
+            let needle = slot.len as usize;
+            if needle > 0 && needle <= FILE_DENY_PREFIX_LEN && needle <= path_len {
+                let mut mismatch = false;
+                let mut j = 0usize;
+                while j < FILE_DENY_PREFIX_LEN {
+                    if j < needle && path[j] != slot.bytes[j] {
+                        mismatch = true;
+                    }
+                    j += 1;
+                }
+                if !mismatch {
+                    hit = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    hit
 }
 
 // ---------------------------------------------------------------------------
