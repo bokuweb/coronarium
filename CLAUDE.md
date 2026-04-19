@@ -52,27 +52,30 @@ rather than as a wall against script-based attacks. The only way
 to reliably *prevent* those is to check BEFORE install happens
 (see `deps check` in CI, or the planned `install-gate` wrapper).
 
-### We do not auto-fallback like pnpm's `minimumReleaseAge`
+### Auto-fallback (pnpm-style): crates.io only, via the proxy
 
-pnpm 10.x has `minimumReleaseAge` which teaches its resolver to
-**filter versions younger than the threshold out of its candidate
-set**, silently resolving to the newest in-range version that also
-meets the age requirement. This is very nice UX: builds don't
-break, they just use slightly older deps.
+pnpm 10.x's `minimumReleaseAge` teaches its resolver to **filter
+versions younger than the threshold out of its candidate set**,
+silently resolving to the newest in-range version that also meets
+the age requirement. Builds don't break; they just use slightly
+older deps.
 
-coronarium does not do this. We exit 1 on violation; the install
-itself has already happened (or won't, if the user wired us in
-pre-install). Teaching every ecosystem's resolver to filter would
-require:
-- cargo: hook the resolver (or ship a sparse-index proxy)
-- npm: ditto + peer-dep gymnastics
-- pip: pip's backtracking resolver is complex
-- nuget: newer API to intercept
+**Status (v0.15):**
+- **crates.io** — ✅ implemented via the proxy. `coronarium
+  proxy serve` rewrites `index.crates.io` sparse-index responses on
+  the fly, dropping JSONL lines whose `(name, vers)` publish time is
+  < `--min-age`. cargo's resolver sees only acceptable versions and
+  naturally picks the newest older-in-range. No error; no user
+  action required beyond running cargo through the proxy.
+- **npm / pypi / nuget** — still fail-hard. The proxy returns 403
+  on a too-young pinned fetch; the install stops. Sparse-index-like
+  rewriting for these ecosystems is the next roadmap item. The
+  blockers are format-specific (npm's registry returns one JSON doc
+  listing *all* versions; PyPI has a JSON API and a separate simple
+  index; NuGet uses versioned flat-container URLs).
 
-It's a real roadmap item (see "Roadmap" below) but it's a large
-investment. Until then: `deps check` tells you something is too
-young, and it's up to you to tighten the version range in your
-manifest.
+For ecosystems without rewriting, `deps check` (CI) or the proxy's
+hard-deny (desktop) is still the defense — just not silent.
 
 ### file block is "tripwire", not pre-open block
 
@@ -108,9 +111,10 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 2. **HTTPS registry proxy** — same idea but transparent: set
    `HTTPS_PROXY` system-wide, filter fetch traffic. No shell
    aliasing required, but MITM cert management is a UX chore.
-3. **pnpm-style auto-fallback** — the big one. Per-ecosystem
-   resolver integration, probably via sparse-index proxy for
-   cargo and an npm cache server for npm/pnpm.
+3. **pnpm-style auto-fallback for npm/pypi/nuget** — crates.io
+   already works via sparse-index rewrite (v0.15). Extend to the
+   other three: npm packument filtering, PyPI simple-index /
+   JSON-API filtering, NuGet flat-container index filtering.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.

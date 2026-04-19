@@ -486,9 +486,11 @@ name = "coronarium-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "coronarium-core",
  "http",
+ "http-body-util",
  "hudsucker",
  "log",
  "rcgen",
