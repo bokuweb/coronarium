@@ -1,5 +1,5 @@
 name: "coronarium"
-description: "eBPF-based network/file/exec audit & block for GitHub Actions"
+description: "eBPF/ETW audit & block for GitHub Actions (Linux + Windows)"
 author: "bokuweb"
 branding:
   icon: "shield"
@@ -15,26 +15,28 @@ inputs:
     required: false
     default: "audit"
   version:
-    description: "Coronarium release tag to install (e.g. v0.1.0). Defaults to whatever tag this action was referenced as."
+    description: "Coronarium release tag to install (e.g. v0.6.0). Defaults to whatever tag this action was referenced as; `latest` resolves the newest release."
     required: false
     default: ""
   log:
-    description: "Where the subsequent `coronarium-run` step should write its JSON audit log."
+    description: "Where the subsequent `coronarium run` step should write its JSON audit log."
     required: false
     default: "coronarium.log.json"
 
 outputs:
   bin:
     description: "Absolute path to the installed coronarium binary."
-    value: ${{ steps.install.outputs.bin }}
+    value: ${{ steps.linux.outputs.bin || steps.windows.outputs.bin }}
   bpf:
-    description: "Absolute path to the installed coronarium.bpf.o."
-    value: ${{ steps.install.outputs.bpf }}
+    description: "Absolute path to the installed coronarium.bpf.o (Linux only)."
+    value: ${{ steps.linux.outputs.bpf }}
 
 runs:
   using: composite
   steps:
-    - id: install
+    # --------------- Linux ---------------
+    - id: linux
+      if: runner.os == 'Linux'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -42,31 +44,20 @@ runs:
       run: |
         set -euo pipefail
 
-        if [[ "${RUNNER_OS}" != "Linux" ]]; then
-          echo "::error::coronarium only supports Linux runners (got ${RUNNER_OS})"
-          exit 1
-        fi
-
-        # Resolve version: input > action ref > latest.
         version="${INPUT_VERSION}"
         if [[ -z "${version}" ]]; then
-          # github.action_ref isn't exposed to composite steps directly; fall
-          # back to whatever the parent workflow pinned.
           version="${GITHUB_ACTION_REF:-}"
         fi
-        if [[ -z "${version}" || "${version}" == "main" ]]; then
+        if [[ -z "${version}" || "${version}" == "main" || "${version}" == "latest" ]]; then
           version=$(gh release view --repo bokuweb/coronarium --json tagName -q .tagName)
         fi
-        echo "Installing coronarium ${version}"
+        echo "Installing coronarium ${version} for Linux"
 
         arch=$(uname -m)
         case "${arch}" in
           x86_64)  target="x86_64-unknown-linux-musl" ;;
           aarch64) target="aarch64-unknown-linux-musl" ;;
-          *)
-            echo "::error::unsupported runner arch: ${arch}"
-            exit 1
-            ;;
+          *) echo "::error::unsupported Linux arch: ${arch}"; exit 1 ;;
         esac
 
         asset="coronarium-${target}.tar.gz"
@@ -88,13 +79,68 @@ runs:
         echo "bin=${dest}/coronarium" >> "${GITHUB_OUTPUT}"
         echo "bpf=${dest}/coronarium.bpf.o" >> "${GITHUB_OUTPUT}"
         echo "CORONARIUM_BPF_OBJ=${dest}/coronarium.bpf.o" >> "${GITHUB_ENV}"
-        # Stash the binary path for the companion coronarium-run action.
         echo "CORONARIUM_BIN=${dest}/coronarium" >> "${GITHUB_ENV}"
         echo "CORONARIUM_POLICY=${{ inputs.policy }}" >> "${GITHUB_ENV}"
         echo "CORONARIUM_MODE=${{ inputs.mode }}" >> "${GITHUB_ENV}"
         echo "CORONARIUM_LOG=${{ inputs.log }}" >> "${GITHUB_ENV}"
+        echo "CORONARIUM_OS=linux" >> "${GITHUB_ENV}"
 
+    # --------------- Windows ---------------
+    - id: windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $version = $env:INPUT_VERSION
+        if ([string]::IsNullOrEmpty($version)) { $version = $env:GITHUB_ACTION_REF }
+        if ([string]::IsNullOrEmpty($version) -or $version -eq "main" -or $version -eq "latest") {
+          $version = gh release view --repo bokuweb/coronarium --json tagName -q .tagName
+        }
+        Write-Host "Installing coronarium $version for Windows"
+
+        $target = "x86_64-pc-windows-msvc"
+        $asset = "coronarium-$target.tar.gz"
+        $workdir = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\coronarium-download" | Select-Object -ExpandProperty FullName
+        Push-Location $workdir
+        gh release download $version --repo bokuweb/coronarium --pattern $asset --pattern "$asset.sha256"
+
+        # Manual checksum verify (sha256sum is not on Windows by default but
+        # certutil is — still, a couple lines of pwsh is simpler).
+        $expected = ((Get-Content "$asset.sha256") -split '\s+')[0]
+        $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+        if ($expected -ne $actual) {
+          throw "checksum mismatch for $asset (expected $expected, got $actual)"
+        }
+
+        tar -xzf $asset
+        Pop-Location
+
+        $dest = "$env:RUNNER_TEMP\coronarium"
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        Move-Item -Force "$workdir\coronarium-$target\coronarium-win.exe" "$dest\coronarium-win.exe"
+
+        # Expose the same env / output names as Linux so downstream steps
+        # can be written once and work on both.
+        "bin=$dest\coronarium-win.exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "CORONARIUM_BIN=$dest\coronarium-win.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CORONARIUM_POLICY=${{ inputs.policy }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CORONARIUM_MODE=${{ inputs.mode }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CORONARIUM_LOG=${{ inputs.log }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "CORONARIUM_OS=windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    # --------------- anything else (macOS) ---------------
+    - if: runner.os != 'Linux' && runner.os != 'Windows'
+      shell: bash
+      run: |
+        echo "::error::coronarium supports Linux + Windows only (runner=${RUNNER_OS})"
+        exit 1
+
+    # --------------- info step (both OSes) ---------------
     - shell: bash
+      if: runner.os == 'Linux'
       run: |
         if [[ -f "${CORONARIUM_POLICY}" ]]; then
           "${CORONARIUM_BIN}" check-policy --policy "${CORONARIUM_POLICY}" >/dev/null
@@ -103,5 +149,11 @@ runs:
           echo "::notice::policy file '${CORONARIUM_POLICY}' not found — the next 'coronarium run' step should point --policy somewhere real."
         fi
         echo ""
-        echo "Coronarium installed. Wrap the command you want to supervise like:"
+        echo "Coronarium (Linux) installed. Wrap the command you want to supervise like:"
         echo "    - run: sudo -E \$CORONARIUM_BIN run --policy <path> --mode \$CORONARIUM_MODE --log \$CORONARIUM_LOG --summary \$GITHUB_STEP_SUMMARY -- <your command>"
+
+    - shell: pwsh
+      if: runner.os == 'Windows'
+      run: |
+        Write-Host "Coronarium (Windows) installed. Wrap the command you want to supervise like:"
+        Write-Host "    - run: & `"$env:CORONARIUM_BIN`" --policy <path> --mode $env:CORONARIUM_MODE --log $env:CORONARIUM_LOG --summary $env:GITHUB_STEP_SUMMARY -- <your command>"

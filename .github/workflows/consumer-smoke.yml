@@ -112,3 +112,33 @@ jobs:
             exit 1
           } || true
           echo "✓ released action fails CI on block + deny, and curl itself was blocked"
+
+  use-as-action-windows:
+    # Proves `bokuweb/coronarium@v0` also works on windows-latest, using
+    # the same inputs / env contract as the Linux job above.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bokuweb/coronarium@v0
+        with:
+          mode: audit
+      - name: Run supervised command (Windows)
+        shell: pwsh
+        run: |
+          $policy = "$env:RUNNER_TEMP\policy.yml"
+          @"
+          mode: audit
+          network:
+            default: allow
+          file:
+            default: allow
+          "@ | Out-File -Encoding utf8 $policy
+          $log = "$env:RUNNER_TEMP\log.json"
+          $html = "$env:RUNNER_TEMP\report.html"
+          & $env:CORONARIUM_BIN --policy $policy --log $log --html $html `
+            -- powershell -Command "Get-ChildItem C:\Windows | Select -First 3"
+          if ($LASTEXITCODE -ne 0) { throw "coronarium-win exit=$LASTEXITCODE" }
+          $json = Get-Content $log -Raw | ConvertFrom-Json
+          Write-Host "observed=$($json.observed) denied=$($json.denied)"
+          if ($json.observed -lt 1) { throw "no events captured" }
+          if (-not (Test-Path $html)) { throw "html report missing" }

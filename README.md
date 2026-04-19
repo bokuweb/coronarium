@@ -163,6 +163,9 @@ The full parsed shape is what `coronarium check-policy` prints.
 
 ## GitHub Actions
 
+The action works on Linux **and** Windows runners — same inputs, same
+env contract, OS-specific binary picked automatically:
+
 ```yaml
 # .github/workflows/build.yml
 name: build
@@ -170,12 +173,15 @@ on: [push]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # Installs the coronarium binary + bpf.o from the v0.x release.
-      # `@v0` is a floating tag that tracks the newest v0.x.y.
+      # Installs the right binary for this runner's OS. `@v0` is a floating
+      # tag that tracks the newest v0.x.y across platforms.
       - uses: bokuweb/coronarium@v0
         with:
           policy: .github/coronarium.yml
@@ -184,7 +190,9 @@ jobs:
       # Wrap your real command with `coronarium run`. The install step
       # exported CORONARIUM_BIN / CORONARIUM_POLICY / CORONARIUM_MODE /
       # CORONARIUM_LOG so you don't need to repeat them here.
-      - run: |
+      # Linux (needs sudo for CAP_BPF):
+      - if: runner.os == 'Linux'
+        run: |
           sudo -E "$CORONARIUM_BIN" run \
             --policy  "$CORONARIUM_POLICY" \
             --mode    "$CORONARIUM_MODE" \
@@ -192,11 +200,22 @@ jobs:
             --summary "$GITHUB_STEP_SUMMARY" \
             -- cargo test
 
+      # Windows (already elevated; no sudo):
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & $env:CORONARIUM_BIN `
+            --policy  $env:CORONARIUM_POLICY `
+            --mode    $env:CORONARIUM_MODE `
+            --log     $env:CORONARIUM_LOG `
+            --summary $env:GITHUB_STEP_SUMMARY `
+            -- cargo test
+
       # Optional: attach the JSON log as an artifact for later inspection.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coronarium-log
+          name: coronarium-log-${{ runner.os }}
           path: coronarium.log.json
 ```
 
@@ -298,19 +317,25 @@ The step needs `pull-requests: write` in `permissions:` (or the default
 
 ### Runner requirements
 
-Coronarium requires:
-
-- **Linux kernel ≥ 5.13** (cgroup v2, ringbuf, `sys_enter_*` tracepoints)
-- **`CAP_BPF` + `CAP_SYS_ADMIN`** — `coronarium run` is invoked via `sudo`
-- **cgroup v2 unified hierarchy** at `/sys/fs/cgroup` (default on Ubuntu ≥ 22.04)
-
 | runner | supported | notes |
 |---|---|---|
-| `ubuntu-latest`, `ubuntu-22.04`, `ubuntu-24.04` | ✅ | canonical target |
-| `ubuntu-24.04-arm` | ✅ | aarch64 assets ship in the same release |
-| container jobs (`container:` key) | ⚠️ | needs `--privileged` and host cgroup mount |
-| self-hosted | ⚠️ | runner user must have passwordless `sudo` and the host kernel must expose tracepoints + bpf |
-| Windows / macOS | ❌ | eBPF is Linux-only; action exits early |
+| `ubuntu-latest`, `ubuntu-22.04`, `ubuntu-24.04` | ✅ | eBPF (cgroup/connect, tracepoints, ringbuf); canonical target |
+| `ubuntu-24.04-arm` | ✅ | same featureset, aarch64 binary ships in each release |
+| `windows-latest` | ✅ | ETW public providers; runs elevated by default |
+| `windows-2022`, `windows-2019` | ⚠️ | probably works but not smoke-tested yet |
+| container jobs (`container:` key on Linux) | ⚠️ | needs `--privileged` + host cgroup mount |
+| self-hosted Linux | ⚠️ | requires passwordless `sudo`, kernel ≥ 5.13, tracepoints + bpf exposed |
+| self-hosted Windows | ⚠️ | requires Administrator (for ETW kernel provider subscription) |
+| macOS | ❌ | action exits early on any non-Linux/Windows runner |
+
+Linux path needs: kernel ≥ 5.13 (cgroup v2, ringbuf), `CAP_BPF` +
+`CAP_SYS_ADMIN` via `sudo`, cgroup v2 unified hierarchy at
+`/sys/fs/cgroup`.
+
+Windows path needs: Administrator (hosted runners are elevated by
+default). Uses the `Microsoft-Windows-Kernel-Process`,
+`-Kernel-Network`, and `-Kernel-File` public ETW providers — no kernel
+driver install, no signing.
 
 If the BPF programs fail to attach (typically a kernel-config or
 capabilities issue), `coronarium run` logs a warning and falls through to
