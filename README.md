@@ -345,22 +345,38 @@ in the step log.
 
 ## Limitations
 
-Honesty about what this does and doesn't do:
+Honesty about what this does and doesn't do — per-OS:
 
-- **Network block works at the kernel**: `default: deny` actually makes
-  `connect(2)` return EPERM to the caller, so the supervised process
-  observes `Connection refused`.
-- **File block is audit-only**: `file.deny` tags matching opens as
-  `denied: true` in the JSON log and makes `mode: block` exit non-zero,
-  but the child still reads the file. Real enforcement needs
-  `bpf_override_return` (kernel-config dependent).
-- **Exec block is audit-only** for the same reason. `coronarium run`
-  prints a loud warning when `mode: block` + non-empty
-  `process.deny_exec` is configured.
-- **Hostname resolution is one-shot** at startup. If DNS changes during
-  the run, the map is stale.
-- **Ring-buffer overflow** under event bursts is counted as `lost`; the
-  summary surfaces a warning when `lost > 0`.
+### Linux
+
+- **Network block works at the kernel**: `default: deny` makes
+  `connect(2)` return `EPERM` via a `cgroup/connect4|6` BPF program.
+- **File / exec block is audit-only**: `file.deny` / `process.deny_exec`
+  tag matching events as `denied: true` in the JSON log and make
+  `mode: block` exit non-zero, but the child process is not prevented.
+  Real enforcement needs `bpf_override_return` (kernel-config
+  dependent; roadmap).
+
+### Windows
+
+- **Network deny is kernel-enforced** for IP literals / CIDRs /
+  hostnames via dynamic Windows Defender Firewall rules created by
+  `New-NetFirewallRule -Program <child.exe> -Direction Outbound
+  -Action Block`. Rules are scoped by child-exe path and by a per-PID
+  display-name prefix, and cleaned up via RAII on exit.
+- **Network `default: deny` with `allow: [...]` is audit-only on
+  Windows.** Windows FW's rule evaluation is "block wins over allow",
+  so an allowlist pattern can't be expressed without flipping the
+  system-wide default outbound to `Block`, which would affect the
+  rest of the runner. Use `network.deny: [...]` for enforcement.
+- **File / exec block is audit-only** (same as Linux).
+
+### Both
+
+- **Hostname resolution is one-shot** at startup. DNS rebinds during
+  the run won't be tracked.
+- **Ring-buffer / ETW overflow** is counted as `lost`; the summary
+  surfaces a warning when `lost > 0`.
 
 ## Troubleshooting
 

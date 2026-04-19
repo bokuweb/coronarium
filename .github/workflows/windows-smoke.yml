@@ -114,6 +114,56 @@ jobs:
           # otherwise inherits $LASTEXITCODE and fails the step.
           exit 0
 
+      - name: network block e2e (curl to denied IP should fail)
+        shell: pwsh
+        working-directory: crates/coronarium-win
+        run: |
+          $exe = "target\release\coronarium-win.exe"
+          $policy = "$env:RUNNER_TEMP\netblock.yml"
+          # example.com's stable IPv4; we block it via policy and expect
+          # curl to either time out (firewall drops the SYN) or fail with
+          # an unambiguous network error.
+          @"
+          mode: block
+          network:
+            default: allow
+            deny:
+              - target: 93.184.216.34
+                ports: [80, 443]
+          "@ | Out-File -Encoding utf8 $policy
+
+          $log = "$env:RUNNER_TEMP\netblock.json"
+          $out = "$env:RUNNER_TEMP\curl-out.txt"
+          $err = "$env:RUNNER_TEMP\curl-err.txt"
+
+          # Resolve curl.exe so the firewall rule's -Program matches what
+          # actually runs (coronarium-win does this via `where` too).
+          $curl = (Get-Command curl.exe).Source
+          Write-Host "using curl at $curl"
+
+          & $exe --policy $policy --log $log --mode block -- $curl -sS -m 8 -o $out http://93.184.216.34/ 2>$err
+          $rc = $LASTEXITCODE
+          Write-Host "coronarium rc=${rc}"
+          Write-Host "--- curl stderr ---"
+          Get-Content $err -ErrorAction SilentlyContinue
+          Write-Host "--- log head ---"
+          Get-Content $log -TotalCount 60
+
+          if ($rc -eq 0) {
+            Write-Error "coronarium exit=0 — firewall didn't block, or deny wasn't observed"
+            exit 1
+          }
+          # curl itself should have failed. Accept either connection
+          # timeout (28) or couldn't-connect (7); the FW silently drops
+          # so timeout is the common outcome on hosted runners.
+          $stderr = (Get-Content $err -ErrorAction SilentlyContinue) -join "`n"
+          if ($stderr -notmatch "(Connection|timed out|time-out|Couldn't connect|Failed to connect|refused)") {
+            Write-Error "curl stderr doesn't look like a network failure:`n$stderr"
+            exit 1
+          }
+          Write-Host "✓ Windows firewall block denied the outbound TCP connect"
+          exit 0
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -122,3 +172,5 @@ jobs:
             ${{ runner.temp }}\log.json
             ${{ runner.temp }}\report.html
             ${{ runner.temp }}\block.json
+            ${{ runner.temp }}\netblock.json
+            ${{ runner.temp }}\curl-*.txt

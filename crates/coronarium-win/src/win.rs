@@ -13,9 +13,11 @@ use clap::{Parser, ValueEnum};
 use coronarium_core::{
     Event, Policy, Stats,
     matcher::{ExecMatcher, FileMatcher},
-    policy::{self, Mode},
+    policy::{self, DefaultDecision, Mode},
     report::ReportArgs,
 };
+
+use crate::firewall::{FirewallGuard, resolve_program};
 use ferrisetw::{
     EventRecord, parser::Parser as EtwParser, provider::Provider,
     schema_locator::SchemaLocator, trace::UserTrace,
@@ -88,6 +90,16 @@ pub fn run() -> Result<()> {
 
     let file_matcher = Arc::new(FileMatcher::from_policy(&policy.file));
     let exec_matcher = Arc::new(ExecMatcher::from_policy(&policy.process));
+    // Pre-resolve network.deny IPs so the connect-event callback can tag
+    // matches quickly without blocking on DNS.
+    let denied_addrs: Arc<Vec<String>> = Arc::new(
+        policy
+            .network
+            .deny
+            .iter()
+            .flat_map(|r| crate::firewall::resolve_rule_public(r))
+            .collect(),
+    );
     let stats = Arc::new(Mutex::new(Stats::default()));
 
     // Callbacks need 'static + Send + Sync. Clone the Arcs into each closure.
@@ -100,8 +112,9 @@ pub fn run() -> Result<()> {
     };
     let network_cb = {
         let stats = Arc::clone(&stats);
+        let denied = Arc::clone(&denied_addrs);
         move |record: &EventRecord, schema_locator: &SchemaLocator| {
-            handle_network_event(record, schema_locator, &stats);
+            handle_network_event(record, schema_locator, &stats, &denied);
         }
     };
     let file_cb = {
@@ -157,6 +170,37 @@ pub fn run() -> Result<()> {
         .command
         .split_first()
         .context("empty command after arg parse")?;
+
+    // --- network block (Windows Defender Firewall) ---
+    // Only in `mode: block` do we actually install rules. Audit mode
+    // tags denied events in the JSON log but doesn't touch the OS fw.
+    let _fw_guard = if matches!(mode, Mode::Block) {
+        if matches!(policy.network.default, DefaultDecision::Deny) {
+            log::warn!(
+                "network.default=deny on Windows is audit-only — Windows \
+                 Defender Firewall block rules always win over allow rules, \
+                 so an 'allowlist' pattern can't be expressed safely without \
+                 changing the system-wide default-outbound policy. Use \
+                 network.deny: [...] to block specific endpoints instead."
+            );
+        }
+        let exe_path = resolve_program(program);
+        let exe_str = exe_path.to_string_lossy().to_string();
+        log::info!("installing firewall block rules for {exe_str}");
+        match FirewallGuard::apply(&policy.network, &exe_str) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // ::error:: annotation so CI turns red clearly.
+                eprintln!(
+                    "::error title=coronarium::failed to install firewall rules in block mode: {e:#}"
+                );
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
     let status = Command::new(program)
         .args(rest)
         .status()
@@ -258,7 +302,12 @@ fn debug_log_process_start(filename: &str, argv0: &str, pid: u32) {
     }
 }
 
-fn handle_network_event(record: &EventRecord, schema_locator: &SchemaLocator, stats: &Mutex<Stats>) {
+fn handle_network_event(
+    record: &EventRecord,
+    schema_locator: &SchemaLocator,
+    stats: &Mutex<Stats>,
+    denied_addrs: &[String],
+) {
     debug_log_event_id("network", record.event_id());
     let Ok(schema) = schema_locator.event_schema(record) else {
         return;
@@ -282,6 +331,11 @@ fn handle_network_event(record: &EventRecord, schema_locator: &SchemaLocator, st
         .or_else(|_| parser.try_parse::<u16>("DestinationPort"))
         .unwrap_or(0);
 
+    // Match on the textual daddr. Good enough for IP literals (most
+    // common deny target); for CIDR / hostname-resolved entries we
+    // already expanded to a flat list at startup.
+    let denied = denied_addrs.iter().any(|a| a == &daddr);
+
     let ev = Event::Connect {
         pid,
         uid: 0,
@@ -289,7 +343,7 @@ fn handle_network_event(record: &EventRecord, schema_locator: &SchemaLocator, st
         daddr,
         dport,
         protocol: 6,
-        denied: false,
+        denied,
     };
     stats.lock().unwrap().ingest(ev);
 }
