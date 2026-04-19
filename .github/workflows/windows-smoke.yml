@@ -34,15 +34,6 @@ jobs:
         working-directory: crates/coronarium-win
         run: cargo build --release
 
-      - name: Stop any lingering NT Kernel Logger session
-        shell: pwsh
-        run: |
-          # The NT Kernel Logger session is a Windows-wide singleton. Any
-          # previous run or flaky shutdown can leave it lingering; stop it
-          # (ignore the error if it wasn't running).
-          logman stop "NT Kernel Logger" -ets 2>$null
-          exit 0
-
       - name: Run audit against `cmd /C dir`
         shell: pwsh
         working-directory: crates/coronarium-win
@@ -66,12 +57,6 @@ jobs:
             Write-Error "child should have exited 0 (dir succeeded)"
             exit 1
           }
-
-      - name: Stop lingering kernel session before next run
-        shell: pwsh
-        run: |
-          logman stop "NT Kernel Logger" -ets 2>$null
-          exit 0
 
       - name: Run audit against a curl (exercise TcpIp)
         shell: pwsh

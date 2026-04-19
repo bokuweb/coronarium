@@ -23,11 +23,18 @@ use std::{
 use anyhow::{Context, Result};
 use ferrisetw::{
     EventRecord,
-    provider::{Provider, kernel_providers},
+    provider::Provider,
     schema_locator::SchemaLocator,
-    trace::KernelTrace,
+    trace::UserTrace,
 };
 use serde::Serialize;
+
+// Modern public ETW providers (Windows 8+). Unlike the legacy "NT Kernel
+// Logger" which is a Windows-wide singleton that the OS itself holds,
+// these can be consumed by any number of named UserTrace sessions.
+const PROVIDER_KERNEL_PROCESS: &str = "22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716";
+const PROVIDER_KERNEL_NETWORK: &str = "7DD42A49-5329-4832-8DFD-43D979153A88";
+const PROVIDER_KERNEL_FILE: &str = "EDD08927-9CC4-4E65-B970-C2560FB5C289";
 
 static N_PROCESS: AtomicU64 = AtomicU64::new(0);
 static N_TCPIP: AtomicU64 = AtomicU64::new(0);
@@ -80,37 +87,33 @@ fn main() -> Result<()> {
         N_FILEIO.fetch_add(1, Ordering::Relaxed);
     };
 
-    let process_provider = Provider::kernel(&kernel_providers::PROCESS_PROVIDER)
+    // Modern public providers (by GUID) instead of the legacy NT Kernel
+    // Logger. The legacy session is a Windows-wide singleton held by OS
+    // services (perf counters, autologger, Defender), so we can't get a
+    // clean start on it. These public providers expose the same events
+    // via ETW's user-mode trace sessions, which can be uniquely named.
+    let process_provider = Provider::by_guid(PROVIDER_KERNEL_PROCESS)
         .add_callback(process_cb)
         .build();
-    let tcpip_provider = Provider::kernel(&kernel_providers::TCP_IP_PROVIDER)
+    let tcpip_provider = Provider::by_guid(PROVIDER_KERNEL_NETWORK)
         .add_callback(tcpip_cb)
         .build();
-    let fileio_provider = Provider::kernel(&kernel_providers::FILE_IO_PROVIDER)
+    let fileio_provider = Provider::by_guid(PROVIDER_KERNEL_FILE)
         .add_callback(fileio_cb)
         .build();
 
-    // `start_and_process` opens the NT Kernel Logger session and spawns
-    // the ETW processing thread. Drop (or .stop()) ends the trace.
-    // NT Kernel Logger is a Windows-wide singleton. A crashed previous run
-    // can leave the session registered, then start_and_process fails with
-    // AlreadyExist. Ask the OS to stop any lingering session first — ignore
-    // failure (means it wasn't running, which is fine).
-    let _ = Command::new("logman")
-        .args(["stop", "NT Kernel Logger", "-ets"])
-        .output();
-
-    // ferrisetw's TraceError doesn't impl std::error::Error, so convert
-    // manually instead of using `.context`.
-    let _trace = KernelTrace::new()
-        .named("coronarium-win".to_string())
+    // Process-unique session name — no singleton conflicts even if runs
+    // overlap or a previous one crashed without cleanup.
+    let session_name = format!("coronarium-{}", std::process::id());
+    let _trace = UserTrace::new()
+        .named(session_name.clone())
         .enable(process_provider)
         .enable(tcpip_provider)
         .enable(fileio_provider)
         .start_and_process()
         .map_err(|e| {
             anyhow::anyhow!(
-                "failed to start NT Kernel Logger ETW session: {e:?} \
+                "failed to start ETW session '{session_name}': {e:?} \
                  (requires Administrator; hosted runners are elevated by default)"
             )
         })?;
