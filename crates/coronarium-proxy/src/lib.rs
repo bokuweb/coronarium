@@ -6,6 +6,7 @@ pub mod decision;
 pub mod install;
 pub mod parser;
 pub mod proxy;
+pub mod rewrite;
 
 pub use decision::{AgeOracle, Decider, Decision, RegistryOracle};
 pub use parser::{
@@ -13,3 +14,4 @@ pub use parser::{
     parse_for_host,
 };
 pub use proxy::{ProxyConfig, run};
+pub use rewrite::{RewriteStats, rewrite_crates_index_jsonl};

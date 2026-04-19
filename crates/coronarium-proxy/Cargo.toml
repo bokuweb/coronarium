@@ -28,3 +28,5 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc
 time = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 http = "1"
+http-body-util = "0.1"
+bytes = "1"

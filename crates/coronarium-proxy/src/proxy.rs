@@ -21,6 +21,7 @@ use hudsucker::{
 use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
+use crate::rewrite::rewrite_crates_index_jsonl;
 
 pub struct ProxyConfig {
     pub listen: SocketAddr,
@@ -77,6 +78,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
     let handler = CoronariumHandler {
         parsers: Arc::new(default_parsers()),
         decider,
+        last_host: None,
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -110,6 +112,10 @@ fn should_intercept(host: &str, parsers: &[Box<dyn RegistryParser>]) -> bool {
 struct CoronariumHandler {
     parsers: Arc<Vec<Box<dyn RegistryParser>>>,
     decider: Arc<Decider<dyn AgeOracle>>,
+    /// Host of the in-flight request, captured in `handle_request` so
+    /// `handle_response` knows whether to rewrite the body. hudsucker
+    /// guarantees the same handler instance sees the matching pair.
+    last_host: Option<String>,
 }
 
 impl HttpHandler for CoronariumHandler {
@@ -129,8 +135,10 @@ impl HttpHandler for CoronariumHandler {
             .unwrap_or("")
             .to_string();
         if !should_intercept(&host, &self.parsers) {
+            self.last_host = None;
             return RequestOrResponse::Request(req);
         }
+        self.last_host = Some(host.clone());
         let path = req
             .uri()
             .path_and_query()
@@ -153,6 +161,61 @@ impl HttpHandler for CoronariumHandler {
             }
             ParseResult::Metadata | ParseResult::Unknown => RequestOrResponse::Request(req),
         }
+    }
+
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+        // Only rewrite the crates.io sparse index. Other hosts flow
+        // through untouched so we don't risk corrupting binary tarballs
+        // or metadata we haven't specifically handled.
+        let is_sparse_index = matches!(self.last_host.as_deref(), Some("index.crates.io"));
+        if !is_sparse_index {
+            return res;
+        }
+        // 2xx only — preserve 404 / 304 / etc. as-is.
+        if !res.status().is_success() {
+            return res;
+        }
+
+        use http_body_util::BodyExt;
+        let (parts, body) = res.into_parts();
+        let collected = match body.collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                log::warn!("sparse-rewrite: failed to buffer response body: {e}");
+                // Best effort: return an empty body — safer than
+                // forwarding a half-read stream.
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+
+        let now = Utc::now();
+        let (rewritten, stats) = rewrite_crates_index_jsonl(&collected, &self.decider, now);
+        if stats.dropped > 0 {
+            log::info!(
+                "sparse-rewrite: dropped {} version(s), kept {} (crates.io)",
+                stats.dropped,
+                stats.kept
+            );
+        }
+
+        // Rebuild response with the new body. Strip Content-Length —
+        // hyper will set it from the new Full body, and leaving a stale
+        // length would confuse the client.
+        let mut parts = parts;
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+        // If the upstream used gzip/br etc. the filter already saw
+        // plaintext (hudsucker doesn't auto-decode), so refuse to rewrite
+        // encoded bodies — punt and return original.
+        if let Some(enc) = parts.headers.get(http::header::CONTENT_ENCODING)
+            && !enc.as_bytes().eq_ignore_ascii_case(b"identity")
+        {
+            log::debug!("sparse-rewrite: skipping non-identity Content-Encoding");
+            return Response::from_parts(parts, Body::from(http_body_util::Full::new(collected)));
+        }
+        Response::from_parts(
+            parts,
+            Body::from(http_body_util::Full::new(bytes::Bytes::from(rewritten))),
+        )
     }
 }
 
