@@ -112,13 +112,21 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // `.any(0xFFFFFFFFFFFFFFFF)` = MatchAnyKeyword all-set, which enables
+    // every event class the provider publishes. Without this, ETW treats
+    // keyword=0 as "match nothing" for most providers and only the odd
+    // event (e.g. one process start) leaks through.
+    const ALL_KEYWORDS: u64 = u64::MAX;
     let process_provider = Provider::by_guid(PROVIDER_KERNEL_PROCESS)
+        .any(ALL_KEYWORDS)
         .add_callback(process_cb)
         .build();
     let network_provider = Provider::by_guid(PROVIDER_KERNEL_NETWORK)
+        .any(ALL_KEYWORDS)
         .add_callback(network_cb)
         .build();
     let file_provider = Provider::by_guid(PROVIDER_KERNEL_FILE)
+        .any(ALL_KEYWORDS)
         .add_callback(file_cb)
         .build();
 
@@ -137,7 +145,8 @@ pub fn run() -> Result<()> {
         })?;
 
     // Warm-up so the first child events aren't racing provider setup.
-    thread::sleep(Duration::from_millis(150));
+    // ETW takes ~300ms to actually start delivering events in practice.
+    thread::sleep(Duration::from_millis(500));
 
     log::info!(
         "starting coronarium-win (mode={:?}, command={:?})",
@@ -153,8 +162,9 @@ pub fn run() -> Result<()> {
         .status()
         .with_context(|| format!("spawning {program}"))?;
 
-    // Drain tail events.
-    thread::sleep(Duration::from_millis(400));
+    // Drain tail events. ETW is async; bursts take a second or so to
+    // percolate through the buffering path into our callback.
+    thread::sleep(Duration::from_millis(1000));
 
     let final_stats = stats.lock().unwrap().clone();
 
