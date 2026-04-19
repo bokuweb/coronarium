@@ -30,3 +30,4 @@ rustls = { version = "0.23", default-features = false, features = ["std", "loggi
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+semver = "1"
