@@ -14,10 +14,11 @@ use tokio::{process::Command, sync::Mutex};
 
 pub use coronarium_core::Stats;
 
+use coronarium_core::matcher::{ExecMatcher, FileMatcher};
+
 use crate::{
     cgroup::Cgroup,
     events::{self, Event},
-    matcher::{ExecMatcher, FileMatcher},
     policy::{Mode, Policy},
     resolve::Resolver,
 };
