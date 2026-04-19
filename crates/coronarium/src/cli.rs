@@ -40,6 +40,42 @@ pub enum Command {
 pub enum DepsCommand {
     /// Check publish ages against all dependencies in the given lockfile(s).
     Check(DepsCheckArgs),
+    /// Stay resident: watch one or more workspace roots, run `check` on
+    /// every lockfile change, and surface violations via a desktop
+    /// notification. Designed for `launchd` / `systemd --user`.
+    Watch(DepsWatchArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct DepsWatchArgs {
+    /// Workspace root(s) to watch recursively.
+    #[arg(required = true)]
+    pub roots: Vec<PathBuf>,
+    /// Minimum age a package must have.
+    #[arg(long, default_value = "7d")]
+    pub min_age: String,
+    #[arg(long)]
+    pub ignore: Vec<String>,
+    #[arg(long)]
+    pub no_cache: bool,
+    #[arg(long)]
+    pub cache: Option<PathBuf>,
+    /// How long to wait for a burst of edits to settle, in ms.
+    #[arg(long, default_value_t = 800)]
+    pub debounce_ms: u64,
+    /// Poll interval for the FS-event source, in ms.
+    #[arg(long, default_value_t = 250)]
+    pub tick_ms: u64,
+    /// Notification sink. `mac` uses osascript (macOS only), `stdout`
+    /// prints to stderr — good for launchctl log redirects.
+    #[arg(long, value_enum, default_value = "mac")]
+    pub notifier: DepsNotifier,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum DepsNotifier {
+    Mac,
+    Stdout,
 }
 
 #[derive(Debug, Parser)]
@@ -139,6 +175,25 @@ pub async fn run(cli: Cli) -> Result<()> {
                 user_agent: None,
             })?;
             std::process::exit(exit);
+        }
+        Command::Deps {
+            cmd: DepsCommand::Watch(args),
+        } => {
+            coronarium_core::deps::cli::run_watch(coronarium_core::deps::cli::WatchCliArgs {
+                roots: args.roots,
+                min_age: args.min_age,
+                ignore: args.ignore,
+                no_cache: args.no_cache,
+                cache_path: args.cache,
+                debounce_ms: args.debounce_ms,
+                tick_ms: args.tick_ms,
+                notifier: match args.notifier {
+                    DepsNotifier::Mac => coronarium_core::deps::cli::WatchNotifierKind::Mac,
+                    DepsNotifier::Stdout => coronarium_core::deps::cli::WatchNotifierKind::Stdout,
+                },
+                user_agent: None,
+            })?;
+            Ok(())
         }
     }
 }
