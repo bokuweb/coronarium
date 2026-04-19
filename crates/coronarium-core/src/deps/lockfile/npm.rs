@@ -114,4 +114,53 @@ mod tests {
             Some("@scope/bar".into())
         );
     }
+
+    fn tmp(body: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("coronarium-npm-{id}/package-lock.json"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn parses_v3_lockfile_with_scoped_and_nested_deps() {
+        let body = r#"{
+  "name":"x","version":"0.0.0","lockfileVersion":3,"requires":true,
+  "packages": {
+    "": {"name":"x","version":"0.0.0"},
+    "node_modules/lodash": {"version":"4.17.21","resolved":"https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz","integrity":"x"},
+    "node_modules/@scope/pkg": {"version":"1.2.3","resolved":"https://registry.npmjs.org/@scope/pkg/-/pkg-1.2.3.tgz","integrity":"x"},
+    "node_modules/foo/node_modules/lodash": {"version":"4.17.10","resolved":"https://registry.npmjs.org/lodash/-/lodash-4.17.10.tgz","integrity":"x"},
+    "packages/my-workspace": {"link":true, "resolved":"packages/my-workspace"},
+    "node_modules/git-dep": {"version":"0.0.1","resolved":"git+https://github.com/x/y.git"}
+  }
+}"#;
+        let p = tmp(body);
+        let pkgs = parse(&p).unwrap();
+        let mut keys: Vec<String> = pkgs
+            .iter()
+            .map(|p| format!("{}@{}", p.name, p.version))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "@scope/pkg@1.2.3".to_string(),
+                "lodash@4.17.10".to_string(),
+                "lodash@4.17.21".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn v1_lockfile_is_rejected() {
+        let body = r#"{"name":"x","version":"0.0.0","lockfileVersion":1}"#;
+        let p = tmp(body);
+        assert!(parse(&p).is_err());
+    }
 }

@@ -399,11 +399,19 @@ Honesty about what this does and doesn't do — per-OS:
 
 - **Network block works at the kernel**: `default: deny` makes
   `connect(2)` return `EPERM` via a `cgroup/connect4|6` BPF program.
-- **File / exec block is audit-only**: `file.deny` / `process.deny_exec`
-  tag matching events as `denied: true` in the JSON log and make
-  `mode: block` exit non-zero, but the child process is not prevented.
-  Real enforcement needs `bpf_override_return` (kernel-config
-  dependent; roadmap).
+- **File block is "tripwire"**: the first `file.deny` entries
+  (up to 8, up to 60 bytes each) are installed into a kernel-side
+  prefix map. A matching `openat(2)` in `mode: block` triggers
+  `bpf_send_signal(SIGKILL)` on the offending process — the file
+  descriptor may briefly exist but the process dies before consuming
+  it, and coronarium exits non-zero. Entries beyond the cap (or
+  patterns longer than 60 bytes) fall through to userspace-only
+  audit tagging.
+- **Exec block is audit-only**: `process.deny_exec` tags matching
+  events as `denied: true` in the JSON log and makes `mode: block`
+  exit non-zero, but the child is not prevented from exec'ing.
+  Kernel-side exec block would need `bpf_override_return` (kernel
+  config dependent); roadmap.
 
 ### Windows
 
