@@ -23,6 +23,7 @@ use crate::decision::{AgeOracle, Decider, Decision};
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
 use crate::rewrite::rewrite_crates_index_jsonl;
 use crate::rewrite_npm::rewrite_npm_packument;
+use crate::rewrite_pypi::{rewrite_pypi_json_api, rewrite_pypi_simple_json};
 
 pub struct ProxyConfig {
     pub listen: SocketAddr,
@@ -229,6 +230,49 @@ impl HttpHandler for CoronariumHandler {
                 }
                 out
             }
+            RewriteTarget::PypiJsonApi => {
+                let (out, stats) = rewrite_pypi_json_api(&collected, self.decider.min_age, now);
+                if stats.dropped > 0 {
+                    log::info!(
+                        "pypi-rewrite(json): dropped {} version(s), kept {}",
+                        stats.dropped,
+                        stats.kept
+                    );
+                }
+                out
+            }
+            RewriteTarget::PypiSimpleJson => {
+                // PEP 691 Simple JSON and PEP 503 HTML share the
+                // `/simple/<pkg>/` path — distinguish by Content-Type.
+                // Anything other than `application/vnd.pypi.simple.v1+json`
+                // (the only JSON shape we currently handle) passes through.
+                let is_simple_json = parts
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|ct| {
+                        let ct = ct.to_ascii_lowercase();
+                        ct.contains("application/vnd.pypi.simple.v1+json")
+                            || ct.contains("application/vnd.pypi.simple.latest+json")
+                    })
+                    .unwrap_or(false);
+                if !is_simple_json {
+                    log::debug!("pypi-rewrite(simple): pass-through (non-JSON Content-Type)");
+                    return Response::from_parts(
+                        parts,
+                        Body::from(http_body_util::Full::new(collected)),
+                    );
+                }
+                let (out, stats) = rewrite_pypi_simple_json(&collected, self.decider.min_age, now);
+                if stats.dropped > 0 {
+                    log::info!(
+                        "pypi-rewrite(simple): dropped {} file(s), kept {}",
+                        stats.dropped,
+                        stats.kept
+                    );
+                }
+                out
+            }
         };
 
         // Strip Content-Length so hyper recomputes it from the new body.
@@ -244,6 +288,8 @@ impl HttpHandler for CoronariumHandler {
 enum RewriteTarget {
     CratesSparse,
     NpmPackument,
+    PypiJsonApi,
+    PypiSimpleJson,
 }
 
 /// Match the in-flight `(host, path)` to a rewriter. Returning `None`
@@ -262,7 +308,37 @@ fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTa
     if host.eq_ignore_ascii_case("registry.npmjs.org") && is_npm_packument_path(path) {
         return Some(RewriteTarget::NpmPackument);
     }
+    if host.eq_ignore_ascii_case("pypi.org") {
+        if is_pypi_json_api_path(path) {
+            return Some(RewriteTarget::PypiJsonApi);
+        }
+        if is_pypi_simple_path(path) {
+            // We can't distinguish HTML vs JSON by path alone — the
+            // client's Accept header decides, and the upstream
+            // response's Content-Type confirms. The handler inspects
+            // Content-Type at rewrite time and skips HTML bodies.
+            return Some(RewriteTarget::PypiSimpleJson);
+        }
+    }
     None
+}
+
+/// `GET /pypi/<pkg>/json` — the Warehouse legacy JSON API.
+fn is_pypi_json_api_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    // Accept both `/pypi/<pkg>/json` and `/pypi/<pkg>/<version>/json`.
+    path.starts_with("/pypi/") && path.trim_end_matches('/').ends_with("/json")
+}
+
+/// `GET /simple/<pkg>/` — PEP 503 simple index (HTML) or PEP 691 JSON.
+fn is_pypi_simple_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    if let Some(rest) = path.strip_prefix("/simple/") {
+        let rest = rest.trim_end_matches('/');
+        !rest.is_empty() && !rest.contains('/')
+    } else {
+        false
+    }
 }
 
 fn is_npm_packument_path(path: &str) -> bool {
@@ -313,11 +389,12 @@ mod tests {
             "index.crates.io",
             "registry.npmjs.org",
             "files.pythonhosted.org",
+            "pypi.org",
             "api.nuget.org",
         ] {
             assert!(should_intercept(host, &ps), "should intercept {host}");
         }
-        for host in ["evil.example.com", "pypi.org", "www.nuget.org"] {
+        for host in ["evil.example.com", "www.nuget.org"] {
             assert!(!should_intercept(host, &ps), "should NOT intercept {host}");
         }
     }
@@ -345,6 +422,25 @@ mod tests {
     }
 
     #[test]
+    fn pypi_json_api_path_matches_warehouse_shape() {
+        assert!(is_pypi_json_api_path("/pypi/requests/json"));
+        assert!(is_pypi_json_api_path("/pypi/requests/json/"));
+        assert!(is_pypi_json_api_path("/pypi/requests/2.32.4/json"));
+        assert!(!is_pypi_json_api_path("/simple/requests/"));
+        assert!(!is_pypi_json_api_path("/pypi/requests/"));
+        assert!(!is_pypi_json_api_path("/"));
+    }
+
+    #[test]
+    fn pypi_simple_path_matches_index_shape() {
+        assert!(is_pypi_simple_path("/simple/requests/"));
+        assert!(is_pypi_simple_path("/simple/requests"));
+        assert!(!is_pypi_simple_path("/simple/requests/2.32.4/"));
+        assert!(!is_pypi_simple_path("/simple/"));
+        assert!(!is_pypi_simple_path("/pypi/requests/json"));
+    }
+
+    #[test]
     fn classify_response_routes_to_correct_rewriter() {
         assert_eq!(
             classify_response(Some("index.crates.io"), Some("/anything")),
@@ -362,6 +458,16 @@ mod tests {
             ),
             None
         );
+        // PyPI endpoints
+        assert_eq!(
+            classify_response(Some("pypi.org"), Some("/pypi/requests/json")),
+            Some(RewriteTarget::PypiJsonApi)
+        );
+        assert_eq!(
+            classify_response(Some("pypi.org"), Some("/simple/requests/")),
+            Some(RewriteTarget::PypiSimpleJson)
+        );
+        assert_eq!(classify_response(Some("pypi.org"), Some("/")), None);
         // unrecognised host
         assert_eq!(
             classify_response(Some("evil.example.com"), Some("/foo")),

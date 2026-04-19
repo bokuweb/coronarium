@@ -207,6 +207,27 @@ impl RegistryParser for PypiParser {
     }
 }
 
+// ---------------- PyPI metadata host (pypi.org) ----------------
+
+/// Parser for `pypi.org`, the PyPI **metadata** host.
+///
+/// Every request to `pypi.org` is metadata (JSON API, Simple index
+/// HTML/JSON, project pages). The tarballs themselves live on
+/// `files.pythonhosted.org` and are handled by [`PypiParser`]. This
+/// parser exists purely so `should_intercept` returns `true` for
+/// `pypi.org` and the proxy MITMs the TLS so we can rewrite metadata
+/// responses. It never produces a `Pinned` result.
+pub struct PypiOrgParser;
+
+impl RegistryParser for PypiOrgParser {
+    fn host(&self) -> &'static str {
+        "pypi.org"
+    }
+    fn parse(&self, _path: &str) -> ParseResult {
+        ParseResult::Metadata
+    }
+}
+
 // ---------------- NuGet (api.nuget.org) ----------------
 
 /// Parser for `api.nuget.org`. Tarball download URL:
@@ -249,6 +270,7 @@ pub fn default_parsers() -> Vec<Box<dyn RegistryParser>> {
         Box::new(CratesIoSparseParser),
         Box::new(NpmParser),
         Box::new(PypiParser),
+        Box::new(PypiOrgParser),
         Box::new(NugetParser),
     ]
 }

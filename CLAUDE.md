@@ -60,7 +60,7 @@ silently resolving to the newest in-range version that also meets
 the age requirement. Builds don't break; they just use slightly
 older deps.
 
-**Status (v0.16):**
+**Status (v0.17):**
 - **crates.io** — ✅ implemented via the proxy. `coronarium
   proxy serve` rewrites `index.crates.io` sparse-index responses on
   the fly, dropping JSONL lines whose `(name, vers)` publish time is
@@ -72,10 +72,23 @@ older deps.
   (notably `latest`) that pointed at a removed version is
   retargeted to the highest remaining semver. npm's resolver then
   picks the newest in-range surviving version — no error.
-- **pypi / nuget** — still fail-hard. The proxy returns 403 on a
-  too-young pinned fetch; the install stops. PyPI has a JSON API
-  plus a separate simple index; NuGet uses flat-container URLs.
-  Same pattern as npm/crates, just per-ecosystem format work.
+- **pypi** — ✅ implemented for the two JSON endpoints modern pip
+  and uv actually consult:
+  - Warehouse JSON API (`pypi.org/pypi/<pkg>/json`) — drops version
+    keys from `releases` whose earliest `upload_time_iso_8601` is
+    too young, plus stripping the `urls` shortcut.
+  - PEP 691 Simple JSON (`pypi.org/simple/<pkg>/` with
+    `Accept: application/vnd.pypi.simple.v1+json`) — drops
+    too-young `files[]`, prunes `versions[]` to only those with
+    surviving files.
+
+  The legacy HTML Simple index (PEP 503) carries no upload time in
+  the response; it passes through unchanged. pip fall-back to
+  tarball-level `files.pythonhosted.org` deny still catches those
+  installs fail-hard.
+- **nuget** — still fail-hard. NuGet uses versioned flat-container
+  URLs (`api.nuget.org/v3-flatcontainer/<id>/index.json`); same
+  pattern as the others, just one more ecosystem to wire.
 
 For ecosystems without rewriting, `deps check` (CI) or the proxy's
 hard-deny (desktop) is still the defense — just not silent.
@@ -114,10 +127,9 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 2. **HTTPS registry proxy** — same idea but transparent: set
    `HTTPS_PROXY` system-wide, filter fetch traffic. No shell
    aliasing required, but MITM cert management is a UX chore.
-3. **pnpm-style auto-fallback for pypi/nuget** — crates.io (v0.15)
-   and npm (v0.16) already work. Extend to the remaining two:
-   PyPI simple-index / JSON-API filtering, NuGet flat-container
-   index filtering.
+3. **pnpm-style auto-fallback for nuget** — crates.io (v0.15),
+   npm (v0.16) and pypi (v0.17) already work. NuGet's
+   flat-container index is the last of the four to wire.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.
