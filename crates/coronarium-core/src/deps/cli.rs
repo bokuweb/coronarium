@@ -27,6 +27,103 @@ pub enum Format {
     Json,
 }
 
+pub struct WatchCliArgs {
+    pub roots: Vec<PathBuf>,
+    pub min_age: String,
+    pub ignore: Vec<String>,
+    pub no_cache: bool,
+    pub cache_path: Option<PathBuf>,
+    pub debounce_ms: u64,
+    pub tick_ms: u64,
+    pub notifier: WatchNotifierKind,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WatchNotifierKind {
+    /// Native macOS `display notification` via osascript.
+    Mac,
+    /// Plain stderr logging (useful in tmux / screen / headless dev).
+    Stdout,
+}
+
+pub fn run_watch(args: WatchCliArgs) -> Result<()> {
+    use super::watch::{Debouncer, NotifyEventSource, StdoutNotifier, WatchLoop};
+
+    let min_age = parse_duration(&args.min_age)?;
+    let cache_path = if args.no_cache {
+        None
+    } else {
+        Some(args.cache_path.unwrap_or_else(default_cache_path))
+    };
+    let user_agent = args
+        .user_agent
+        .unwrap_or_else(|| format!("coronarium/{}", env!("CARGO_PKG_VERSION")));
+
+    // Initial pass: scan each root once, so a stale too-new dep that was
+    // already in the lockfile surfaces immediately instead of waiting
+    // for the next edit.
+    let initial_hits: Vec<PathBuf> = args
+        .roots
+        .iter()
+        .flat_map(|r| super::watch::scan_lockfiles(r))
+        .collect();
+
+    log::info!(
+        "watching {} root(s) — found {} lockfile(s) on initial scan",
+        args.roots.len(),
+        initial_hits.len(),
+    );
+
+    let source = NotifyEventSource::new(&args.roots)?;
+
+    // Pick the notifier backend.
+    let stdout_notifier;
+    #[cfg(target_os = "macos")]
+    let mac_notifier;
+    let notifier_ref: &dyn super::watch::Notifier = match args.notifier {
+        #[cfg(target_os = "macos")]
+        WatchNotifierKind::Mac => {
+            mac_notifier = super::watch::MacNotifier::new();
+            &mac_notifier
+        }
+        #[cfg(not(target_os = "macos"))]
+        WatchNotifierKind::Mac => {
+            log::warn!("--notifier=mac is macOS-only; falling back to stdout");
+            stdout_notifier = StdoutNotifier;
+            &stdout_notifier
+        }
+        WatchNotifierKind::Stdout => {
+            stdout_notifier = StdoutNotifier;
+            &stdout_notifier
+        }
+    };
+
+    let mut wl = WatchLoop {
+        source,
+        notifier: notifier_ref,
+        debouncer: Debouncer::new(std::time::Duration::from_millis(args.debounce_ms)),
+        min_age,
+        ignore: args.ignore,
+        cache_path,
+        user_agent,
+        tick: std::time::Duration::from_millis(args.tick_ms),
+        now: std::time::Instant::now,
+    };
+
+    // Seed with the initial scan so stale violations aren't silent.
+    for p in initial_hits {
+        wl.debouncer.touch(&p, std::time::Instant::now());
+    }
+
+    loop {
+        match wl.tick_once() {
+            Ok(_) => {}
+            Err(e) => log::error!("watch tick failed: {e:#}"),
+        }
+    }
+}
+
 pub fn run(args: CliArgs) -> Result<i32> {
     let min_age = parse_duration(&args.min_age)?;
     let cache_path = if args.no_cache {

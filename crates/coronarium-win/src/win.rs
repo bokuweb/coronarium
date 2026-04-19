@@ -407,6 +407,9 @@ fn run_deps(raw: &[String]) -> Result<()> {
     enum DepsCmd {
         /// Check publish ages against all dependencies in the given lockfile(s).
         Check(DepsCheckArgs),
+        /// Resident watcher (stdout notifier on Windows — pipe to your
+        /// preferred toast / Teams hook).
+        Watch(DepsWatchArgs),
     }
     #[derive(Debug, Parser)]
     struct DepsCheckArgs {
@@ -431,26 +434,60 @@ fn run_deps(raw: &[String]) -> Result<()> {
         Json,
     }
 
+    #[derive(Debug, Parser)]
+    struct DepsWatchArgs {
+        #[arg(required = true)]
+        roots: Vec<std::path::PathBuf>,
+        #[arg(long, default_value = "7d")]
+        min_age: String,
+        #[arg(long)]
+        ignore: Vec<String>,
+        #[arg(long)]
+        no_cache: bool,
+        #[arg(long)]
+        cache: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 800)]
+        debounce_ms: u64,
+        #[arg(long, default_value_t = 250)]
+        tick_ms: u64,
+    }
+
     // Drop argv[0] (binary) and argv[1] ("deps") so clap sees just the
     // subcommand tokens.
     let remainder: Vec<&str> = raw.iter().skip(2).map(|s| s.as_str()).collect();
     let parsed = DepsCli::try_parse_from(remainder).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let DepsCmd::Check(args) = parsed.cmd;
-
-    let exit = coronarium_core::deps::cli::run(coronarium_core::deps::cli::CliArgs {
-        lockfiles: args.lockfiles,
-        min_age: args.min_age,
-        ignore: args.ignore,
-        fail_on_missing: args.fail_on_missing,
-        no_cache: args.no_cache,
-        cache_path: args.cache,
-        format: match args.format {
-            DepsFormatArg::Text => coronarium_core::deps::cli::Format::Text,
-            DepsFormatArg::Json => coronarium_core::deps::cli::Format::Json,
-        },
-        user_agent: None,
-    })?;
-    std::process::exit(exit);
+    match parsed.cmd {
+        DepsCmd::Check(args) => {
+            let exit = coronarium_core::deps::cli::run(coronarium_core::deps::cli::CliArgs {
+                lockfiles: args.lockfiles,
+                min_age: args.min_age,
+                ignore: args.ignore,
+                fail_on_missing: args.fail_on_missing,
+                no_cache: args.no_cache,
+                cache_path: args.cache,
+                format: match args.format {
+                    DepsFormatArg::Text => coronarium_core::deps::cli::Format::Text,
+                    DepsFormatArg::Json => coronarium_core::deps::cli::Format::Json,
+                },
+                user_agent: None,
+            })?;
+            std::process::exit(exit);
+        }
+        DepsCmd::Watch(args) => {
+            coronarium_core::deps::cli::run_watch(coronarium_core::deps::cli::WatchCliArgs {
+                roots: args.roots,
+                min_age: args.min_age,
+                ignore: args.ignore,
+                no_cache: args.no_cache,
+                cache_path: args.cache,
+                debounce_ms: args.debounce_ms,
+                tick_ms: args.tick_ms,
+                notifier: coronarium_core::deps::cli::WatchNotifierKind::Stdout,
+                user_agent: None,
+            })?;
+            Ok(())
+        }
+    }
 }
 
 /// Logs each distinct event id a provider emits exactly once. Helps debug

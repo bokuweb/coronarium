@@ -64,6 +64,41 @@ jobs:
             coronarium-${{ matrix.target }}.tar.gz
             coronarium-${{ matrix.target }}.tar.gz.sha256
 
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-13     # Intel
+          - target: aarch64-apple-darwin
+            runner: macos-14     # Apple Silicon
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build coronarium (macOS)
+        run: cargo build --release -p coronarium --target ${{ matrix.target }}
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          name="coronarium-${{ matrix.target }}"
+          staging="staging/${name}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/coronarium" "${staging}/coronarium"
+          cp README.md "${staging}/" 2>/dev/null || true
+          cp packaging/macos/dev.coronarium.watch.plist "${staging}/" 2>/dev/null || true
+          cp packaging/macos/README.md "${staging}/macos-README.md" 2>/dev/null || true
+          tar -czf "${name}.tar.gz" -C staging "${name}"
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            coronarium-${{ matrix.target }}.tar.gz
+            coronarium-${{ matrix.target }}.tar.gz.sha256
+
   build-windows:
     runs-on: windows-latest
     env:
@@ -96,7 +131,7 @@ jobs:
             coronarium-x86_64-pc-windows-msvc.tar.gz.sha256
 
   publish:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
