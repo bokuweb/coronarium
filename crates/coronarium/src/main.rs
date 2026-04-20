@@ -2,6 +2,7 @@
 
 mod cgroup;
 mod cli;
+mod doctor;
 mod enforcer;
 mod events;
 mod install_gate;
