@@ -41,6 +41,30 @@ pub struct Decider<O: AgeOracle + ?Sized> {
     /// `--min-age`. Errors during lookup are logged and treated
     /// as "no match" — OSV downtime shouldn't block installs.
     pub known_bad: Option<Box<dyn crate::osv::KnownBadOracle>>,
+    /// Optional typosquat detector. When set, every decide() call
+    /// runs the package name through the detector; matches trigger
+    /// `log::warn!` (in `Warn` mode) or a hard deny (`Block` mode).
+    pub typosquat: Option<TyposquatHook>,
+}
+
+/// How to react to a typosquat hit. Separate from the detector
+/// itself so we can hold one `Detector` and vary policy per
+/// `Decider` (useful in tests and in the future for per-ecosystem
+/// overrides).
+#[derive(Debug, Clone, Copy)]
+pub struct TyposquatHook {
+    pub detector: crate::typosquat::Detector,
+    pub mode: TyposquatMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TyposquatMode {
+    /// Log a warning with the suggested legitimate name; let the
+    /// request proceed to the age check.
+    Warn,
+    /// Return `Deny` immediately with a message naming the
+    /// suggested legitimate package.
+    Block,
 }
 
 impl<O: AgeOracle + ?Sized> Decider<O> {
@@ -51,7 +75,37 @@ impl<O: AgeOracle + ?Sized> Decider<O> {
         version: &str,
         now: DateTime<Utc>,
     ) -> Decision {
-        // Known-malicious check first — hard-deny regardless of age.
+        // Typosquat check — cheapest to run first (pure in-memory
+        // edit-distance), and if we're in Block mode we skip every
+        // downstream network lookup.
+        if let Some(hook) = &self.typosquat
+            && let Some(m) = hook.detector.suggest(eco, name)
+        {
+            match hook.mode {
+                TyposquatMode::Warn => {
+                    log::warn!(
+                        "typosquat: {}/{name} looks like a typo of {} (edit-distance {}). \
+                         Allowing — pass --typosquat block to deny.",
+                        eco.label(),
+                        m.suggested,
+                        m.distance,
+                    );
+                }
+                TyposquatMode::Block => {
+                    return Decision::Deny {
+                        reason: format!(
+                            "coronarium: {}/{name} looks like a typosquat of {}@({} edit(s) away). \
+                             Did you mean `{}`?",
+                            eco.label(),
+                            m.suggested,
+                            m.distance,
+                            m.suggested,
+                        ),
+                    };
+                }
+            }
+        }
+        // Known-malicious check — hard-deny regardless of age.
         if let Some(kb) = &self.known_bad {
             match kb.lookup(eco, name, version) {
                 Ok(Some(ids)) if !ids.is_empty() => {
@@ -202,6 +256,7 @@ mod tests {
             min_age: Duration::from_secs(min_age_hours * 3600),
             fail_on_missing,
             known_bad: None,
+            typosquat: None,
         }
     }
 

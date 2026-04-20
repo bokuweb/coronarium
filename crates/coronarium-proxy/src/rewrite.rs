@@ -232,6 +232,7 @@ mod tests {
             min_age: Duration::from_secs(min_age_hours * 3600),
             fail_on_missing: false,
             known_bad: None,
+            typosquat: None,
         }
     }
 
@@ -361,6 +362,7 @@ mod tests {
             min_age: Duration::from_secs(168 * 3600),
             fail_on_missing: false,
             known_bad: None,
+            typosquat: None,
         };
 
         let body = concat!(
@@ -396,6 +398,7 @@ mod tests {
             min_age: Duration::from_secs(168 * 3600),
             fail_on_missing: false,
             known_bad: None,
+            typosquat: None,
         };
 
         let body = concat!(
@@ -425,6 +428,7 @@ mod tests {
             min_age: Duration::from_secs(168 * 3600),
             fail_on_missing: false,
             known_bad: None,
+            typosquat: None,
         };
 
         let body = r#"{"name":"a","vers":"1.0.0","pubtime":"not-a-date"}

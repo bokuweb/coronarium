@@ -125,6 +125,21 @@ pub struct InstallGateInstallArgs {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TyposquatMode {
+    Warn,
+    Block,
+}
+
+impl From<TyposquatMode> for coronarium_proxy::decision::TyposquatMode {
+    fn from(m: TyposquatMode) -> Self {
+        match m {
+            TyposquatMode::Warn => Self::Warn,
+            TyposquatMode::Block => Self::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 #[allow(clippy::enum_variant_names)]
 pub enum InstallGateShell {
     Bash,
@@ -251,6 +266,12 @@ pub struct ProxyStartArgs {
     /// Only meaningful with `--osv-mirror`.
     #[arg(long)]
     pub osv_mirror_url: Option<String>,
+    /// Typosquat detection: compare incoming package names against
+    /// a small top-N list per ecosystem (lodash, requests, tokio,
+    /// Newtonsoft.Json, …). `warn` logs a warning and lets the
+    /// install proceed; `block` hard-denies. Off by default.
+    #[arg(long, value_enum)]
+    pub typosquat: Option<TyposquatMode>,
     /// Override the CA/config directory. Defaults to
     /// `$XDG_CONFIG_HOME/coronarium` (or `~/.config/coronarium`).
     #[arg(long)]
@@ -478,6 +499,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 osv: args.osv,
                 osv_mirror: args.osv_mirror,
                 osv_mirror_url: args.osv_mirror_url,
+                typosquat: args.typosquat.map(Into::into),
                 ca_files,
                 user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,
