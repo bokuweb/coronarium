@@ -199,30 +199,128 @@ fn uninstall_linux(files: &CaFiles) -> Result<InstallResult> {
 
 #[cfg(target_os = "windows")]
 fn install_windows(files: &CaFiles) -> Result<InstallResult> {
-    let cmd = format!(
-        "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\LocalMachine\\Root",
-        files.cert_pem.display()
+    let cert = files.cert_pem.display().to_string();
+    // Two-tier strategy:
+    // 1. If we're already Administrator, run `Import-Certificate`
+    //    directly — no UAC prompt, no extra process.
+    // 2. Otherwise try `Start-Process -Verb RunAs` from a
+    //    non-elevated PowerShell, which triggers the UAC prompt.
+    //    We wait for the elevated child to exit and bubble up its
+    //    status. The user sees exactly one UAC prompt and the CLI
+    //    returns cleanly.
+    //
+    // If even that fails (no interactive session, policy-blocked
+    // elevation, etc.) we fall through to returning the hint as a
+    // copy-pasteable command, matching the macOS/Linux fallback.
+    let direct_cmd = format!(
+        "Import-Certificate -FilePath '{cert}' -CertStoreLocation Cert:\\LocalMachine\\Root"
     );
-    // We never attempt automatic install on Windows from the CLI —
-    // Import-Certificate needs an elevated PowerShell.
-    Ok(InstallResult {
-        outcome: InstallOutcome::NeedsPrivilege,
-        command_hint: cmd,
-    })
+    if is_windows_admin() {
+        let status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &direct_cmd])
+            .status()
+            .context("spawning powershell.exe")?;
+        if status.success() {
+            return Ok(InstallResult {
+                outcome: InstallOutcome::Installed,
+                command_hint: direct_cmd,
+            });
+        }
+        anyhow::bail!("Import-Certificate exited {status}");
+    }
+    // Non-admin path: fire off `Start-Process -Verb RunAs` which
+    // prompts UAC. `-Wait` blocks until the elevated child exits.
+    let elevated = format!(
+        "Start-Process -Wait -Verb RunAs powershell.exe \
+         -ArgumentList '-NoProfile','-Command','Import-Certificate -FilePath ''{cert}'' -CertStoreLocation Cert:\\LocalMachine\\Root'"
+    );
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &elevated])
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(InstallResult {
+            outcome: InstallOutcome::Installed,
+            command_hint: direct_cmd,
+        }),
+        _ => Ok(InstallResult {
+            // Couldn't confirm — return the hint so the user can run
+            // it by hand in an elevated shell.
+            outcome: InstallOutcome::NeedsPrivilege,
+            command_hint: direct_cmd,
+        }),
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn uninstall_windows(files: &CaFiles) -> Result<InstallResult> {
-    let cmd = format!(
-        "Get-ChildItem Cert:\\LocalMachine\\Root | \
-         Where-Object {{ $_.Subject -like '*coronarium*' }} | \
-         Remove-Item",
-    );
+    // We identify our own cert by subject substring (`coronarium`
+    // is unique enough) so we don't need to remember the thumbprint.
+    let direct_cmd = "Get-ChildItem Cert:\\LocalMachine\\Root | \
+                      Where-Object { $_.Subject -like '*coronarium*' } | \
+                      Remove-Item"
+        .to_string();
     let _ = files;
-    Ok(InstallResult {
-        outcome: InstallOutcome::NeedsPrivilege,
-        command_hint: cmd,
-    })
+    if is_windows_admin() {
+        let status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &direct_cmd])
+            .status()
+            .context("spawning powershell.exe")?;
+        // Non-zero is fine (nothing matched) — treat as idempotent.
+        let _ = status;
+        return Ok(InstallResult {
+            outcome: InstallOutcome::Installed,
+            command_hint: direct_cmd,
+        });
+    }
+    let elevated = format!(
+        "Start-Process -Wait -Verb RunAs powershell.exe \
+         -ArgumentList '-NoProfile','-Command','{direct_cmd}'"
+    );
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &elevated])
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(InstallResult {
+            outcome: InstallOutcome::Installed,
+            command_hint: direct_cmd,
+        }),
+        _ => Ok(InstallResult {
+            outcome: InstallOutcome::NeedsPrivilege,
+            command_hint: direct_cmd,
+        }),
+    }
+}
+
+/// Very-best-effort admin check on Windows: run an `[Security.Principal…]`
+/// one-liner and read the boolean. Heavier than the Unix USER==root
+/// check, but still cheap enough to do unconditionally (single
+/// short-lived powershell invocation).
+#[cfg(target_os = "windows")]
+fn is_windows_admin() -> bool {
+    use std::process::Stdio;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.trim().eq_ignore_ascii_case("True")
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn is_windows_admin() -> bool {
+    false
 }
 
 // ---------------- shared helpers ----------------
