@@ -96,7 +96,7 @@ pub fn render(policy: &Policy, stats: &Stats, meta: ReportMeta<'_>) -> String {
       <input id="q" type="search" placeholder="filter by path, host, comm…" autocomplete="off">
     </div>
     <table class="events-table">
-      <thead><tr><th>verdict</th><th>kind</th><th>pid</th><th>comm</th><th>detail</th></tr></thead>
+      <thead><tr><th>verdict</th><th>kind</th><th>pid</th><th>comm</th><th>host</th><th>detail</th></tr></thead>
       <tbody>
 "#,
     );
@@ -172,7 +172,9 @@ fn render_event_row(out: &mut String, ev: &Event) {
     } else {
         r#"<span class="chip chip-allow">ALLOW</span>"#
     };
-    let (kind, kind_class, pid, comm, detail) = match ev {
+    // `host` is the resolved hostname for Connect events (PTR lookup
+    // performed by the userspace supervisor) — empty for exec/open.
+    let (kind, kind_class, pid, comm, host, detail) = match ev {
         Event::Exec {
             pid,
             comm,
@@ -184,6 +186,7 @@ fn render_event_row(out: &mut String, ev: &Event) {
             "chip-exec",
             *pid,
             comm.clone(),
+            String::new(),
             format!(
                 r#"<code>{}</code> <span class="muted">({})</span>"#,
                 html_escape(filename),
@@ -201,6 +204,7 @@ fn render_event_row(out: &mut String, ev: &Event) {
             "chip-open",
             *pid,
             comm.clone(),
+            String::new(),
             format!(
                 r#"<code>{}</code> <span class="muted">flags=0x{:x}</span>"#,
                 html_escape(filename),
@@ -212,16 +216,26 @@ fn render_event_row(out: &mut String, ev: &Event) {
             comm,
             daddr,
             dport,
+            hostname,
             ..
-        } => (
-            "connect",
-            "chip-connect",
-            *pid,
-            comm.clone(),
-            format!(r#"<code>{}:{}</code>"#, html_escape(daddr), dport),
-        ),
+        } => {
+            let host_cell = match hostname.as_deref().filter(|s| !s.is_empty()) {
+                Some(h) => format!(r#"<code>{}</code>"#, html_escape(h)),
+                None => r#"<span class="muted">—</span>"#.to_string(),
+            };
+            (
+                "connect",
+                "chip-connect",
+                *pid,
+                comm.clone(),
+                host_cell,
+                format!(r#"<code>{}:{}</code>"#, html_escape(daddr), dport),
+            )
+        }
     };
-    let searchable = format!("{kind} {pid} {comm} {detail}").to_lowercase();
+    // `searchable` now includes host so the filter box matches by
+    // hostname too, not just IP:port.
+    let searchable = format!("{kind} {pid} {comm} {host} {detail}").to_lowercase();
     let _ = write!(
         out,
         r#"        <tr class="{row_class}" data-kind="{kind}" data-denied="{denied}" data-search="{search}">
@@ -229,6 +243,7 @@ fn render_event_row(out: &mut String, ev: &Event) {
           <td><span class="chip {kind_class}">{kind}</span></td>
           <td class="num">{pid}</td>
           <td><code>{comm}</code></td>
+          <td>{host}</td>
           <td>{detail}</td>
         </tr>
 "#,
@@ -240,6 +255,7 @@ fn render_event_row(out: &mut String, ev: &Event) {
         kind_class = kind_class,
         pid = pid,
         comm = html_escape(&comm),
+        host = host,
         detail = detail,
     );
 }
@@ -497,3 +513,87 @@ const JS: &str = r#"
   q.addEventListener('input', apply);
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Mode, Policy};
+    use crate::stats::Stats;
+
+    fn stats_with_one_connect(daddr: &str, hostname: Option<&str>) -> Stats {
+        let mut s = Stats::default();
+        s.ingest(Event::Connect {
+            pid: 42,
+            uid: 0,
+            comm: "curl".into(),
+            daddr: daddr.into(),
+            dport: 443,
+            protocol: 6,
+            denied: false,
+            hostname: hostname.map(|s| s.to_string()),
+        });
+        s
+    }
+
+    fn meta<'a>() -> ReportMeta<'a> {
+        ReportMeta {
+            title: "test",
+            mode: Mode::Audit,
+            command: "curl https://example.com",
+        }
+    }
+
+    #[test]
+    fn html_includes_host_column_header() {
+        let p = Policy::permissive_audit();
+        let s = stats_with_one_connect("1.2.3.4", None);
+        let out = render(&p, &s, meta());
+        assert!(out.contains("<th>host</th>"), "host column header missing");
+    }
+
+    #[test]
+    fn connect_row_shows_hostname_when_present() {
+        let p = Policy::permissive_audit();
+        let s = stats_with_one_connect("1.2.3.4", Some("example.com"));
+        let out = render(&p, &s, meta());
+        assert!(out.contains("example.com"), "hostname should render");
+        // The IP still appears in the detail column.
+        assert!(out.contains("1.2.3.4:443"));
+    }
+
+    #[test]
+    fn connect_row_shows_dash_when_hostname_missing() {
+        let p = Policy::permissive_audit();
+        let s = stats_with_one_connect("1.2.3.4", None);
+        let out = render(&p, &s, meta());
+        // Em-dash placeholder in the host cell.
+        assert!(out.contains("—"), "dash placeholder expected when no PTR");
+    }
+
+    #[test]
+    fn exec_and_open_rows_leave_host_empty_placeholder() {
+        let p = Policy::permissive_audit();
+        let mut s = Stats::default();
+        s.ingest(Event::Exec {
+            pid: 1,
+            uid: 0,
+            comm: "x".into(),
+            filename: "/bin/sh".into(),
+            argv0: "sh".into(),
+            denied: false,
+        });
+        s.ingest(Event::Open {
+            pid: 1,
+            uid: 0,
+            comm: "x".into(),
+            filename: "/etc/passwd".into(),
+            flags: 0,
+            denied: false,
+        });
+        let out = render(&p, &s, meta());
+        // Both rows should render; the host cell is simply empty for
+        // non-connect events.
+        assert!(out.contains("/bin/sh"));
+        assert!(out.contains("/etc/passwd"));
+    }
+}

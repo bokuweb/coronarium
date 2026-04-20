@@ -8,6 +8,7 @@ mod install_gate;
 mod loader;
 mod policy;
 mod resolve;
+mod resolve_hostnames;
 
 use anyhow::Result;
 use clap::Parser;

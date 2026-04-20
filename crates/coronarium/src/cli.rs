@@ -566,7 +566,13 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
 
     let supervised = loader::Supervisor::start(policy.clone(), mode).await?;
     let exit = supervised.run_child(&args.command).await?;
-    let stats = supervised.shutdown().await?;
+    let mut stats = supervised.shutdown().await?;
+
+    // Best-effort PTR enrichment so the HTML report shows hostnames
+    // next to raw IPs. Failures are silent — the report is still
+    // useful without resolved names, and we don't want to block the
+    // CI step on flaky DNS.
+    crate::resolve_hostnames::resolve(&mut stats).await;
 
     let command_str = args.command.join(" ");
     let report_args = ReportArgs {
