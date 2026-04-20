@@ -823,6 +823,27 @@ Architecture notes live in [CLAUDE.md](CLAUDE.md).
 
 ---
 
+## Commercial support
+
+coronarium is free to use under MIT/Apache-2.0. If your team needs
+any of the following, the maintainer offers paid engagements:
+
+- Onboarding help (writing/auditing your `policy.yml`, integrating
+  with your CI, tuning per-runner thresholds).
+- Priority bug fixes and feature requests.
+- Private Slack/Discord channel for questions.
+- Custom ecosystem support or proprietary registry adapters.
+
+Contact: **bokuweb12@gmail.com**
+
+For non-commercial appreciation, [GitHub Sponsors](https://github.com/sponsors/bokuweb)
+is also welcome.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be signed off
+([DCO](https://developercertificate.org/)) — `git commit -s`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
