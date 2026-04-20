@@ -1,0 +1,106 @@
+name: homebrew-formula
+
+# Runs after `release.yml` has published a new GitHub Release. We
+# download each platform's .tar.gz.sha256 sidecar, rewrite the
+# `version`, `url`, and `sha256` lines in
+# `HomebrewFormula/coronarium.rb`, and commit to main.
+#
+# Separated from release.yml so a broken formula update doesn't
+# cancel the binary release itself, and so we can manually
+# re-run it against an already-published tag.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to sync (defaults to latest release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: homebrew-formula
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Need enough history to push a fresh commit; shallow is fine.
+          fetch-depth: 1
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          if [ -z "$tag" ]; then
+            # workflow_dispatch with no input → latest release
+            tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+          # Version without leading 'v' for the Homebrew `version`
+          # field. `brew` normalises both but the convention is bare.
+          ver="${tag#v}"
+          echo "tag=$tag"   >> "$GITHUB_OUTPUT"
+          echo "ver=$ver"   >> "$GITHUB_OUTPUT"
+          echo "Syncing formula to $tag (version $ver)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch tarball sha256s
+        id: sha
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/coronarium-${t}.tar.gz.sha256"
+            echo "fetch $url"
+            sha=$(curl -fsSL "$url" | awk '{print $1}')
+            if [ -z "$sha" ]; then
+              echo "::error::empty sha256 for $t @ $tag"
+              exit 1
+            fi
+            # Export as shell var for the rewrite step.
+            key=$(echo "$t" | tr '.-' '__')
+            echo "${key}=${sha}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Rewrite formula
+        run: |
+          set -euo pipefail
+          python3 scripts/update-homebrew-formula.py \
+              --file HomebrewFormula/coronarium.rb \
+              --version '${{ steps.tag.outputs.ver }}' \
+              --tag '${{ steps.tag.outputs.tag }}' \
+              --sha-aarch64-apple-darwin        '${{ steps.sha.outputs.aarch64_apple_darwin }}' \
+              --sha-x86_64-apple-darwin         '${{ steps.sha.outputs.x86_64_apple_darwin }}' \
+              --sha-aarch64-unknown-linux-musl  '${{ steps.sha.outputs.aarch64_unknown_linux_musl }}' \
+              --sha-x86_64-unknown-linux-musl   '${{ steps.sha.outputs.x86_64_unknown_linux_musl }}'
+
+          echo "--- rewritten formula ---"
+          cat HomebrewFormula/coronarium.rb
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          git config user.name 'coronarium-homebrew-bot'
+          git config user.email 'homebrew-bot@users.noreply.github.com'
+          git add HomebrewFormula/coronarium.rb
+          if git diff --cached --quiet; then
+            echo "Formula already at ${{ steps.tag.outputs.tag }}; nothing to commit."
+            exit 0
+          fi
+          git commit -s -m "chore(homebrew): bump formula to ${{ steps.tag.outputs.tag }}"
+          # Push straight to main. The formula is data-only; no CI
+          # impact beyond the fmt/clippy jobs which don't touch it.
+          git push origin HEAD:main

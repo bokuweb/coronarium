@@ -95,6 +95,18 @@ pinned fetches downstream fail hard at the tarball layer.
 
 Pick whichever fits your setup.
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install bokuweb/coronarium/coronarium
+# ↑ the repo-is-its-own-tap convention; no separate `brew tap` needed.
+```
+
+Auto-updated on every release via the `homebrew-formula.yml`
+workflow — the formula lives at
+[`HomebrewFormula/coronarium.rb`](HomebrewFormula/coronarium.rb)
+in this repo.
+
 ### Pre-built binary (macOS / Linux / Windows)
 
 ```bash
