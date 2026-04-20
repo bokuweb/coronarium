@@ -195,6 +195,246 @@ fn top_list_for(eco: Ecosystem) -> &'static [&'static str] {
     }
 }
 
+// --- mirrored detector (v0.29) ----------------------------------
+
+use std::sync::Arc;
+use std::sync::RwLock;
+
+use anyhow::{Context, Result};
+
+/// Default URL the consumer pulls from. Populated weekly by the
+/// repo's `typosquat-data.yml` workflow; clients override via
+/// [`MirroredDetector::with_url`].
+pub const DEFAULT_TYPOSQUAT_MIRROR_URL: &str =
+    "https://raw.githubusercontent.com/bokuweb/coronarium/typosquat-data/top.json";
+
+/// Background refresh cadence. Daily is plenty — download rankings
+/// barely move week to week; sub-hour would just churn GitHub's CDN.
+pub const MIRROR_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+const MIRROR_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One snapshot of the mirror — per-ecosystem name lists plus
+/// ETag / updated_at for conditional-GET bookkeeping.
+#[derive(Debug, Default, Clone)]
+pub struct MirrorLists {
+    pub npm: Vec<String>,
+    pub crates: Vec<String>,
+    pub pypi: Vec<String>,
+    pub nuget: Vec<String>,
+    pub etag: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl MirrorLists {
+    fn lookup(&self, eco: Ecosystem) -> &[String] {
+        match eco {
+            Ecosystem::Crates => &self.crates,
+            Ecosystem::Npm => &self.npm,
+            Ecosystem::Pypi => &self.pypi,
+            Ecosystem::Nuget => &self.nuget,
+        }
+    }
+
+    fn is_empty_for(&self, eco: Ecosystem) -> bool {
+        self.lookup(eco).is_empty()
+    }
+}
+
+/// Parse the producer's `top.json` payload.
+///
+/// Schema 1 shape:
+/// ```json
+/// { "schema": 1, "updated_at": "…",
+///   "entries": { "npm": [...], "crates": [...], "pypi": [...], "nuget": [...] } }
+/// ```
+///
+/// Unknown ecosystem keys are silently ignored so the producer can
+/// add new lists without breaking old consumers.
+pub fn parse_mirror_lists(body: &[u8]) -> Result<MirrorLists> {
+    let doc: serde_json::Value =
+        serde_json::from_slice(body).context("typosquat mirror body is not JSON")?;
+    let entries = doc
+        .get("entries")
+        .and_then(|v| v.as_object())
+        .context("mirror body has no `entries` object")?;
+    let take = |key: &str| -> Vec<String> {
+        entries
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(MirrorLists {
+        npm: take("npm"),
+        crates: take("crates"),
+        pypi: take("pypi"),
+        nuget: take("nuget"),
+        etag: None,
+        updated_at: doc
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
+/// Detector that prefers the live mirror lists and falls back to
+/// the hard-coded baseline per-ecosystem. Clone cheaply — state
+/// lives behind `Arc<RwLock<_>>`.
+#[derive(Debug, Clone)]
+pub struct MirroredDetector {
+    pub threshold: usize,
+    url: String,
+    user_agent: String,
+    state: Arc<RwLock<MirrorLists>>,
+}
+
+impl MirroredDetector {
+    pub fn new(user_agent: impl Into<String>) -> Self {
+        Self::with_url(user_agent, DEFAULT_TYPOSQUAT_MIRROR_URL)
+    }
+
+    pub fn with_url(user_agent: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            threshold: DEFAULT_THRESHOLD,
+            url: url.into(),
+            user_agent: user_agent.into(),
+            state: Arc::new(RwLock::new(MirrorLists::default())),
+        }
+    }
+
+    pub fn with_threshold(mut self, t: usize) -> Self {
+        self.threshold = t;
+        self
+    }
+
+    /// One-shot fetch + swap. Returns `true` on update, `false` on
+    /// HTTP 304. Errors bubble up so the refresh loop can log.
+    pub fn refresh_once(&self) -> Result<bool> {
+        let etag_before = self.state.read().ok().and_then(|s| s.etag.clone());
+        let mut req = ureq::get(&self.url)
+            .set("user-agent", &self.user_agent)
+            .set("accept", "application/json")
+            .timeout(MIRROR_FETCH_TIMEOUT);
+        if let Some(etag) = &etag_before {
+            req = req.set("if-none-match", etag);
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(304, _)) => return Ok(false),
+            Err(e) => return Err(anyhow::anyhow!("fetch {}: {e:#}", self.url)),
+        };
+        let new_etag = resp.header("etag").map(String::from);
+        let body = resp.into_string().context("mirror body unreadable")?;
+        let mut parsed = parse_mirror_lists(body.as_bytes())?;
+        parsed.etag = new_etag;
+        if let Ok(mut w) = self.state.write() {
+            log::info!(
+                "typosquat-mirror: refreshed — npm={} crates={} pypi={} nuget={}",
+                parsed.npm.len(),
+                parsed.crates.len(),
+                parsed.pypi.len(),
+                parsed.nuget.len(),
+            );
+            *w = parsed;
+        }
+        Ok(true)
+    }
+
+    /// Fire-and-forget background refresh. Immediate call then
+    /// every [`MIRROR_REFRESH_EVERY`].
+    pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let ours = this.clone();
+                let res = tokio::task::spawn_blocking(move || ours.refresh_once()).await;
+                match res {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => log::warn!("typosquat-mirror: refresh failed: {e:#}"),
+                    Err(e) => log::warn!("typosquat-mirror: task panicked: {e}"),
+                }
+                tokio::time::sleep(MIRROR_REFRESH_EVERY).await;
+            }
+        })
+    }
+
+    /// Suggest the closest typosquat candidate, preferring the
+    /// mirror; fall back to the hard-coded baseline per-ecosystem
+    /// when the mirror has no entries for that ecosystem.
+    pub fn suggest(&self, eco: Ecosystem, name: &str) -> Option<Match> {
+        if self.threshold == 0 || name.is_empty() {
+            return None;
+        }
+        let lc_name = name.to_ascii_lowercase();
+
+        // Tier 1: mirror.
+        let from_mirror = {
+            let s = self.state.read().ok();
+            s.as_ref()
+                .filter(|s| !s.is_empty_for(eco))
+                .and_then(|s| scan_mirror(s.lookup(eco), &lc_name, name, self.threshold))
+        };
+        match from_mirror {
+            Some(Outcome::Exact) => return None,
+            Some(Outcome::Match(m)) => return Some(m),
+            None => {}
+        }
+
+        // Tier 2: baseline fallback (identical to `Detector::suggest`).
+        Detector::with_threshold(self.threshold).suggest(eco, name)
+    }
+}
+
+/// Result of scanning one mirror list: either the input was an
+/// exact match (legitimate top package — suppress all warnings),
+/// or we found the closest neighbour within the threshold.
+enum Outcome {
+    Exact,
+    Match(Match),
+}
+
+fn scan_mirror(
+    list: &[String],
+    lc_name: &str,
+    original: &str,
+    threshold: usize,
+) -> Option<Outcome> {
+    // Fast exact-match exit (case-insensitive).
+    if list.iter().any(|top| top.eq_ignore_ascii_case(original)) {
+        return Some(Outcome::Exact);
+    }
+    let mut best: Option<(String, usize)> = None;
+    for top in list {
+        let lc_top = top.to_ascii_lowercase();
+        if lc_name.len().abs_diff(lc_top.len()) > threshold {
+            continue;
+        }
+        let d = edit_distance_bounded(lc_name, &lc_top, threshold);
+        match (d, best.as_ref()) {
+            (Some(0), _) => return Some(Outcome::Exact),
+            (Some(d), None) => best = Some((top.clone(), d)),
+            (Some(d), Some((_, bd))) if d < *bd => best = Some((top.clone(), d)),
+            _ => {}
+        }
+    }
+    best.map(|(suggested, distance)| {
+        // Intern the String into a leaked &'static so it fits the
+        // existing `Match.suggested: &'static str` field. Leaks
+        // are bounded — one per distinct typosquat-hit suggestion,
+        // which is a handful per proxy lifetime in practice.
+        Outcome::Match(Match {
+            input: original.to_string(),
+            suggested: Box::leak(suggested.into_boxed_str()),
+            distance,
+        })
+    })
+}
+
 // --- hard-coded top lists ---------------------------------------
 //
 // Derived from recent download rankings (npm Registry stats, PyPI

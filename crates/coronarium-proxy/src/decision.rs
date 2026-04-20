@@ -51,9 +51,31 @@ pub struct Decider<O: AgeOracle + ?Sized> {
 /// itself so we can hold one `Detector` and vary policy per
 /// `Decider` (useful in tests and in the future for per-ecosystem
 /// overrides).
-#[derive(Debug, Clone, Copy)]
+/// Two detector variants (v0.28 vs v0.29):
+/// - `Static` — hard-coded top-100 lists baked into the binary.
+///   No network; deterministic behaviour.
+/// - `Mirrored` — up to top-1000 per ecosystem fetched weekly
+///   from the coronarium-hosted mirror, refreshed in the
+///   background. Better recall; falls back to the Static list
+///   per-ecosystem when the mirror is unavailable / empty.
+#[derive(Debug, Clone)]
+pub enum TyposquatDetector {
+    Static(crate::typosquat::Detector),
+    Mirrored(crate::typosquat::MirroredDetector),
+}
+
+impl TyposquatDetector {
+    pub fn suggest(&self, eco: Ecosystem, name: &str) -> Option<crate::typosquat::Match> {
+        match self {
+            Self::Static(d) => d.suggest(eco, name),
+            Self::Mirrored(d) => d.suggest(eco, name),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TyposquatHook {
-    pub detector: crate::typosquat::Detector,
+    pub detector: TyposquatDetector,
     pub mode: TyposquatMode,
 }
 

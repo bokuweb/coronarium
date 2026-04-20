@@ -272,6 +272,16 @@ pub struct ProxyStartArgs {
     /// install proceed; `block` hard-denies. Off by default.
     #[arg(long, value_enum)]
     pub typosquat: Option<TyposquatMode>,
+    /// Use the coronarium-hosted pre-fetched top-1000-per-ecosystem
+    /// list instead of the ~100-name baseline baked into the binary.
+    /// Refreshes daily in the background and falls back to the
+    /// baseline when the mirror is unreachable. Only meaningful with
+    /// `--typosquat`.
+    #[arg(long)]
+    pub typosquat_mirror: bool,
+    /// Override the typosquat mirror URL.
+    #[arg(long)]
+    pub typosquat_mirror_url: Option<String>,
     /// Override the CA/config directory. Defaults to
     /// `$XDG_CONFIG_HOME/coronarium` (or `~/.config/coronarium`).
     #[arg(long)]
@@ -500,6 +510,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 osv_mirror: args.osv_mirror,
                 osv_mirror_url: args.osv_mirror_url,
                 typosquat: args.typosquat.map(Into::into),
+                typosquat_mirror: args.typosquat_mirror,
+                typosquat_mirror_url: args.typosquat_mirror_url,
                 ca_files,
                 user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,
