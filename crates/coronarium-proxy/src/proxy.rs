@@ -20,10 +20,11 @@ use hudsucker::{
 
 use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
+use crate::nuget_flatcontainer_client::NugetFlatContainerClient;
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
 use crate::rewrite::rewrite_crates_index_jsonl;
 use crate::rewrite_npm::{NpmRewriteOptions, rewrite_npm_packument_with};
-use crate::rewrite_nuget::rewrite_nuget_registration;
+use crate::rewrite_nuget::{rewrite_nuget_flatcontainer, rewrite_nuget_registration};
 use crate::rewrite_pypi::{rewrite_pypi_json_api, rewrite_pypi_simple_json};
 
 pub struct ProxyConfig {
@@ -180,6 +181,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         last_host: None,
         last_path: None,
         require_provenance: cfg.require_provenance,
+        nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -224,6 +226,10 @@ struct CoronariumHandler {
     /// Forwarded from [`ProxyConfig::require_provenance`]. Consulted
     /// by the npm rewrite path.
     require_provenance: bool,
+    /// Looks up per-package publish times from the registration
+    /// endpoint so we can silently filter the flat-container index
+    /// (which has no dates inline).
+    nuget_flat: NugetFlatContainerClient,
 }
 
 impl HttpHandler for CoronariumHandler {
@@ -405,6 +411,27 @@ impl HttpHandler for CoronariumHandler {
                 }
                 out
             }
+            RewriteTarget::NugetFlatContainerIndex(id) => {
+                // Look up publish times from the registration endpoint.
+                // Cached per package; a failed lookup yields an empty
+                // map which makes the filter fail-open (pinned `.nupkg`
+                // fetches still hard-deny at the tarball layer, so
+                // fail-open doesn't silently admit young versions into
+                // a build).
+                let oracle = self.nuget_flat.lookup(&id).await;
+                let (out, stats) =
+                    rewrite_nuget_flatcontainer(&collected, self.decider.min_age, now, |v| {
+                        oracle.get(v).copied()
+                    });
+                if stats.dropped > 0 {
+                    log::info!(
+                        "nuget-flat: dropped {} version(s), kept {} for {id}",
+                        stats.dropped,
+                        stats.kept
+                    );
+                }
+                out
+            }
         };
 
         // Strip Content-Length so hyper recomputes it from the new body.
@@ -416,13 +443,18 @@ impl HttpHandler for CoronariumHandler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RewriteTarget {
     CratesSparse,
     NpmPackument,
     PypiJsonApi,
     PypiSimpleJson,
     NugetRegistration,
+    /// Flat-container index (`/v3-flatcontainer/<id>/index.json`).
+    /// The String is the lower-cased package id, captured here so the
+    /// handler can feed it to the out-of-band registration fetcher
+    /// without re-parsing the path.
+    NugetFlatContainerIndex(String),
 }
 
 /// Match the in-flight `(host, path)` to a rewriter. Returning `None`
@@ -453,10 +485,30 @@ fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTa
             return Some(RewriteTarget::PypiSimpleJson);
         }
     }
-    if host.eq_ignore_ascii_case("api.nuget.org") && is_nuget_registration_path(path) {
-        return Some(RewriteTarget::NugetRegistration);
+    if host.eq_ignore_ascii_case("api.nuget.org") {
+        if is_nuget_registration_path(path) {
+            return Some(RewriteTarget::NugetRegistration);
+        }
+        if let Some(id) = parse_nuget_flatcontainer_index_path(path) {
+            return Some(RewriteTarget::NugetFlatContainerIndex(id));
+        }
     }
     None
+}
+
+/// NuGet flat-container index: `/v3-flatcontainer/<id>/index.json`.
+/// The body is a `{"versions":[…]}` with no timestamps; we look them
+/// up out-of-band from the registration endpoint. Returns the lower-
+/// cased package id on match, `None` otherwise.
+fn parse_nuget_flatcontainer_index_path(path: &str) -> Option<String> {
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = path.strip_prefix("/v3-flatcontainer/")?;
+    // Expect exactly `<id>/index.json`.
+    let (id, tail) = rest.split_once('/')?;
+    if id.is_empty() || tail != "index.json" {
+        return None;
+    }
+    Some(id.to_ascii_lowercase())
 }
 
 /// NuGet registration endpoints:
@@ -620,6 +672,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_nuget_flatcontainer_index_path_is_lenient_on_casing() {
+        assert_eq!(
+            parse_nuget_flatcontainer_index_path("/v3-flatcontainer/Newtonsoft.Json/index.json"),
+            Some("newtonsoft.json".into())
+        );
+        assert_eq!(
+            parse_nuget_flatcontainer_index_path("/v3-flatcontainer/serilog/index.json"),
+            Some("serilog".into())
+        );
+        // Not an index.json — `.nupkg` or a version directory.
+        assert_eq!(
+            parse_nuget_flatcontainer_index_path(
+                "/v3-flatcontainer/serilog/3.0.0/serilog.3.0.0.nupkg"
+            ),
+            None
+        );
+        // Registration endpoint — different path family.
+        assert_eq!(
+            parse_nuget_flatcontainer_index_path("/v3/registration5-semver1/serilog/index.json"),
+            None
+        );
+        // Empty id.
+        assert_eq!(
+            parse_nuget_flatcontainer_index_path("/v3-flatcontainer//index.json"),
+            None
+        );
+        // Query string tolerated.
+        assert_eq!(
+            parse_nuget_flatcontainer_index_path("/v3-flatcontainer/pkg/index.json?ts=1"),
+            Some("pkg".into())
+        );
+    }
+
+    #[test]
     fn classify_response_routes_to_correct_rewriter() {
         assert_eq!(
             classify_response(Some("index.crates.io"), Some("/anything")),
@@ -655,11 +741,22 @@ mod tests {
             ),
             Some(RewriteTarget::NugetRegistration)
         );
-        // NuGet flat-container is NOT rewritten yet.
+        // NuGet flat-container index: handled via registration lookup.
         assert_eq!(
             classify_response(
                 Some("api.nuget.org"),
                 Some("/v3-flatcontainer/newtonsoft.json/index.json")
+            ),
+            Some(RewriteTarget::NugetFlatContainerIndex(
+                "newtonsoft.json".into()
+            ))
+        );
+        // Pinned `.nupkg` fetches under flat-container still fall
+        // through to the pin decider — not rewritten here.
+        assert_eq!(
+            classify_response(
+                Some("api.nuget.org"),
+                Some("/v3-flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg")
             ),
             None
         );

@@ -96,13 +96,15 @@ older deps.
   request and goes through the same rewriter.
 
   The **flat-container index** (`/v3-flatcontainer/<id>/index.json`
-  — a plain `{"versions":[...]}` with no dates) is **not** yet
-  silently filtered; we'd need an out-of-band lookup to the
-  registration endpoint to get dates. Until we do, dotnet restore
-  paths through flat-container still hit the existing nupkg
-  download deny at `api.nuget.org/v3-flatcontainer/<id>/<version>/…`
-  — fail-hard, not silent. This is the last remaining roadmap
-  item for the four-ecosystem sweep.
+  — a plain `{"versions":[...]}` with no dates) is silently filtered
+  via an out-of-band lookup to the registration endpoint. The
+  `NugetFlatContainerClient` fetches
+  `/v3/registration5-semver1/<id>/index.json`, extracts version→
+  publish-time pairs (walking page references up to a bounded
+  depth), caches the map per-package for 10 minutes, and feeds the
+  rewriter's oracle. Failed lookups yield an empty map → fail-open,
+  but pinned `.nupkg` fetches still hard-deny at the tarball layer
+  so stale cache can't silently admit young versions.
 
 For ecosystems without rewriting, `deps check` (CI) or the proxy's
 hard-deny (desktop) is still the defense — just not silent.
@@ -159,12 +161,11 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 2. **HTTPS registry proxy** — same idea but transparent: set
    `HTTPS_PROXY` system-wide, filter fetch traffic. No shell
    aliasing required, but MITM cert management is a UX chore.
-3. **NuGet flat-container auto-fallback** — NuGet registration
-   pages are rewritten as of v0.18. The last silent-fallback gap
-   is the flat-container `/v3-flatcontainer/<id>/index.json`
-   endpoint, which carries no publish dates inline. Fix needs
-   an out-of-band lookup to the registration endpoint (cached)
-   to learn dates, then filter the version list.
+3. ~~**NuGet flat-container auto-fallback**~~ — done.
+   `NugetFlatContainerClient` fetches the registration endpoint
+   out-of-band, caches the version→publish-time map per package,
+   and feeds the flat-container rewriter. All four ecosystems
+   now have silent fallback.
 4. **Linux file/exec block via `bpf_override_return`** — clean
    pre-syscall block, requires runtime detection of
    CONFIG_BPF_KPROBE_OVERRIDE and a well-timed kprobe.

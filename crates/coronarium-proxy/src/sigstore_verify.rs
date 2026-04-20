@@ -411,7 +411,10 @@ mod tests {
         let v = verify_bundle_semantics(&bundle, &known_integrity()).unwrap();
         assert_eq!(v.predicate_type, "https://slsa.dev/provenance/v1");
         assert_eq!(v.subject_sha512_hex, hex);
-        assert!(v.builder_id.starts_with("https://github.com/actions/runner/"));
+        assert!(
+            v.builder_id
+                .starts_with("https://github.com/actions/runner/")
+        );
     }
 
     #[test]
