@@ -500,6 +500,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

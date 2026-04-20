@@ -36,6 +36,11 @@ pub struct ProxyConfig {
     /// strongest single knob against "stolen publish token" attacks
     /// that `minimumReleaseAge` alone can't catch.
     pub require_provenance: bool,
+    /// When `true`, consult OSV.dev before every age check. Versions
+    /// flagged as malicious packages (MAL-* IDs or advisories whose
+    /// summary/details contain "malicious") are hard-denied
+    /// regardless of `--min-age`.
+    pub osv: bool,
     pub ca_files: CaFiles,
     pub user_agent: String,
     /// Override to inject a fake oracle in tests.
@@ -49,6 +54,7 @@ impl ProxyConfig {
             min_age: Duration::from_secs(7 * 24 * 3600),
             fail_on_missing: false,
             require_provenance: false,
+            osv: false,
             ca_files: CaFiles::at_default_location()?,
             user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
@@ -79,10 +85,17 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
     let oracle: Box<dyn AgeOracle> = cfg
         .oracle
         .unwrap_or_else(|| Box::new(crate::decision::RegistryOracle::new(cfg.user_agent.clone())));
+    let known_bad: Option<Box<dyn crate::osv::KnownBadOracle>> = if cfg.osv {
+        log::info!("OSV known-malicious check: enabled (api.osv.dev)");
+        Some(Box::new(crate::osv::OsvClient::new(cfg.user_agent.clone())))
+    } else {
+        None
+    };
     let decider = Arc::new(Decider {
         oracle,
         min_age: cfg.min_age,
         fail_on_missing: cfg.fail_on_missing,
+        known_bad,
     });
 
     let handler = CoronariumHandler {
