@@ -13,6 +13,7 @@ pub mod rewrite;
 pub mod rewrite_npm;
 pub mod rewrite_nuget;
 pub mod rewrite_pypi;
+pub mod sigstore_verify;
 pub mod typosquat;
 
 pub use decision::{AgeOracle, Decider, Decision, RegistryOracle};
