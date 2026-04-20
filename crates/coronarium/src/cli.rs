@@ -214,6 +214,17 @@ pub struct ProxyStartArgs {
     /// allow through).
     #[arg(long)]
     pub fail_on_missing: bool,
+    /// **Strict mode.** Drop every npm package version that doesn't
+    /// carry a Sigstore provenance claim (`dist.attestations.provenance`).
+    /// Closes the "stolen publish token" hole that `--min-age`
+    /// alone can't cover: a token thief can publish immediately,
+    /// but without an OIDC-authenticated CI run they can't attach a
+    /// valid provenance attestation.
+    ///
+    /// Only affects the npm packument path. pypi / nuget / crates
+    /// equivalents (PEP 740, cargo attestation) are roadmap items.
+    #[arg(long)]
+    pub require_provenance: bool,
     /// Override the CA/config directory. Defaults to
     /// `$XDG_CONFIG_HOME/coronarium` (or `~/.config/coronarium`).
     #[arg(long)]
@@ -437,6 +448,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 listen: args.listen,
                 min_age,
                 fail_on_missing: args.fail_on_missing,
+                require_provenance: args.require_provenance,
                 ca_files,
                 user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,

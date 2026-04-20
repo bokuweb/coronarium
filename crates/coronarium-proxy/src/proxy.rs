@@ -22,7 +22,7 @@ use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
 use crate::rewrite::rewrite_crates_index_jsonl;
-use crate::rewrite_npm::rewrite_npm_packument;
+use crate::rewrite_npm::{NpmRewriteOptions, rewrite_npm_packument_with};
 use crate::rewrite_nuget::rewrite_nuget_registration;
 use crate::rewrite_pypi::{rewrite_pypi_json_api, rewrite_pypi_simple_json};
 
@@ -30,6 +30,12 @@ pub struct ProxyConfig {
     pub listen: SocketAddr,
     pub min_age: Duration,
     pub fail_on_missing: bool,
+    /// Strict mode: when `true`, npm packument rewriting drops every
+    /// version without a Sigstore provenance claim (see
+    /// [`crate::rewrite_npm::NpmRewriteOptions`]). This is the
+    /// strongest single knob against "stolen publish token" attacks
+    /// that `minimumReleaseAge` alone can't catch.
+    pub require_provenance: bool,
     pub ca_files: CaFiles,
     pub user_agent: String,
     /// Override to inject a fake oracle in tests.
@@ -42,6 +48,7 @@ impl ProxyConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             min_age: Duration::from_secs(7 * 24 * 3600),
             fail_on_missing: false,
+            require_provenance: false,
             ca_files: CaFiles::at_default_location()?,
             user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
@@ -83,6 +90,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         decider,
         last_host: None,
         last_path: None,
+        require_provenance: cfg.require_provenance,
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -124,6 +132,9 @@ struct CoronariumHandler {
     /// `registry.npmjs.org` response is a packument (bare `/<pkg>`) —
     /// per-version endpoints and tarballs must be left untouched.
     last_path: Option<String>,
+    /// Forwarded from [`ProxyConfig::require_provenance`]. Consulted
+    /// by the npm rewrite path.
+    require_provenance: bool,
 }
 
 impl HttpHandler for CoronariumHandler {
@@ -231,11 +242,19 @@ impl HttpHandler for CoronariumHandler {
                 out
             }
             RewriteTarget::NpmPackument => {
-                let (out, stats) = rewrite_npm_packument(&collected, self.decider.min_age, now);
+                let (out, stats) = rewrite_npm_packument_with(
+                    &collected,
+                    self.decider.min_age,
+                    now,
+                    NpmRewriteOptions {
+                        require_provenance: self.require_provenance,
+                    },
+                );
                 if stats.dropped > 0 {
                     log::info!(
-                        "npm-rewrite: dropped {} version(s), kept {}, retargeted {} tag(s)",
+                        "npm-rewrite: dropped {} version(s) ({} for missing provenance), kept {}, retargeted {} tag(s)",
                         stats.dropped,
+                        stats.dropped_no_provenance,
                         stats.kept,
                         stats.retargeted_tags
                     );
