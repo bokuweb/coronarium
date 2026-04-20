@@ -1,24 +1,162 @@
 # coronarium
 
-eBPF-based audit & block for CI workloads, written in Rust with [aya].
+**Stop your team from pulling a 2-hour-old crate.** A cross-ecosystem
+supply-chain guard, written in Rust, that gives every package manager
+on your machine pnpm's `minimumReleaseAge` semantics — transparently,
+without any resolver integration.
 
-`coronarium` wraps a build/test command and, via eBPF programs attached to a
-dedicated cgroup v2, observes (and optionally denies) its:
+```bash
+$ coronarium proxy install-ca              # trust the proxy's root CA
+$ coronarium proxy install-daemon          # run the proxy in the background
+$ coronarium install-gate install          # route your shell through it
+
+# Open a new shell. Business as usual.
+$ npm install react
+# → proxy silently drops versions < 7d old, npm picks the newest older version
+# → no error, no broken build, just a measurably safer dependency.
+```
+
+Four ecosystems are covered today, end-to-end:
+
+| ecosystem | silent auto-fallback via proxy | tarball hard-deny |
+|---|---|---|
+| **crates.io** | ✅ sparse-index rewrite | ✅ |
+| **npm** | ✅ packument rewrite (+ `dist-tags.latest` retargeted) | ✅ |
+| **pypi** | ✅ JSON API + PEP 691 Simple JSON | ✅ |
+| **nuget** | ✅ registration-page rewrite | ✅ |
+
+Supply-chain attacks typically live in the 24–72h gap between a
+malicious version being published and the community catching it. If
+your installs only ever see versions older than that window, you dodge
+most of them. [pnpm 10.x ships this](https://pnpm.io/next/settings#minimumreleaseage)
+for npm only — coronarium brings the same thing to every major
+ecosystem, as a single HTTPS proxy the package managers already trust.
+
+## Quick start (desktop — macOS / Linux)
+
+```bash
+# 1. Install (prebuilt binary). Replace $TRIPLE with your platform, e.g.
+#    aarch64-apple-darwin / x86_64-apple-darwin / x86_64-unknown-linux-musl.
+curl -fsSL "https://github.com/bokuweb/coronarium/releases/latest/download/coronarium-$TRIPLE.tar.gz" \
+  | sudo tar -xz -C /usr/local/bin
+
+# 2. Generate the proxy's root CA, install into the system trust store.
+coronarium proxy install-ca
+# (prompts for sudo — we use the OS `security` / `update-ca-certificates`
+#  CLI, auditable and reversible with the same commands.)
+
+# 3. Run the proxy as a background daemon (launchd on macOS, systemd
+#    --user on Linux) so it's always up.
+coronarium proxy install-daemon
+# Follow the printed `launchctl bootstrap …` / `systemctl --user enable --now`
+# line.
+
+# 4. Wire your shell so every new terminal picks up HTTPS_PROXY + the CA.
+coronarium install-gate install
+
+# 5. Open a new shell. Done.
+$ env | grep HTTPS_PROXY
+HTTPS_PROXY=http://127.0.0.1:8910
+```
+
+From here, `npm install` / `pnpm add` / `yarn add` / `cargo add` /
+`cargo build` / `pip install` / `uv add` / `poetry add` / `dotnet add
+package` / `dotnet restore` all go through the proxy and silently get
+the fallback treatment.
+
+## What "silent fallback" actually means
+
+Concretely, for `crates.io` the proxy rewrites the sparse-index
+response to drop JSONL lines whose `pubtime` is younger than
+`--min-age`:
+
+```
+$ curl -s https://index.crates.io/se/rd/serde | wc -l           # direct
+315
+$ coronarium proxy start --min-age 365d &
+$ curl -s -x http://127.0.0.1:8910 https://index.crates.io/se/rd/serde | wc -l
+306     # the 9 most recent versions are now invisible to cargo's resolver
+```
+
+cargo then picks the newest remaining in-range version — **no error**,
+just a slightly older (and harder-to-attack) dependency. Same shape
+for npm's packument (where `dist-tags.latest` is also retargeted to
+the highest remaining semver so bare `npm install <pkg>` doesn't
+resolve to a removed version), PyPI's JSON API + PEP 691 Simple JSON,
+and NuGet's registration pages.
+
+For unhandled paths (direct tarball pinning, etc.) the proxy returns
+`403` with an `x-coronarium-deny` header so the install stops loudly.
+
+## In CI (GitHub Actions)
+
+```yaml
+# .github/workflows/build.yml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Route every HTTPS request from later steps through the proxy.
+      # Versions published less than 7 days ago are invisible to your
+      # resolver, so `cargo build` / `npm install` / `pip install` /
+      # `dotnet restore` silently pick the newest older version.
+      - uses: bokuweb/coronarium/proxy@v0
+        with:
+          min-age: 7d
+
+      - run: cargo test      # flows through the proxy
+      - run: npm ci          # ditto
+```
+
+Prefer running the proxy yourself (Kubernetes, docker-compose,
+internal infra)? A prebuilt image lives on GHCR:
+
+```bash
+docker run --rm -p 8910:8910 ghcr.io/bokuweb/coronarium-proxy:v0 \
+    --listen 0.0.0.0:8910 --min-age 7d
+# Then point your package managers at http://<host>:8910 as HTTPS_PROXY.
+```
+
+## When to use what
+
+| situation | reach for |
+|---|---|
+| Dev machine, want every `npm install` to auto-fallback | `install-gate` + `proxy install-daemon` (Quick start above) |
+| CI job, want the build to fail loudly on too-young deps | `coronarium deps check` ([CI features](#ci-features)) |
+| CI job, want kernel-level audit of what the build does | `coronarium run` + a policy file ([CI features](#ci-features)) |
+| macOS user who wants background lockfile monitoring | `coronarium deps watch` (see [desktop watch](#desktop-watch-mode-macos)) |
+
+---
+
+## Platforms
+
+- **Linux** — proxy ✅, eBPF supervisor ✅ (network kernel-block,
+  file kernel-kill, exec audit).
+- **macOS** — proxy ✅, `deps check` + `deps watch` (supply-chain
+  guard). The supervised-child runtime is Linux/Windows only; macOS
+  is the developer-desktop home.
+- **Windows** — proxy ✅, ETW supervisor ✅ (ETW audit, kernel network
+  deny via dynamic Defender Firewall rules).
+
+---
+
+## CI features
+
+Everything below predates the proxy and is still fully supported. For
+CI the proxy story is usually overkill; `deps check` as a pre-install
+step + optional `coronarium run` supervisor is a simpler shape.
+
+`coronarium` wraps a build/test command and, via eBPF programs
+attached to a dedicated cgroup v2, observes (and optionally denies) its:
 
 - **Network** — outbound `connect(2)` on IPv4 and IPv6
-- **File** — `openat(2)` (audit; deny is on the roadmap)
+- **File** — `openat(2)` (audit + kernel-kill on deny)
 - **Process** — `execve(2)` (audit; deny is on the roadmap)
 
 It can run locally as a CLI, or be installed into a GitHub Actions workflow
 as a composite action.
-
-> **Platforms:**
-> - **Linux** — eBPF supervisor (network kernel-block, file tripwire, exec audit).
-> - **Windows** — ETW supervisor (ETW audit, kernel network deny via
->   dynamic Defender Firewall rules).
-> - **macOS** — `deps check` + `deps watch` (supply-chain guard). The
->   supervised-child runtime is Linux/Windows only; macOS is the
->   developer-desktop home.
 
 ## Architecture
 

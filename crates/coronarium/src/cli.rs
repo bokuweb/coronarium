@@ -82,6 +82,10 @@ pub enum Command {
         #[command(subcommand)]
         cmd: InstallGateCommand,
     },
+    /// One-command diagnostic: checks CA files, proxy liveness,
+    /// $HTTPS_PROXY, rc-file block, and daemon unit. Exits non-zero
+    /// if any critical check fails.
+    Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,6 +158,22 @@ pub enum ProxyCommand {
     InstallDaemon(ProxyDaemonArgs),
     /// Remove the daemon unit written by `install-daemon`.
     UninstallDaemon(ProxyDaemonArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct DoctorArgs {
+    /// Proxy listen address to probe. Must match whatever you passed
+    /// to `proxy start` / `install-daemon`.
+    #[arg(long, default_value = "127.0.0.1:8910")]
+    pub listen: std::net::SocketAddr,
+    /// Override the CA/config directory. Defaults to the same logic
+    /// as `proxy start`.
+    #[arg(long)]
+    pub config_dir: Option<PathBuf>,
+    /// Shell rc file to inspect. Defaults to the one `install-gate`
+    /// would target for the detected shell.
+    #[arg(long)]
+    pub rc: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -420,6 +440,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             coronarium_proxy::run(cfg).await?;
             Ok(())
         }
+        Command::Doctor(args) => run_doctor(args),
         Command::Proxy {
             cmd: ProxyCommand::InstallDaemon(args),
         } => run_install_daemon(args),
@@ -657,4 +678,44 @@ fn run_uninstall_daemon(args: ProxyDaemonArgs) -> Result<()> {
         plan.deactivate_command,
     );
     Ok(())
+}
+
+fn run_doctor(args: DoctorArgs) -> Result<()> {
+    let ca_files = ca_files_for(args.config_dir)?;
+    let expected_https_proxy = format!("http://{}", args.listen);
+    let rc_path = args.rc.or_else(|| {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let shell = crate::install_gate::detect_shell_from_env();
+        Some(crate::install_gate::default_rc_path(&home, shell))
+    });
+    let daemon_unit_path = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| {
+            use coronarium_proxy::daemon::{DaemonBackend, DaemonInputs, render};
+            let backend = DaemonBackend::detect()?;
+            let plan = render(
+                backend,
+                &DaemonInputs {
+                    binary_path: PathBuf::from("coronarium"),
+                    listen: args.listen,
+                    min_age: "7d".into(),
+                    home,
+                },
+            );
+            Some(plan.unit_path)
+        });
+    let inputs = crate::doctor::DoctorInputs {
+        ca_cert: ca_files.cert_pem.clone(),
+        ca_key: ca_files.key_pem.clone(),
+        proxy_addr: args.listen,
+        https_proxy_env: std::env::var("HTTPS_PROXY")
+            .ok()
+            .or_else(|| std::env::var("https_proxy").ok()),
+        expected_https_proxy,
+        rc_path,
+        daemon_unit_path,
+    };
+    let results = crate::doctor::run_checks(&inputs);
+    print!("{}", crate::doctor::render_report(&results));
+    std::process::exit(crate::doctor::exit_code(&results));
 }
