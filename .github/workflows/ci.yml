@@ -301,25 +301,51 @@ jobs:
       - name: policy dry-run
         run: |
           ./bin/coronarium check-policy -p examples/coronarium.yml
-      - name: audit-mode e2e (captures exec/open/connect)
+      - name: audit-mode e2e (captures exec/open/connect with mixed ALLOW+DENY)
         env:
           CORONARIUM_BPF_OBJ: ${{ github.workspace }}/bpf/coronarium
           RUST_LOG: info
         run: |
+          # Policy is *audit* mode (nothing is actually blocked) but
+          # includes explicit deny entries for each event class so the
+          # uploaded HTML artifact shows the realistic "ALLOW + DENY"
+          # mix a user would see in block mode. This gives reviewers
+          # something useful to look at in the PR report artifact
+          # instead of the previous all-ALLOW noise.
           cat > /tmp/audit.yml <<'EOF'
           mode: audit
           network:
             default: allow
+            deny:
+              - target: example.com      # resolved to 1+ IPs at startup
+                ports: [443]
+              - target: 1.1.1.1
+                ports: [443]
           file:
             default: allow
+            deny:
+              - /etc/os-release          # the child below reads this
+          process:
+            deny_exec:
+              - /usr/bin/whoami          # the child below runs this
           EOF
-          # Run with stderr captured so we can assert the BPF programs
-          # actually loaded (no passthrough fallback).
+          # The child exercises every deny path so the report has
+          # DENY-annotated exec, open, and connect rows:
+          #   - whoami        → exec deny
+          #   - cat os-release→ open deny
+          #   - curl example  → connect deny
+          #   - plain echo    → plain ALLOW exec, for contrast
           sudo -E ./bin/coronarium run \
             --policy /tmp/audit.yml \
             --log /tmp/coronarium.log.json \
             --html /tmp/coronarium-report.html \
-            -- /bin/sh -c 'echo hello from coronarium; curl -s -o /dev/null -m 5 https://example.com || true' \
+            -- /bin/sh -c '
+              echo hello from coronarium;
+              /usr/bin/whoami >/dev/null 2>&1 || true;
+              cat /etc/os-release >/dev/null 2>&1 || true;
+              curl -s -o /dev/null -m 5 https://example.com || true;
+              curl -s -o /dev/null -m 5 https://1.1.1.1 || true;
+            ' \
             2> /tmp/coronarium.stderr
           echo "--- stderr ---"
           cat /tmp/coronarium.stderr
@@ -333,18 +359,27 @@ jobs:
           import json, sys
           log = json.load(open("/tmp/coronarium.log.json"))
           kinds = {}
+          denied_kinds = {}
           for s in log.get("samples", []):
               kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
+              if s.get("denied"):
+                  denied_kinds[s["kind"]] = denied_kinds.get(s["kind"], 0) + 1
           print(f"observed={log['observed']} denied={log['denied']} lost={log['lost']}")
           print(f"sample kinds: {kinds}")
-          missing = []
-          for k in ("exec", "open", "connect"):
-              if kinds.get(k, 0) == 0:
-                  missing.append(k)
+          print(f"denied-sample kinds: {denied_kinds}")
+          # Every kind must be represented in the samples.
+          missing = [k for k in ("exec", "open", "connect") if kinds.get(k, 0) == 0]
+          if "exec" in missing:
+              print(f"::error::no exec samples captured")
+              sys.exit(1)
           if missing:
               print(f"::warning::no samples for: {missing}")
-              if "exec" in missing:
-                  sys.exit(1)
+          # Report-artifact requirement: at least one DENY in each
+          # of exec/open/connect so the uploaded HTML visibly shows
+          # the mixed-verdict table.
+          for kind in ("exec", "open", "connect"):
+              if denied_kinds.get(kind, 0) == 0:
+                  print(f"::warning::no DENY-tagged {kind} samples — report will look plain")
           PY
       - name: block-mode e2e (kernel actually denies egress)
         env:
