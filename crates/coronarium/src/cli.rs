@@ -225,6 +225,17 @@ pub struct ProxyStartArgs {
     /// equivalents (PEP 740, cargo attestation) are roadmap items.
     #[arg(long)]
     pub require_provenance: bool,
+    /// Consult OSV.dev on every decision. Versions flagged as
+    /// malicious packages (MAL-* IDs or advisories whose
+    /// summary/details say "malicious") are hard-denied regardless
+    /// of `--min-age` — catching e.g. event-stream 3.3.6 which is
+    /// old enough to pass the age filter but still poisonous.
+    ///
+    /// OSV lookups are in-memory cached. On lookup error (network
+    /// blip, OSV downtime) the check fails open and the age filter
+    /// still runs.
+    #[arg(long)]
+    pub osv: bool,
     /// Override the CA/config directory. Defaults to
     /// `$XDG_CONFIG_HOME/coronarium` (or `~/.config/coronarium`).
     #[arg(long)]
@@ -449,6 +460,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 min_age,
                 fail_on_missing: args.fail_on_missing,
                 require_provenance: args.require_provenance,
+                osv: args.osv,
                 ca_files,
                 user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,

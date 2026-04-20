@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use cache::Cache;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ecosystem {
     Npm,
     Crates,

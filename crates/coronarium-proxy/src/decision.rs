@@ -34,6 +34,13 @@ pub struct Decider<O: AgeOracle + ?Sized> {
     /// …) as Deny. If `false`, fail-open and Allow so a flaky registry
     /// doesn't brick the developer's install flow.
     pub fail_on_missing: bool,
+    /// Optional hook for "this package version is known malicious"
+    /// lookups (OSV / GHSA). When set, checked *before* the age
+    /// filter so that a 7-year-old-but-still-poisonous package
+    /// (e.g. event-stream 3.3.6) gets denied regardless of
+    /// `--min-age`. Errors during lookup are logged and treated
+    /// as "no match" — OSV downtime shouldn't block installs.
+    pub known_bad: Option<Box<dyn crate::osv::KnownBadOracle>>,
 }
 
 impl<O: AgeOracle + ?Sized> Decider<O> {
@@ -44,6 +51,34 @@ impl<O: AgeOracle + ?Sized> Decider<O> {
         version: &str,
         now: DateTime<Utc>,
     ) -> Decision {
+        // Known-malicious check first — hard-deny regardless of age.
+        if let Some(kb) = &self.known_bad {
+            match kb.lookup(eco, name, version) {
+                Ok(Some(ids)) if !ids.is_empty() => {
+                    let head = ids.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+                    let more = if ids.len() > 2 {
+                        format!(" (+{} more)", ids.len() - 2)
+                    } else {
+                        String::new()
+                    };
+                    return Decision::Deny {
+                        reason: format!(
+                            "coronarium: {}/{}@{} is listed as malicious: {head}{more}",
+                            eco.label(),
+                            name,
+                            version
+                        ),
+                    };
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!(
+                    "known-bad lookup for {}/{}@{} failed: {e:#} — proceeding with age check",
+                    eco.label(),
+                    name,
+                    version
+                ),
+            }
+        }
         match self.oracle.published(eco, name, version) {
             Ok(Some(published)) => {
                 let age = now - published;
@@ -166,6 +201,7 @@ mod tests {
             oracle: Box::new(oracle) as Box<dyn AgeOracle>,
             min_age: Duration::from_secs(min_age_hours * 3600),
             fail_on_missing,
+            known_bad: None,
         }
     }
 
@@ -233,6 +269,64 @@ mod tests {
             d.decide(Ecosystem::Npm, "x", "1.0.0", utc(2025, 1, 1)),
             Decision::Deny { .. }
         ));
+    }
+
+    /// Fake `KnownBadOracle` for Decider-level tests.
+    struct FixedBad(Option<Vec<String>>);
+    impl crate::osv::KnownBadOracle for FixedBad {
+        fn lookup(&self, _: Ecosystem, _: &str, _: &str) -> Result<Option<Vec<String>>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct BadErr;
+    impl crate::osv::KnownBadOracle for BadErr {
+        fn lookup(&self, _: Ecosystem, _: &str, _: &str) -> Result<Option<Vec<String>>> {
+            Err(anyhow::anyhow!("OSV down"))
+        }
+    }
+
+    #[test]
+    fn known_malicious_hard_denies_even_for_old_packages() {
+        // Published 10 years ago — age filter would allow this.
+        // But known-bad lookup returns a MAL id → hard deny.
+        let now = utc(2025, 1, 10);
+        let ancient = now - chrono::Duration::days(10 * 365);
+        let mut d = decider(FixedOracle(Some(ancient)), 168, false);
+        d.known_bad = Some(Box::new(FixedBad(Some(vec!["MAL-2025-1".into()]))));
+        match d.decide(Ecosystem::Npm, "event-stream", "3.3.6", now) {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("listed as malicious"));
+                assert!(reason.contains("MAL-2025-1"));
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_bad_none_response_falls_through_to_age_check() {
+        let now = utc(2025, 1, 10);
+        let ancient = now - chrono::Duration::days(10 * 365);
+        let mut d = decider(FixedOracle(Some(ancient)), 168, false);
+        d.known_bad = Some(Box::new(FixedBad(None))); // clean
+        assert_eq!(
+            d.decide(Ecosystem::Npm, "safe", "1.0.0", now),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn known_bad_lookup_error_falls_through() {
+        // OSV downtime must never block developer installs on a
+        // known-safe-enough package.
+        let now = utc(2025, 1, 10);
+        let ancient = now - chrono::Duration::days(10 * 365);
+        let mut d = decider(FixedOracle(Some(ancient)), 168, false);
+        d.known_bad = Some(Box::new(BadErr));
+        assert_eq!(
+            d.decide(Ecosystem::Npm, "safe", "1.0.0", now),
+            Decision::Allow
+        );
     }
 
     #[test]

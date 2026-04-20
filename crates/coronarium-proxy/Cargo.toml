@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+ureq = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
