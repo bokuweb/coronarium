@@ -1,3 +1,5 @@
 /target
 .claude/
 /osv-mirror/mal.json
+/typosquat-data/top.json
+__pycache__/

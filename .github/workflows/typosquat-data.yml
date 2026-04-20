@@ -1,0 +1,98 @@
+name: typosquat-data
+
+# Weekly refresh of the top-N-per-ecosystem list that fuels
+# `--typosquat-mirror` on the proxy. See
+# `scripts/build-typosquat-data.py` for the producer and
+# `crates/coronarium-proxy/src/typosquat.rs::MirroredDetector`
+# for the consumer.
+#
+# Weekly (not every 10 min like the OSV mirror) because download
+# rankings move glacially — today's rank 1,000 is next week's
+# rank 997; the exact ordering doesn't matter for typosquat
+# detection. What matters is *coverage* — which the weekly
+# rebuild renews without hammering the upstream APIs.
+#
+# Output goes to a separate `typosquat-data` branch, force-pushed
+# so the main-branch history stays clean.
+
+on:
+  schedule:
+    # Sundays 04:00 UTC. GitHub cron drifts 5–15 min, fine.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: typosquat-data
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main-ck
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build typosquat-data/top.json
+        working-directory: main-ck
+        run: |
+          python3 scripts/build-typosquat-data.py
+          ls -la typosquat-data/
+          python3 -c 'import json; d=json.load(open("typosquat-data/top.json")); [print(f"  {k}: {len(v)}") for k,v in d["entries"].items()]'
+
+      - name: Publish to typosquat-data branch
+        run: |
+          set -euo pipefail
+          cd main-ck
+          work=$(mktemp -d)
+          git init -q "$work"
+          cp typosquat-data/top.json "$work/top.json"
+
+          cat > "$work/README.md" <<'EOF'
+          # coronarium typosquat mirror data
+
+          Auto-generated on every run of `.github/workflows/typosquat-data.yml`
+          in the main branch. **Don't edit this branch by hand** — any
+          manual commits get force-pushed over by the next cron.
+
+          Consumers:
+          - `https://raw.githubusercontent.com/bokuweb/coronarium/typosquat-data/top.json`
+
+          Schema: see `scripts/build-typosquat-data.py` on `main`.
+          EOF
+
+          cd "$work"
+          git config user.name 'coronarium-typosquat-bot'
+          git config user.email 'typosquat-bot@users.noreply.github.com'
+          git checkout -q -b typosquat-data
+          git add .
+          total=$(python3 -c 'import json;d=json.load(open("top.json"));print(sum(len(v) for v in d["entries"].values()))')
+          git commit -q -s -m "mirror: $(date -u +%FT%TZ) ($total names)"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push -q -f origin typosquat-data
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### typosquat-data snapshot" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f main-ck/typosquat-data/top.json ]; then
+            python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("main-ck/typosquat-data/top.json"))
+          print()
+          for k, v in d["entries"].items():
+              print(f"- **{k}**: {len(v)}")
+          print()
+          print(f"- branch: `typosquat-data`")
+          PY
+          else
+            echo "top.json was not produced" >> "$GITHUB_STEP_SUMMARY"
+          fi

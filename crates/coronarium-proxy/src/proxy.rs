@@ -54,6 +54,14 @@ pub struct ProxyConfig {
     /// close-match warnings, `Some(Block)` hard-denies typosquat
     /// candidates.
     pub typosquat: Option<crate::decision::TyposquatMode>,
+    /// When `true`, use the coronarium-hosted top-N-per-ecosystem
+    /// mirror (~1000 names each) instead of the hard-coded top-100
+    /// baked into the binary. Only meaningful when `typosquat` is
+    /// also set. Refreshes daily in the background.
+    pub typosquat_mirror: bool,
+    /// Override URL for `typosquat_mirror`. Defaults to
+    /// [`crate::typosquat::DEFAULT_TYPOSQUAT_MIRROR_URL`].
+    pub typosquat_mirror_url: Option<String>,
     pub ca_files: CaFiles,
     pub user_agent: String,
     /// Override to inject a fake oracle in tests.
@@ -71,6 +79,8 @@ impl ProxyConfig {
             osv_mirror: false,
             osv_mirror_url: None,
             typosquat: None,
+            typosquat_mirror: false,
+            typosquat_mirror_url: None,
             ca_files: CaFiles::at_default_location()?,
             user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
@@ -136,11 +146,25 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         }
     };
     let typosquat = cfg.typosquat.map(|mode| {
-        log::info!("typosquat detection: {:?}", mode);
-        crate::decision::TyposquatHook {
-            detector: crate::typosquat::Detector::new(),
-            mode,
-        }
+        // Pick the detector variant based on `typosquat_mirror`.
+        // Mirror mode spawns a background refresh task now — the
+        // first decision after startup may still see the baseline
+        // list (mirror HTTP fetch hasn't completed yet), which is
+        // fine since the fallback is semantically identical.
+        let detector = if cfg.typosquat_mirror {
+            let url = cfg
+                .typosquat_mirror_url
+                .clone()
+                .unwrap_or_else(|| crate::typosquat::DEFAULT_TYPOSQUAT_MIRROR_URL.to_string());
+            log::info!("typosquat detection: {mode:?} (mirror: {url})");
+            let mirror = crate::typosquat::MirroredDetector::with_url(cfg.user_agent.clone(), url);
+            mirror.spawn_refresh_loop();
+            crate::decision::TyposquatDetector::Mirrored(mirror)
+        } else {
+            log::info!("typosquat detection: {mode:?} (baseline only)");
+            crate::decision::TyposquatDetector::Static(crate::typosquat::Detector::new())
+        };
+        crate::decision::TyposquatHook { detector, mode }
     });
     let decider = Arc::new(Decider {
         oracle,
