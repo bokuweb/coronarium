@@ -50,6 +50,10 @@ pub struct ProxyConfig {
     /// Override URL for `osv_mirror`. Defaults to
     /// [`crate::osv_mirror::DEFAULT_MIRROR_URL`].
     pub osv_mirror_url: Option<String>,
+    /// Typosquat detection mode: `None` disables, `Some(Warn)` logs
+    /// close-match warnings, `Some(Block)` hard-denies typosquat
+    /// candidates.
+    pub typosquat: Option<crate::decision::TyposquatMode>,
     pub ca_files: CaFiles,
     pub user_agent: String,
     /// Override to inject a fake oracle in tests.
@@ -66,6 +70,7 @@ impl ProxyConfig {
             osv: false,
             osv_mirror: false,
             osv_mirror_url: None,
+            typosquat: None,
             ca_files: CaFiles::at_default_location()?,
             user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
@@ -130,11 +135,19 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
             }))
         }
     };
+    let typosquat = cfg.typosquat.map(|mode| {
+        log::info!("typosquat detection: {:?}", mode);
+        crate::decision::TyposquatHook {
+            detector: crate::typosquat::Detector::new(),
+            mode,
+        }
+    });
     let decider = Arc::new(Decider {
         oracle,
         min_age: cfg.min_age,
         fail_on_missing: cfg.fail_on_missing,
         known_bad,
+        typosquat,
     });
 
     let handler = CoronariumHandler {
