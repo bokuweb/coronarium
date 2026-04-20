@@ -27,24 +27,65 @@ jobs:
 
       - name: Run supervised command
         run: |
+          # Policy is intentionally rich (one deny per kind) so the
+          # uploaded report + PR comment artifact show the realistic
+          # ALLOW+DENY mix users will see in block mode. Audit mode
+          # means nothing is actually blocked.
+          #
+          # Targets are picked to look good in the `host` column:
+          # 1.1.1.1 and 8.8.8.8 have PTR records (`one.one.one.one`
+          # and `dns.google`), whereas CDN anycast IPs like
+          # 104.20.x.x / 172.66.x.x don't publish PTR at all — so
+          # using example.com (which currently resolves to Cloudflare)
+          # would just produce a sea of "—" in the host column.
           cat > /tmp/policy.yml <<'EOF'
           mode: audit
           network:
             default: allow
+            deny:
+              - target: 1.1.1.1
+                ports: [443]
+              - target: 8.8.8.8
+                ports: [443]
           file:
             default: allow
             deny:
               - /etc/shadow
+          process:
+            deny_exec:
+              - /usr/bin/whoami
           EOF
           sudo -E "$CORONARIUM_BIN" run \
             --policy /tmp/policy.yml \
             --log coronarium.log.json \
             --html coronarium-report.html \
             --summary "$GITHUB_STEP_SUMMARY" \
-            -- /bin/sh -c 'cat /etc/shadow >/dev/null 2>&1 || true; cat /etc/hostname >/dev/null; curl -s -o /dev/null https://example.com || true'
+            -- /bin/sh -c '
+              echo hello from coronarium;
+              /usr/bin/whoami >/dev/null 2>&1 || true;
+              cat /etc/shadow >/dev/null 2>&1 || true;
+              cat /etc/hostname >/dev/null;
+              curl -s -o /dev/null -m 5 https://1.1.1.1 || true;
+              curl -s -o /dev/null -m 5 https://8.8.8.8 || true;
+            '
           cat coronarium.log.json | head -60
-          observed=$(python3 -c 'import json;print(json.load(open("coronarium.log.json"))["observed"])')
-          test "$observed" -gt 0
+          # Assert each kind has at least one DENY-tagged sample so
+          # the PR comment/artifact genuinely demonstrates the full
+          # verdict range — regressions here would quietly produce a
+          # boring all-ALLOW report for consumers looking at the comment.
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("coronarium.log.json"))
+          denied = {}
+          for s in d.get("samples", []):
+              if s.get("denied"):
+                  denied[s["kind"]] = denied.get(s["kind"], 0) + 1
+          print(f"observed={d['observed']} denied={d['denied']} denied-by-kind={denied}")
+          assert d["observed"] > 0
+          for k in ("exec", "open", "connect"):
+              if denied.get(k, 0) == 0:
+                  print(f"::warning::no denied {k} samples — report artifact will be weaker")
+          PY
           test -f coronarium-report.html
 
       # Upload both so the comment's one-liner can pull the HTML.
