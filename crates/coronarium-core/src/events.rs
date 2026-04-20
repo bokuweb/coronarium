@@ -21,6 +21,12 @@ pub enum Event {
         dport: u16,
         protocol: u16,
         denied: bool,
+        /// Reverse-DNS of `daddr` (PTR record) when known. Populated
+        /// best-effort by the userspace supervisor after all events
+        /// are collected — the kernel decoder doesn't know it.
+        /// `None` means either "lookup not attempted" or "no PTR".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     Open {
         pid: u32,
@@ -73,6 +79,7 @@ mod tests {
             dport: 0,
             protocol: 6,
             denied: false,
+            hostname: None,
         };
         let open = Event::Open {
             pid: 1,

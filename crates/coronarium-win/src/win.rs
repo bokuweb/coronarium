@@ -352,6 +352,7 @@ fn handle_network_event(
         dport,
         protocol: 6,
         denied,
+        hostname: None,
     };
     stats.lock().unwrap().ingest(ev);
 }

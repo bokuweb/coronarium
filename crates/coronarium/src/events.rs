@@ -47,6 +47,7 @@ fn decode_connect4(bytes: &[u8]) -> Option<Event> {
         dport: u16::from_be(ev.dport),
         protocol: ev.protocol,
         denied: ev.header.verdict == VERDICT_DENY,
+        hostname: None,
     })
 }
 
@@ -60,6 +61,7 @@ fn decode_connect6(bytes: &[u8]) -> Option<Event> {
         dport: u16::from_be(ev.dport),
         protocol: ev.protocol,
         denied: ev.header.verdict == VERDICT_DENY,
+        hostname: None,
     })
 }
 

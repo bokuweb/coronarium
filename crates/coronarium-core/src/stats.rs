@@ -109,6 +109,7 @@ mod tests {
                 dport: 80,
                 protocol: 6,
                 denied: false,
+                hostname: None,
             });
         }
         assert_eq!(s.samples.len(), 3 * PER_KIND_CAP);
