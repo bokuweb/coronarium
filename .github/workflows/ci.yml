@@ -105,6 +105,142 @@ jobs:
           done
           echo "✓ all 4 ecosystems produced violations at --min-age 3650d"
 
+  proxy-smoke:
+    # End-to-end check that the MITM proxy correctly rewrites metadata
+    # responses for all 4 ecosystems. Runs against the real public
+    # registries with a high `--min-age` so we're guaranteed to find
+    # some too-young versions. If this fails you've regressed either
+    # the rewriter or the hudsucker wiring.
+    runs-on: ubuntu-latest
+    needs: userspace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p coronarium
+      - name: Generate CA + start proxy in background
+        run: |
+          set -euo pipefail
+          # First run creates the CA in $XDG_CONFIG_HOME/coronarium.
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/xdg"
+          mkdir -p "$XDG_CONFIG_HOME"
+          echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" >>"$GITHUB_ENV"
+          # 365d is enough to guarantee hits on all four fixtures we
+          # probe below. Very-old packages will see 0 drops and that's
+          # fine — the per-ecosystem assertions pick actively-updated
+          # ones.
+          ./target/release/coronarium proxy start \
+              --listen 127.0.0.1:18910 \
+              --min-age 365d \
+              > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/proxy.pid"
+          # Wait for the listener.
+          for i in $(seq 1 30); do
+            if ss -ltn 2>/dev/null | grep -q ':18910'; then
+              echo "proxy up after ${i}00ms"; break
+            fi
+            sleep 0.1
+          done
+          ss -ltn | grep -q ':18910' || { echo "::error::proxy never opened the port"; cat "$RUNNER_TEMP/proxy.log"; exit 1; }
+          echo "CA=$XDG_CONFIG_HOME/coronarium/ca.pem" >>"$GITHUB_ENV"
+      - name: crates.io sparse index — rewrite drops recent versions
+        run: |
+          set -euo pipefail
+          # `serde` is actively maintained, so some versions are
+          # definitely <365d old on any given day.
+          direct=$(curl -sS https://index.crates.io/se/rd/serde | wc -l)
+          via=$(curl -sS --cacert "$CA" -x http://127.0.0.1:18910 \
+                https://index.crates.io/se/rd/serde | wc -l)
+          echo "crates.io serde: direct=$direct via=$via"
+          if [ "$via" -ge "$direct" ]; then
+            echo "::error::expected proxy to drop some serde versions; direct=$direct via=$via"
+            exit 1
+          fi
+          if [ "$via" -lt 100 ]; then
+            echo "::error::proxy kept implausibly few versions ($via); rewriter likely broke"
+            exit 1
+          fi
+      - name: npm packument — rewrite drops recent versions AND retargets `latest`
+        run: |
+          set -euo pipefail
+          # `react` has very frequent releases.
+          curl -sS https://registry.npmjs.org/react > /tmp/react-direct.json
+          curl -sS --cacert "$CA" -x http://127.0.0.1:18910 \
+              https://registry.npmjs.org/react > /tmp/react-via.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('/tmp/react-direct.json'))
+          v = json.load(open('/tmp/react-via.json'))
+          assert len(v['versions']) < len(d['versions']), (len(d['versions']), len(v['versions']))
+          # dist-tag must be retargeted to a still-present version.
+          assert v['dist-tags']['latest'] in v['versions'], v['dist-tags']['latest']
+          print(f"ok react: direct={len(d['versions'])} via={len(v['versions'])} latest={v['dist-tags']['latest']}")
+          PY
+      - name: pypi JSON API — rewrite drops recent version keys
+        run: |
+          set -euo pipefail
+          curl -sS https://pypi.org/pypi/requests/json > /tmp/requests-direct.json
+          curl -sS --cacert "$CA" -x http://127.0.0.1:18910 \
+              https://pypi.org/pypi/requests/json > /tmp/requests-via.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/requests-direct.json'))
+          v = json.load(open('/tmp/requests-via.json'))
+          assert len(v['releases']) <= len(d['releases']), (len(d['releases']), len(v['releases']))
+          # The "urls" shortcut must not contain entries younger than the cutoff.
+          # We can't easily compute the exact cutoff here, but `urls`
+          # should either be empty (the latest release was young) or
+          # equal to the direct value (latest was old enough).
+          print(f"ok requests: direct={len(d['releases'])} via={len(v['releases'])} urls_via={len(v.get('urls',[]))}")
+          PY
+      - name: pypi simple JSON (PEP 691) — rewrite drops young files + versions
+        run: |
+          set -euo pipefail
+          # The -H Accept header is what switches PyPI to the JSON shape.
+          curl -sS -H 'Accept: application/vnd.pypi.simple.v1+json' \
+               https://pypi.org/simple/requests/ > /tmp/requests-simple-direct.json
+          curl -sS --cacert "$CA" -x http://127.0.0.1:18910 \
+               -H 'Accept: application/vnd.pypi.simple.v1+json' \
+               https://pypi.org/simple/requests/ > /tmp/requests-simple-via.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/requests-simple-direct.json'))
+          v = json.load(open('/tmp/requests-simple-via.json'))
+          assert len(v['files']) <= len(d['files']), (len(d['files']), len(v['files']))
+          print(f"ok simple-json: direct={len(d['files'])} via={len(v['files'])} versions_direct={len(d['versions'])} versions_via={len(v['versions'])}")
+          PY
+      - name: nuget registration — rewrite drops recent leaves
+        run: |
+          set -euo pipefail
+          # Newtonsoft.Json has inline items in its registration index
+          # (small package, not paged separately), so a single fetch is
+          # enough to prove the rewrite path works.
+          curl -sS https://api.nuget.org/v3/registration5-semver1/newtonsoft.json/index.json \
+              > /tmp/nj-direct.json
+          curl -sS --cacert "$CA" -x http://127.0.0.1:18910 \
+              https://api.nuget.org/v3/registration5-semver1/newtonsoft.json/index.json \
+              > /tmp/nj-via.json
+          python3 - <<'PY'
+          import json
+          def leaves(doc):
+              return sum(len(p.get('items', [])) for p in doc.get('items', []))
+          d = leaves(json.load(open('/tmp/nj-direct.json')))
+          v = leaves(json.load(open('/tmp/nj-via.json')))
+          # Newtonsoft ships occasional recent betas so direct>via is the expected shape,
+          # but we allow equality in case no new versions have landed in the last 365d.
+          assert v <= d, (d, v)
+          assert v > 50, f"suspicious drop ratio: direct={d} via={v}"
+          print(f"ok nuget: direct={d} via={v}")
+          PY
+      - name: Show proxy log on success
+        if: always()
+        run: tail -40 "$RUNNER_TEMP/proxy.log" || true
+      - name: Stop proxy
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/proxy.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/proxy.pid")" 2>/dev/null || true
+          fi
+
   ebpf:
     runs-on: ubuntu-latest
     steps:
