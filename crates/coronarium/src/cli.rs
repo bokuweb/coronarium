@@ -125,10 +125,13 @@ pub struct InstallGateInstallArgs {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+#[allow(clippy::enum_variant_names)]
 pub enum InstallGateShell {
     Bash,
     Zsh,
     Fish,
+    /// Windows PowerShell / PowerShell Core (`pwsh`).
+    Powershell,
 }
 
 impl From<InstallGateShell> for crate::install_gate::Shell {
@@ -137,6 +140,7 @@ impl From<InstallGateShell> for crate::install_gate::Shell {
             InstallGateShell::Bash => crate::install_gate::Shell::Bash,
             InstallGateShell::Zsh => crate::install_gate::Shell::Zsh,
             InstallGateShell::Fish => crate::install_gate::Shell::Fish,
+            InstallGateShell::Powershell => crate::install_gate::Shell::PowerShell,
         }
     }
 }
@@ -560,9 +564,11 @@ fn resolve_rc_path(
     if let Some(p) = explicit {
         return Ok(p);
     }
+    // $HOME on Unix, %USERPROFILE% on Windows (PowerShell).
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("$HOME is unset; pass --rc explicitly"))?;
+        .ok_or_else(|| anyhow::anyhow!("$HOME / %USERPROFILE% is unset; pass --rc explicitly"))?;
     Ok(crate::install_gate::default_rc_path(&home, shell))
 }
 
@@ -630,8 +636,9 @@ fn run_install_daemon(args: ProxyDaemonArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("couldn't resolve current exe; pass --binary"))?,
     };
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("$HOME is unset"))?;
+        .ok_or_else(|| anyhow::anyhow!("$HOME / %USERPROFILE% is unset"))?;
     let plan = render(
         backend,
         &DaemonInputs {
@@ -664,8 +671,9 @@ fn run_uninstall_daemon(args: ProxyDaemonArgs) -> Result<()> {
         .or_else(current_exe_canonical)
         .unwrap_or_else(|| PathBuf::from("coronarium"));
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("$HOME is unset"))?;
+        .ok_or_else(|| anyhow::anyhow!("$HOME / %USERPROFILE% is unset"))?;
     let plan = render(
         backend,
         &DaemonInputs {

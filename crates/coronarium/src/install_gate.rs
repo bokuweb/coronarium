@@ -29,31 +29,47 @@ pub const RC_MARKER: &str = "# >>> coronarium install-gate >>>";
 pub const RC_END: &str = "# <<< coronarium install-gate <<<";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Shell {
     Bash,
     Zsh,
     Fish,
+    /// Windows PowerShell / PowerShell Core. Same rendered snippet
+    /// for both — differences are only in rc-file location, which
+    /// `default_rc_file` reports as the PowerShell Core path
+    /// (Windows PowerShell users can pass `--rc` explicitly).
+    PowerShell,
 }
 
 impl Shell {
     /// Return the eval-style line that belongs in the rc file.
     /// Zsh / bash: `eval "$(coronarium install-gate shellenv)"`.
     /// Fish uses its own syntax because `eval` behaves differently.
+    /// PowerShell expands `$(…)` via `Invoke-Expression`.
     pub fn eval_line(self) -> &'static str {
         match self {
             Shell::Bash | Shell::Zsh => "eval \"$(coronarium install-gate shellenv)\"",
             Shell::Fish => "coronarium install-gate shellenv | source",
+            Shell::PowerShell => {
+                "coronarium install-gate shellenv --shell powershell | Out-String | Invoke-Expression"
+            }
         }
     }
 
-    /// Conventional rc file for each shell, as a suffix appended to
-    /// `$HOME`. Callers that want a different path should pass one
-    /// explicitly.
+    /// Conventional rc file for each shell.
+    ///
+    /// For POSIX shells this is appended to `$HOME`; for PowerShell
+    /// the path is the conventional `$PROFILE` location relative to
+    /// the user profile on Windows (`Documents\PowerShell\Microsoft.PowerShell_profile.ps1`
+    /// for PS 7+, also valid for PS 5.1 with a slightly different
+    /// folder name — we pick the PS7 path; Windows PowerShell users
+    /// can override with `--rc`).
     pub fn default_rc_file(self) -> &'static str {
         match self {
             Shell::Bash => ".bashrc",
             Shell::Zsh => ".zshrc",
             Shell::Fish => ".config/fish/config.fish",
+            Shell::PowerShell => "Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
         }
     }
 
@@ -62,6 +78,7 @@ impl Shell {
             "bash" => Some(Shell::Bash),
             "zsh" => Some(Shell::Zsh),
             "fish" => Some(Shell::Fish),
+            "powershell" | "pwsh" => Some(Shell::PowerShell),
             _ => None,
         }
     }
@@ -75,6 +92,7 @@ pub fn render_shellenv(shell: Shell, listen: SocketAddr) -> String {
     match shell {
         Shell::Bash | Shell::Zsh => render_sh(&proxy_url),
         Shell::Fish => render_fish(&proxy_url),
+        Shell::PowerShell => render_powershell(&proxy_url),
     }
 }
 
@@ -143,9 +161,51 @@ end
     )
 }
 
+fn render_powershell(proxy_url: &str) -> String {
+    // PowerShell equivalent of the sh snippet. A few notes:
+    //
+    // * `$env:FOO = 'bar'` is the PowerShell scope-current way of
+    //   setting an environment variable; variables set this way are
+    //   inherited by child processes launched from the same shell,
+    //   which is what we want for `cargo` / `npm` / `dotnet`.
+    // * Windows doesn't care about the lowercase `https_proxy` the
+    //   way POSIX tools do, but we still set it because
+    //   cross-platform libraries (e.g. Git, some Python tools) look
+    //   for both forms regardless of OS.
+    // * `[System.Environment]::SetEnvironmentVariable` with `'User'`
+    //   scope would persist across shells, but install-gate's model
+    //   is "process-local; user opts in per shell", so we stick to
+    //   `$env:` (matching the POSIX `export` semantics).
+    // * If the CA file is absent we silently skip the CAINFO/CERT
+    //   assignments — tools that don't use them keep working, and
+    //   `coronarium proxy install-ca` is the documented fix.
+    let ca_file = default_ca_cert_path_hint();
+    let ca_ps = ca_file.to_string_lossy().replace('\\', "\\\\");
+    format!(
+        r#"# coronarium install-gate: shell environment (PowerShell)
+$env:HTTPS_PROXY = '{proxy}'
+$env:HTTP_PROXY = '{proxy}'
+$env:https_proxy = '{proxy}'
+$env:http_proxy = '{proxy}'
+$__coronarium_ca = '{ca}'
+if (Test-Path -LiteralPath $__coronarium_ca) {{
+    $env:CARGO_HTTP_CAINFO = $__coronarium_ca
+    $env:PIP_CERT = $__coronarium_ca
+    $env:NODE_EXTRA_CA_CERTS = $__coronarium_ca
+    $env:REQUESTS_CA_BUNDLE = $__coronarium_ca
+    $env:SSL_CERT_FILE = $__coronarium_ca
+}}
+Remove-Variable -Name __coronarium_ca -ErrorAction SilentlyContinue
+"#,
+        proxy = proxy_url,
+        ca = ca_ps,
+    )
+}
+
 /// Best-effort default CA path, matching what `coronarium proxy` uses.
 /// We only need a *path* here — the file may or may not exist.
 fn default_ca_cert_path_hint() -> PathBuf {
+    // POSIX: XDG, then HOME.
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
@@ -154,7 +214,25 @@ fn default_ca_cert_path_hint() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".config/coronarium/ca.pem");
     }
-    // Windows or unusual environment.
+    // Windows: mirror `CaFiles::at_default_location` in
+    // coronarium-proxy, which uses `%LOCALAPPDATA%\coronarium\ca.pem`
+    // (via the `directories` crate's `config_local_dir`). We
+    // reconstruct it here without pulling that dep in — the path
+    // only matters as a *hint* the shell snippet renders literally.
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA")
+        && !local_appdata.is_empty()
+    {
+        return PathBuf::from(local_appdata)
+            .join("coronarium")
+            .join("ca.pem");
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        return PathBuf::from(userprofile)
+            .join("AppData")
+            .join("Local")
+            .join("coronarium")
+            .join("ca.pem");
+    }
     PathBuf::from("coronarium-ca.pem")
 }
 
@@ -224,9 +302,16 @@ pub fn install_block(contents: &str, shell: Shell) -> String {
     out
 }
 
-/// Best-effort shell detection from `$SHELL`, for `install` when the
-/// user didn't pass `--shell`. Falls back to bash.
+/// Best-effort shell detection for `install` when the user didn't
+/// pass `--shell`.
+///
+/// - Unix-y: read `$SHELL` and match the basename.
+/// - Windows: default to PowerShell since that's the interactive
+///   shell the vast majority of developers use.
 pub fn detect_shell_from_env() -> Shell {
+    if cfg!(windows) {
+        return Shell::PowerShell;
+    }
     std::env::var("SHELL")
         .ok()
         .and_then(|s| {
@@ -314,10 +399,23 @@ mod tests {
     }
 
     #[test]
+    fn shellenv_powershell_uses_env_assignment() {
+        let out = render_shellenv(Shell::PowerShell, listen());
+        assert!(out.contains("$env:HTTPS_PROXY = 'http://127.0.0.1:8910'"));
+        assert!(out.contains("$env:CARGO_HTTP_CAINFO = $__coronarium_ca"));
+        // Guard with Test-Path not `if [ -f ]`.
+        assert!(out.contains("Test-Path"));
+        // No POSIX sh syntax leaked in.
+        assert!(!out.contains("export "));
+        assert!(!out.contains("set -gx"));
+    }
+
+    #[test]
     fn eval_line_differs_per_shell_family() {
         assert!(Shell::Bash.eval_line().starts_with("eval"));
         assert!(Shell::Zsh.eval_line().starts_with("eval"));
         assert!(Shell::Fish.eval_line().ends_with("| source"));
+        assert!(Shell::PowerShell.eval_line().contains("Invoke-Expression"));
     }
 
     #[test]
@@ -325,6 +423,10 @@ mod tests {
         assert_eq!(Shell::Bash.default_rc_file(), ".bashrc");
         assert_eq!(Shell::Zsh.default_rc_file(), ".zshrc");
         assert_eq!(Shell::Fish.default_rc_file(), ".config/fish/config.fish");
+        assert_eq!(
+            Shell::PowerShell.default_rc_file(),
+            "Documents/PowerShell/Microsoft.PowerShell_profile.ps1"
+        );
     }
 
     #[test]
@@ -332,6 +434,17 @@ mod tests {
         assert_eq!(Shell::from_name("bash"), Some(Shell::Bash));
         assert_eq!(Shell::from_name("zsh"), Some(Shell::Zsh));
         assert_eq!(Shell::from_name("fish"), Some(Shell::Fish));
+        assert_eq!(Shell::from_name("powershell"), Some(Shell::PowerShell));
+        assert_eq!(Shell::from_name("pwsh"), Some(Shell::PowerShell));
         assert_eq!(Shell::from_name("tcsh"), None);
+    }
+
+    #[test]
+    fn powershell_install_block_is_idempotent() {
+        let base = "# my PowerShell profile\nSet-Alias ll Get-ChildItem\n";
+        let once = install_block(base, Shell::PowerShell);
+        let twice = install_block(&once, Shell::PowerShell);
+        assert_eq!(once, twice);
+        assert!(once.contains("Invoke-Expression"));
     }
 }

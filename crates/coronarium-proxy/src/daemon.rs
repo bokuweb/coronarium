@@ -12,9 +12,10 @@
 //!   `~/.config/systemd/user/coronarium-proxy.service` and enables
 //!   it via `systemctl --user enable --now`.
 //!
-//! Windows is intentionally not covered here: NT services need
-//! elevation and a whole different lifecycle; telling the user to
-//! use Task Scheduler themselves is cleaner than half-implementing.
+//! - **Windows** — generates a Task Scheduler XML and installs it
+//!   with `schtasks.exe /Create /TN coronarium-proxy /XML <path>`.
+//!   Runs at logon with the user's own token (no service account /
+//!   UAC prompt).
 //!
 //! The rendered unit/plist text is **pure** and snapshot-testable;
 //! the IO (writing files, shelling out to `launchctl`/`systemctl`) is
@@ -42,6 +43,9 @@ pub struct DaemonPlan {
 pub enum DaemonBackend {
     Launchd,
     SystemdUser,
+    /// Windows Task Scheduler. Installed via `schtasks.exe /Create
+    /// /XML <path>`; runs at user logon with the user's own token.
+    WindowsTaskScheduler,
 }
 
 impl DaemonBackend {
@@ -54,6 +58,10 @@ impl DaemonBackend {
         #[cfg(target_os = "linux")]
         {
             return Some(DaemonBackend::SystemdUser);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return Some(DaemonBackend::WindowsTaskScheduler);
         }
         #[allow(unreachable_code)]
         None
@@ -76,6 +84,7 @@ pub fn render(backend: DaemonBackend, inp: &DaemonInputs) -> DaemonPlan {
     match backend {
         DaemonBackend::Launchd => render_launchd(inp),
         DaemonBackend::SystemdUser => render_systemd(inp),
+        DaemonBackend::WindowsTaskScheduler => render_windows_task(inp),
     }
 }
 
@@ -175,6 +184,116 @@ WantedBy=default.target
     }
 }
 
+fn render_windows_task(inp: &DaemonInputs) -> DaemonPlan {
+    // Task Scheduler XML schema 1.4. This task:
+    //
+    // - registers at user logon (no admin / service account needed),
+    // - runs with the user's own token (InteractLogonTrigger) so the
+    //   proxy has access to the same cert directories install-ca /
+    //   install-gate wrote under %LOCALAPPDATA%,
+    // - restarts on failure up to 99 times with a short delay — the
+    //   practical equivalent of systemd's `Restart=on-failure`,
+    // - hides the console window (no flashing terminal on login).
+    //
+    // The XML is stored next to the other config files we manage so
+    // `uninstall-daemon` knows where to find it without re-deriving
+    // from scratch.
+    let unit_path = inp
+        .home
+        .join("AppData/Local/coronarium")
+        .join("coronarium-proxy.task.xml");
+    let exe = inp.binary_path.display().to_string();
+    // Task Scheduler XML is picky about escaping; & and <, > must be
+    // entity-encoded. Our inputs are well-typed paths and numeric
+    // ports so the only interesting escape is `&` inside a pathname
+    // like `C:\Program Files & Co\…`.
+    let exe_xml = xml_escape(&exe);
+    let args_xml = xml_escape(&format!(
+        "proxy start --listen {} --min-age {}",
+        inp.listen, inp.min_age
+    ));
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>coronarium registry proxy (minimumReleaseAge enforcement)</Description>
+    <URI>\coronarium-proxy</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>99</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe_xml}</Command>
+      <Arguments>{args_xml}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    );
+    DaemonPlan {
+        label: "coronarium-proxy".into(),
+        unit_path: unit_path.clone(),
+        unit_body: body,
+        // `schtasks.exe /Create /XML` imports the XML literally. `/F`
+        // forces overwrite so re-running install-daemon is idempotent.
+        activate_command: format!(
+            "schtasks.exe /Create /TN coronarium-proxy /XML \"{}\" /F",
+            unit_path.display()
+        ),
+        deactivate_command: "schtasks.exe /Delete /TN coronarium-proxy /F".into(),
+    }
+}
+
+/// Minimal XML attribute-value / text-body escaper. Task Scheduler
+/// XML is UTF-16 and picky, so only the XML-critical five get
+/// encoded.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Best-effort absolute path to the current binary. Callers should
 /// pass this into [`DaemonInputs::binary_path`] so the daemon unit
 /// doesn't need `$PATH`.
@@ -259,13 +378,60 @@ mod tests {
     }
 
     #[test]
+    fn windows_task_xml_is_schema_v1_4_and_logon_triggered() {
+        let mut inp = inputs();
+        inp.binary_path = PathBuf::from(r"C:\Program Files\coronarium\coronarium.exe");
+        inp.home = PathBuf::from(r"C:\Users\example");
+        let plan = render(DaemonBackend::WindowsTaskScheduler, &inp);
+        assert_eq!(plan.label, "coronarium-proxy");
+        assert!(
+            plan.unit_body
+                .starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>")
+        );
+        assert!(plan.unit_body.contains("<Task version=\"1.4\""));
+        assert!(plan.unit_body.contains("<LogonTrigger>"));
+        assert!(
+            plan.unit_body
+                .contains("<RunLevel>LeastPrivilege</RunLevel>")
+        );
+        assert!(plan.unit_body.contains("<RestartOnFailure>"));
+        assert!(
+            plan.unit_body
+                .contains(r"C:\Program Files\coronarium\coronarium.exe")
+        );
+        assert!(
+            plan.unit_body
+                .contains("proxy start --listen 127.0.0.1:8910 --min-age 7d")
+        );
+        // Unit file lives under %LOCALAPPDATA% where our other config goes.
+        assert!(
+            plan.unit_path
+                .ends_with("AppData/Local/coronarium/coronarium-proxy.task.xml")
+        );
+        assert!(plan.activate_command.contains("schtasks.exe /Create"));
+        assert!(plan.deactivate_command.contains("schtasks.exe /Delete"));
+    }
+
+    #[test]
+    fn xml_escape_handles_ampersand_and_angle_brackets() {
+        // Ampersands appear in paths like `C:\Program Files & Co\...`.
+        assert_eq!(xml_escape("a & b"), "a &amp; b");
+        assert_eq!(xml_escape("<foo>"), "&lt;foo&gt;");
+        assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
+        // Plain ASCII passes through byte-for-byte.
+        assert_eq!(xml_escape("plain/path:123"), "plain/path:123");
+    }
+
+    #[test]
     fn different_listen_address_shows_up_in_unit() {
         let mut inp = inputs();
         inp.listen = "0.0.0.0:19999".parse().unwrap();
         let plist = render(DaemonBackend::Launchd, &inp);
         let unit = render(DaemonBackend::SystemdUser, &inp);
+        let task = render(DaemonBackend::WindowsTaskScheduler, &inp);
         assert!(plist.unit_body.contains("0.0.0.0:19999"));
         assert!(unit.unit_body.contains("0.0.0.0:19999"));
+        assert!(task.unit_body.contains("0.0.0.0:19999"));
     }
 
     #[test]
