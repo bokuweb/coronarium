@@ -515,12 +515,20 @@ mod integration_tests {
         }
         let bytes = std::fs::read(path).unwrap();
         let m = parse_mirror_dump(&bytes).expect("producer output should parse");
-        assert!(m.len() > 1_000, "real dump should have thousands of entries, got {}", m.len());
+        assert!(
+            m.len() > 1_000,
+            "real dump should have thousands of entries, got {}",
+            m.len()
+        );
 
         // Spot-check: event-stream 3.3.6 is a known MAL- entry from npm
         // (the flatmap-stream incident). If this ever stops being in
         // the feed, the filter heuristic has regressed.
-        let key = (Ecosystem::Npm, "flatmap-stream".to_string(), "0.1.1".to_string());
+        let key = (
+            Ecosystem::Npm,
+            "flatmap-stream".to_string(),
+            "0.1.1".to_string(),
+        );
         let hit = m.get(&key);
         assert!(
             hit.is_some(),
