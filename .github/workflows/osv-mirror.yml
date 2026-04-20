@@ -1,0 +1,112 @@
+name: osv-mirror
+
+# Scheduled refresh of `osv-mirror/mal.json` — the coronarium
+# known-malicious denylist that proxies consume via
+# `https://raw.githubusercontent.com/<owner>/coronarium/osv-mirror-data/mal.json`.
+#
+# Two triggers:
+#   - schedule: every 10 minutes (GitHub can add 5–15 min of drift,
+#     but that's well within the 12–72h window supply-chain attacks
+#     live in).
+#   - workflow_dispatch: manual kick for hot-fixes.
+#
+# Output goes to a **separate branch** (`osv-mirror-data`) that we
+# force-push each run. This keeps `main`'s git history clean (no
+# thousands of "mirror: timestamp" commits) while still giving
+# consumers a stable raw.githubusercontent.com URL.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # If two cron firings overlap (rare but possible — the build
+  # downloads ~20 MB of zips and can take 30s+), only the latest
+  # one wins. Cancelling an in-progress older run is cheaper than
+  # force-pushing twice.
+  group: osv-mirror
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (for the producer script)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main-ck
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build osv-mirror/mal.json
+        working-directory: main-ck
+        run: |
+          python3 scripts/build-osv-mirror.py
+          ls -la osv-mirror/
+          head -20 osv-mirror/mal.json
+          entries=$(python3 -c 'import json; print(len(json.load(open("osv-mirror/mal.json"))["entries"]))')
+          echo "entries=$entries" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to osv-mirror-data branch
+        run: |
+          set -euo pipefail
+          cd main-ck
+
+          # Stand up a tiny orphan working tree for the data branch.
+          # We don't want the rest of coronarium's history in there —
+          # just the mirror + a README explaining what this branch is.
+          work=$(mktemp -d)
+          git init -q "$work"
+          cp osv-mirror/mal.json "$work/mal.json"
+
+          cat > "$work/README.md" <<'EOF'
+          # coronarium OSV mirror data
+
+          Auto-generated on every run of `.github/workflows/osv-mirror.yml`
+          in the main branch. **Don't edit this branch by hand** — any
+          manual commits get force-pushed over by the next cron.
+
+          Consumers:
+          - `https://raw.githubusercontent.com/bokuweb/coronarium/osv-mirror-data/mal.json`
+
+          Schema: see `scripts/build-osv-mirror.py` on `main`.
+          EOF
+
+          cd "$work"
+          git config user.name 'coronarium-osv-bot'
+          git config user.email 'osv-bot@users.noreply.github.com'
+          git checkout -q -b osv-mirror-data
+          git add .
+          # Include the entry count in the commit message so the
+          # branch's "latest commit" summary on GitHub shows the
+          # current denylist size at a glance.
+          git commit -q -s -m "mirror: $(date -u +%FT%TZ) ($(python3 -c 'import json;print(len(json.load(open("mal.json"))["entries"]))') entries)"
+
+          # Force-push over the data branch. This is deliberately
+          # destructive: the branch is a *snapshot mirror*, not a
+          # history of changes. Anyone who needs historical diffs
+          # can run `git log` on the `main-ck/osv-mirror/mal.json`
+          # path in the main branch (we commit the snapshot there
+          # only on the first run, then leave it stale — see below).
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push -q -f origin osv-mirror-data
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### osv-mirror snapshot" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f main-ck/osv-mirror/mal.json ]; then
+            echo "- entries: **$(python3 -c 'import json;print(len(json.load(open("main-ck/osv-mirror/mal.json"))["entries"]))')**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- size:    **$(stat -c '%s' main-ck/osv-mirror/mal.json 2>/dev/null || stat -f '%z' main-ck/osv-mirror/mal.json) bytes**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- branch:  \`osv-mirror-data\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "mal.json was not produced" >> "$GITHUB_STEP_SUMMARY"
+          fi

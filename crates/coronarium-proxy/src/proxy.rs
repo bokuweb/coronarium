@@ -41,6 +41,15 @@ pub struct ProxyConfig {
     /// summary/details contain "malicious") are hard-denied
     /// regardless of `--min-age`.
     pub osv: bool,
+    /// When `true`, additionally consume the coronarium-hosted OSV
+    /// mirror (pre-filtered to malicious-package advisories) for
+    /// O(1) local lookups. Layered in front of live OSV: mirror
+    /// hit short-circuits, miss cascades to live when `osv` is
+    /// also on.
+    pub osv_mirror: bool,
+    /// Override URL for `osv_mirror`. Defaults to
+    /// [`crate::osv_mirror::DEFAULT_MIRROR_URL`].
+    pub osv_mirror_url: Option<String>,
     pub ca_files: CaFiles,
     pub user_agent: String,
     /// Override to inject a fake oracle in tests.
@@ -55,6 +64,8 @@ impl ProxyConfig {
             fail_on_missing: false,
             require_provenance: false,
             osv: false,
+            osv_mirror: false,
+            osv_mirror_url: None,
             ca_files: CaFiles::at_default_location()?,
             user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
             oracle: None,
@@ -85,11 +96,39 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
     let oracle: Box<dyn AgeOracle> = cfg
         .oracle
         .unwrap_or_else(|| Box::new(crate::decision::RegistryOracle::new(cfg.user_agent.clone())));
-    let known_bad: Option<Box<dyn crate::osv::KnownBadOracle>> = if cfg.osv {
-        log::info!("OSV known-malicious check: enabled (api.osv.dev)");
-        Some(Box::new(crate::osv::OsvClient::new(cfg.user_agent.clone())))
-    } else {
-        None
+    // Compose the known-bad oracle chain. Up to three layers:
+    //   mirror (local HashMap) → live OSV API → None
+    // Only the `osv_mirror` layer runs a background task; the live
+    // client is a lazy-per-request HTTP lookup.
+    let known_bad: Option<Box<dyn crate::osv::KnownBadOracle>> = match (cfg.osv_mirror, cfg.osv) {
+        (false, false) => None,
+        (true, false) => {
+            let url = cfg
+                .osv_mirror_url
+                .clone()
+                .unwrap_or_else(|| crate::osv_mirror::DEFAULT_MIRROR_URL.to_string());
+            log::info!("OSV known-malicious check: mirror only ({url})");
+            let mirror = crate::osv_mirror::OsvMirrorOracle::with_url(cfg.user_agent.clone(), url);
+            mirror.spawn_refresh_loop();
+            Some(Box::new(mirror))
+        }
+        (false, true) => {
+            log::info!("OSV known-malicious check: live API only (api.osv.dev)");
+            Some(Box::new(crate::osv::OsvClient::new(cfg.user_agent.clone())))
+        }
+        (true, true) => {
+            let url = cfg
+                .osv_mirror_url
+                .clone()
+                .unwrap_or_else(|| crate::osv_mirror::DEFAULT_MIRROR_URL.to_string());
+            log::info!("OSV known-malicious check: mirror ({url}) + live API fallback");
+            let mirror = crate::osv_mirror::OsvMirrorOracle::with_url(cfg.user_agent.clone(), url);
+            mirror.spawn_refresh_loop();
+            Some(Box::new(crate::osv_mirror::LayeredKnownBad {
+                primary: Box::new(mirror),
+                fallback: Box::new(crate::osv::OsvClient::new(cfg.user_agent.clone())),
+            }))
+        }
     };
     let decider = Arc::new(Decider {
         oracle,

@@ -240,6 +240,23 @@ Options:
                                claim. Forces publishers to have gone
                                through OIDC-authenticated CI.
                                (npm only for now.)
+  --osv                        Consult OSV.dev on every decision.
+                               Versions flagged as malicious
+                               packages (MAL-* or advisories
+                               mentioning "malicious") are hard-
+                               denied regardless of --min-age.
+                               Live API, per-version cached.
+  --osv-mirror                 Same blocking rule as --osv, but
+                               consumed from the coronarium-hosted
+                               pre-filtered snapshot. O(1) in-memory
+                               lookup after a single ~10-minute
+                               background refresh. ~10 min behind
+                               OSV publish time in exchange for
+                               not hitting api.osv.dev per request.
+                               Combine with --osv to additionally
+                               fall back to the live API for
+                               entries the mirror hasn't indexed.
+  --osv-mirror-url <URL>       Override mirror URL (e.g. self-hosted).
   --config-dir <PATH>          Override CA / config directory.
                                Defaults to $XDG_CONFIG_HOME/coronarium
                                on Unix, %LOCALAPPDATA%\coronarium on

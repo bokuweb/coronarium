@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod decision;
 pub mod install;
 pub mod osv;
+pub mod osv_mirror;
 pub mod parser;
 pub mod proxy;
 pub mod rewrite;

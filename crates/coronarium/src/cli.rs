@@ -236,6 +236,21 @@ pub struct ProxyStartArgs {
     /// still runs.
     #[arg(long)]
     pub osv: bool,
+    /// Consume the coronarium-hosted pre-filtered OSV mirror at
+    /// `https://raw.githubusercontent.com/bokuweb/coronarium/osv-mirror-data/mal.json`.
+    ///
+    /// This is the recommended way to enable OSV known-malicious
+    /// blocking: it's O(1) in-memory after a single background
+    /// refresh per 10 minutes, instead of a live HTTP lookup per
+    /// decision. Combine with `--osv` to additionally fall back to
+    /// the live API when the mirror hasn't yet indexed a new
+    /// advisory.
+    #[arg(long)]
+    pub osv_mirror: bool,
+    /// Override the mirror URL (e.g. your org's self-hosted mirror).
+    /// Only meaningful with `--osv-mirror`.
+    #[arg(long)]
+    pub osv_mirror_url: Option<String>,
     /// Override the CA/config directory. Defaults to
     /// `$XDG_CONFIG_HOME/coronarium` (or `~/.config/coronarium`).
     #[arg(long)]
@@ -461,6 +476,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 fail_on_missing: args.fail_on_missing,
                 require_provenance: args.require_provenance,
                 osv: args.osv,
+                osv_mirror: args.osv_mirror,
+                osv_mirror_url: args.osv_mirror_url,
                 ca_files,
                 user_agent: format!("coronarium-proxy/{}", env!("CARGO_PKG_VERSION")),
                 oracle: None,
