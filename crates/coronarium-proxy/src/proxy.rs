@@ -148,13 +148,24 @@ impl HttpHandler for CoronariumHandler {
             return RequestOrResponse::Request(req);
         }
         self.last_host = Some(host.clone());
-        let path = req
+        let path: String = req
             .uri()
             .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-        self.last_path = Some(path.to_string());
-        match parse_for_host(&self.parsers, &host, path) {
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".into());
+        self.last_path = Some(path.clone());
+        // Force upstream to send us plain-body responses so our
+        // rewriters see JSON / JSONL directly. Without this, npm
+        // and pypi will gzip-encode and we'd have to decode+reencode
+        // to filter — hudsucker doesn't decode response bodies for
+        // us. Tarballs are content-encoded, not transfer-encoded,
+        // so this flag doesn't inflate their wire size.
+        let mut req = req;
+        req.headers_mut().insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
+        match parse_for_host(&self.parsers, &host, &path) {
             ParseResult::Pinned {
                 ecosystem,
                 name,

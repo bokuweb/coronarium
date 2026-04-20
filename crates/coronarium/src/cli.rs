@@ -148,6 +148,26 @@ pub enum ProxyCommand {
     InstallCa(ProxyCaArgs),
     /// Remove the proxy's root CA from the OS trust store.
     UninstallCa(ProxyCaArgs),
+    /// Write a user-level launchd plist (macOS) or systemd user unit
+    /// (Linux) so `proxy start` runs in the background and restarts on
+    /// failure. Idempotent. Prints the exact command to activate it.
+    InstallDaemon(ProxyDaemonArgs),
+    /// Remove the daemon unit written by `install-daemon`.
+    UninstallDaemon(ProxyDaemonArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct ProxyDaemonArgs {
+    /// Address the proxy will listen on.
+    #[arg(long, default_value = "127.0.0.1:8910")]
+    pub listen: std::net::SocketAddr,
+    /// Minimum age a package must have, same grammar as `deps check`.
+    #[arg(long, default_value = "7d")]
+    pub min_age: String,
+    /// Override the binary path embedded in the unit. Defaults to
+    /// the canonical path of the currently-running executable.
+    #[arg(long)]
+    pub binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -400,6 +420,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             coronarium_proxy::run(cfg).await?;
             Ok(())
         }
+        Command::Proxy {
+            cmd: ProxyCommand::InstallDaemon(args),
+        } => run_install_daemon(args),
+        Command::Proxy {
+            cmd: ProxyCommand::UninstallDaemon(args),
+        } => run_uninstall_daemon(args),
         Command::Deps {
             cmd: DepsCommand::Watch(args),
         } => {
@@ -563,4 +589,72 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         std::process::exit(1);
     }
     std::process::exit(exit);
+}
+
+fn run_install_daemon(args: ProxyDaemonArgs) -> Result<()> {
+    use coronarium_proxy::daemon::{
+        DaemonBackend, DaemonInputs, current_exe_canonical, render, write_unit,
+    };
+    let backend = DaemonBackend::detect()
+        .ok_or_else(|| anyhow::anyhow!("no daemon backend for this OS; see README"))?;
+    let binary = match args.binary {
+        Some(p) => p,
+        None => current_exe_canonical()
+            .ok_or_else(|| anyhow::anyhow!("couldn't resolve current exe; pass --binary"))?,
+    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is unset"))?;
+    let plan = render(
+        backend,
+        &DaemonInputs {
+            binary_path: binary,
+            listen: args.listen,
+            min_age: args.min_age,
+            home,
+        },
+    );
+    write_unit(&plan).with_context(|| format!("writing {}", plan.unit_path.display()))?;
+    println!(
+        "coronarium: wrote daemon unit to {}\n\n\
+         Activate it with:\n\n    {}\n\n\
+         (On macOS you may be prompted by System Settings to allow \
+         background items the first time.)",
+        plan.unit_path.display(),
+        plan.activate_command,
+    );
+    Ok(())
+}
+
+fn run_uninstall_daemon(args: ProxyDaemonArgs) -> Result<()> {
+    use coronarium_proxy::daemon::{
+        DaemonBackend, DaemonInputs, current_exe_canonical, remove_unit, render,
+    };
+    let backend = DaemonBackend::detect()
+        .ok_or_else(|| anyhow::anyhow!("no daemon backend for this OS; see README"))?;
+    let binary = args
+        .binary
+        .or_else(current_exe_canonical)
+        .unwrap_or_else(|| PathBuf::from("coronarium"));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$HOME is unset"))?;
+    let plan = render(
+        backend,
+        &DaemonInputs {
+            binary_path: binary,
+            listen: args.listen,
+            min_age: args.min_age,
+            home,
+        },
+    );
+    remove_unit(&plan.unit_path)
+        .with_context(|| format!("removing {}", plan.unit_path.display()))?;
+    println!(
+        "coronarium: removed {} (if it existed).\n\n\
+         Deactivate the running instance with:\n\n    {}\n",
+        plan.unit_path.display(),
+        plan.deactivate_command,
+    );
+    Ok(())
 }

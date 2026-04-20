@@ -2,6 +2,7 @@
 //! layer. See the crate README for design + status.
 
 pub mod ca;
+pub mod daemon;
 pub mod decision;
 pub mod install;
 pub mod parser;
