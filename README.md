@@ -775,10 +775,17 @@ Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
   which is already meaningful (npm refuses to attach it unless
   the publish came from OIDC-authenticated CI) but the bundle
   itself isn't cryptographically verified.
-- **DNS round-robin drift**: `network.allow: example.com` resolves
-  *at startup*. If DNS returns different IPs during the run, the
-  drift goes unmatched. Short-lived CI jobs are fine; long-lived
-  daemons should periodically refresh (roadmap).
+<!-- DNS round-robin drift: addressed by `--dns-refresh-interval <secs>`
+     on `coronarium run`. Re-resolves hostname rules on the given
+     interval and additively inserts any newly-observed IPs into the
+     eBPF maps. Default is 0 (off); set to 60–300 for long-running
+     CDN-heavy jobs. Entries are never removed, so increasing the
+     rate is safe and won't kill active connections. -->
+- **CDN IP rotation across long runs**: handled by
+  `coronarium run --dns-refresh-interval <secs>`, which re-resolves
+  `network.allow` / `network.deny` hostnames every N seconds and
+  additively inserts new IPs. Off by default (0); 60–300 is typical
+  for CI jobs that run for hours behind round-robin DNS.
 
 ### Linux supervised run
 

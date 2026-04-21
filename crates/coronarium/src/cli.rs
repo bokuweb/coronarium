@@ -411,6 +411,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub html: Option<PathBuf>,
 
+    /// Re-resolve hostname-based `network.allow` / `network.deny`
+    /// rules on this interval (seconds) and additively populate the
+    /// eBPF map with any newly-observed IPs. Needed for long-running
+    /// supervised jobs behind CDN round-robin DNS: a CDN that
+    /// rotates its IP set mid-run would otherwise start hitting
+    /// addresses the map has never seen. `0` disables refresh
+    /// (default). Entries are never removed once written, so
+    /// increasing the refresh rate is safe.
+    #[arg(long, default_value_t = 0, value_name = "SECS")]
+    pub dns_refresh_interval: u64,
+
     /// Command + args to execute under supervision.
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -666,7 +677,12 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         args.command
     );
 
-    let supervised = loader::Supervisor::start(policy.clone(), mode).await?;
+    let supervised = loader::Supervisor::start(
+        policy.clone(),
+        mode,
+        std::time::Duration::from_secs(args.dns_refresh_interval),
+    )
+    .await?;
     let exit = supervised.run_child(&args.command).await?;
     let mut stats = supervised.shutdown().await?;
 
