@@ -22,10 +22,13 @@ use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
 use crate::nuget_flatcontainer_client::NugetFlatContainerClient;
 use crate::parser::{ParseResult, RegistryParser, default_parsers, parse_for_host};
+use crate::pypi_simple_client::PypiSimpleClient;
 use crate::rewrite::rewrite_crates_index_jsonl;
 use crate::rewrite_npm::{NpmRewriteOptions, rewrite_npm_packument_with};
 use crate::rewrite_nuget::{rewrite_nuget_flatcontainer, rewrite_nuget_registration};
-use crate::rewrite_pypi::{rewrite_pypi_json_api, rewrite_pypi_simple_json};
+use crate::rewrite_pypi::{
+    rewrite_pypi_json_api, rewrite_pypi_simple_html, rewrite_pypi_simple_json,
+};
 
 pub struct ProxyConfig {
     pub listen: SocketAddr,
@@ -182,6 +185,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         last_path: None,
         require_provenance: cfg.require_provenance,
         nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
+        pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
@@ -230,6 +234,10 @@ struct CoronariumHandler {
     /// endpoint so we can silently filter the flat-container index
     /// (which has no dates inline).
     nuget_flat: NugetFlatContainerClient,
+    /// Looks up per-package publish times from the Warehouse JSON
+    /// API so we can silently filter the PEP 503 HTML Simple index
+    /// (which has no dates inline).
+    pypi_simple: PypiSimpleClient,
 }
 
 impl HttpHandler for CoronariumHandler {
@@ -367,37 +375,55 @@ impl HttpHandler for CoronariumHandler {
                 }
                 out
             }
-            RewriteTarget::PypiSimpleJson => {
-                // PEP 691 Simple JSON and PEP 503 HTML share the
-                // `/simple/<pkg>/` path — distinguish by Content-Type.
-                // Anything other than `application/vnd.pypi.simple.v1+json`
-                // (the only JSON shape we currently handle) passes through.
-                let is_simple_json = parts
+            RewriteTarget::PypiSimpleIndex(pkg) => {
+                // PEP 691 JSON vs PEP 503 HTML share the same path;
+                // Content-Type is the source of truth.
+                let ct = parts
                     .headers
                     .get(http::header::CONTENT_TYPE)
                     .and_then(|h| h.to_str().ok())
-                    .map(|ct| {
-                        let ct = ct.to_ascii_lowercase();
-                        ct.contains("application/vnd.pypi.simple.v1+json")
-                            || ct.contains("application/vnd.pypi.simple.latest+json")
-                    })
-                    .unwrap_or(false);
-                if !is_simple_json {
-                    log::debug!("pypi-rewrite(simple): pass-through (non-JSON Content-Type)");
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if ct.contains("application/vnd.pypi.simple.v1+json")
+                    || ct.contains("application/vnd.pypi.simple.latest+json")
+                {
+                    let (out, stats) =
+                        rewrite_pypi_simple_json(&collected, self.decider.min_age, now);
+                    if stats.dropped > 0 {
+                        log::info!(
+                            "pypi-rewrite(simple-json): dropped {} file(s), kept {}",
+                            stats.dropped,
+                            stats.kept
+                        );
+                    }
+                    out
+                } else if ct.contains("text/html") || ct.contains("application/xhtml") {
+                    // PEP 503 HTML: no inline publish times. Look them
+                    // up out-of-band from the Warehouse JSON API,
+                    // cached per package. A failed lookup yields an
+                    // empty map, so the filter fails open — the
+                    // downstream `files.pythonhosted.org` tarball-deny
+                    // path still catches too-young pins.
+                    let oracle = self.pypi_simple.lookup(&pkg).await;
+                    let (out, stats) =
+                        rewrite_pypi_simple_html(&collected, self.decider.min_age, now, |v| {
+                            oracle.get(v).copied()
+                        });
+                    if stats.dropped > 0 {
+                        log::info!(
+                            "pypi-rewrite(simple-html): dropped {} anchor(s), kept {} for {pkg}",
+                            stats.dropped,
+                            stats.kept
+                        );
+                    }
+                    out
+                } else {
+                    log::debug!("pypi-rewrite(simple): pass-through (unknown Content-Type {ct:?})");
                     return Response::from_parts(
                         parts,
                         Body::from(http_body_util::Full::new(collected)),
                     );
                 }
-                let (out, stats) = rewrite_pypi_simple_json(&collected, self.decider.min_age, now);
-                if stats.dropped > 0 {
-                    log::info!(
-                        "pypi-rewrite(simple): dropped {} file(s), kept {}",
-                        stats.dropped,
-                        stats.kept
-                    );
-                }
-                out
             }
             RewriteTarget::NugetRegistration => {
                 let (out, stats) =
@@ -448,7 +474,12 @@ enum RewriteTarget {
     CratesSparse,
     NpmPackument,
     PypiJsonApi,
-    PypiSimpleJson,
+    /// Simple index (`/simple/<pkg>/`) — PEP 691 JSON *or* PEP 503
+    /// HTML, decided at response time by Content-Type. The String is
+    /// the un-normalized package name from the URL path; the HTML
+    /// path hands it to [`PypiSimpleClient`] for the out-of-band
+    /// publish-time lookup.
+    PypiSimpleIndex(String),
     NugetRegistration,
     /// Flat-container index (`/v3-flatcontainer/<id>/index.json`).
     /// The String is the lower-cased package id, captured here so the
@@ -477,12 +508,13 @@ fn classify_response(host: Option<&str>, path: Option<&str>) -> Option<RewriteTa
         if is_pypi_json_api_path(path) {
             return Some(RewriteTarget::PypiJsonApi);
         }
-        if is_pypi_simple_path(path) {
+        if let Some(pkg) = parse_pypi_simple_pkg(path) {
             // We can't distinguish HTML vs JSON by path alone — the
             // client's Accept header decides, and the upstream
             // response's Content-Type confirms. The handler inspects
-            // Content-Type at rewrite time and skips HTML bodies.
-            return Some(RewriteTarget::PypiSimpleJson);
+            // Content-Type at rewrite time and dispatches HTML vs
+            // JSON vs pass-through accordingly.
+            return Some(RewriteTarget::PypiSimpleIndex(pkg));
         }
     }
     if host.eq_ignore_ascii_case("api.nuget.org") {
@@ -543,14 +575,16 @@ fn is_pypi_json_api_path(path: &str) -> bool {
 }
 
 /// `GET /simple/<pkg>/` — PEP 503 simple index (HTML) or PEP 691 JSON.
-fn is_pypi_simple_path(path: &str) -> bool {
+/// Returns the raw `<pkg>` segment from the path so the handler can
+/// pass it to the out-of-band publish-time lookup client.
+fn parse_pypi_simple_pkg(path: &str) -> Option<String> {
     let path = path.split('?').next().unwrap_or(path);
-    if let Some(rest) = path.strip_prefix("/simple/") {
-        let rest = rest.trim_end_matches('/');
-        !rest.is_empty() && !rest.contains('/')
-    } else {
-        false
+    let rest = path.strip_prefix("/simple/")?;
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() || rest.contains('/') {
+        return None;
     }
+    Some(rest.to_string())
 }
 
 fn is_npm_packument_path(path: &str) -> bool {
@@ -645,11 +679,22 @@ mod tests {
 
     #[test]
     fn pypi_simple_path_matches_index_shape() {
-        assert!(is_pypi_simple_path("/simple/requests/"));
-        assert!(is_pypi_simple_path("/simple/requests"));
-        assert!(!is_pypi_simple_path("/simple/requests/2.32.4/"));
-        assert!(!is_pypi_simple_path("/simple/"));
-        assert!(!is_pypi_simple_path("/pypi/requests/json"));
+        assert_eq!(
+            parse_pypi_simple_pkg("/simple/requests/").as_deref(),
+            Some("requests")
+        );
+        assert_eq!(
+            parse_pypi_simple_pkg("/simple/requests").as_deref(),
+            Some("requests")
+        );
+        assert_eq!(
+            parse_pypi_simple_pkg("/simple/Flask-SQLAlchemy/").as_deref(),
+            Some("Flask-SQLAlchemy"),
+            "raw casing preserved — client normalizes on lookup"
+        );
+        assert_eq!(parse_pypi_simple_pkg("/simple/requests/2.32.4/"), None);
+        assert_eq!(parse_pypi_simple_pkg("/simple/"), None);
+        assert_eq!(parse_pypi_simple_pkg("/pypi/requests/json"), None);
     }
 
     #[test]
@@ -730,7 +775,7 @@ mod tests {
         );
         assert_eq!(
             classify_response(Some("pypi.org"), Some("/simple/requests/")),
-            Some(RewriteTarget::PypiSimpleJson)
+            Some(RewriteTarget::PypiSimpleIndex("requests".into()))
         );
         assert_eq!(classify_response(Some("pypi.org"), Some("/")), None);
         // NuGet registration.

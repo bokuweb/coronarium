@@ -10,6 +10,7 @@ pub mod osv;
 pub mod osv_mirror;
 pub mod parser;
 pub mod proxy;
+pub mod pypi_simple_client;
 pub mod rewrite;
 pub mod rewrite_npm;
 pub mod rewrite_nuget;
@@ -29,4 +30,7 @@ pub use rewrite_nuget::{
     NugetRewriteStats, extract_publish_times_from_registration, rewrite_nuget_flatcontainer,
     rewrite_nuget_registration,
 };
-pub use rewrite_pypi::{PypiRewriteStats, rewrite_pypi_json_api, rewrite_pypi_simple_json};
+pub use rewrite_pypi::{
+    PypiRewriteStats, extract_publish_times_from_pypi_json, rewrite_pypi_json_api,
+    rewrite_pypi_simple_html, rewrite_pypi_simple_json,
+};

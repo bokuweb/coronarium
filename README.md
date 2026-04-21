@@ -82,12 +82,11 @@ from then on, every HTTPS request your package managers make through
 |---|---|---|
 | **crates.io** | ✅ sparse-index JSONL rewrite (drops too-young lines from `/<prefix>/<name>`) | ✅ `403` on `.crate` download to a denied version |
 | **npm** | ✅ packument rewrite (drops versions + retargets `dist-tags.latest`) | ✅ `403` on `.tgz` download |
-| **pypi** | ✅ Warehouse JSON API (`/pypi/<pkg>/json`) + PEP 691 Simple JSON | ✅ `403` on `files.pythonhosted.org` tarball download |
+| **pypi** | ✅ Warehouse JSON API (`/pypi/<pkg>/json`) + PEP 691 Simple JSON + PEP 503 Simple HTML via JSON-API lookup | ✅ `403` on `files.pythonhosted.org` tarball download |
 | **nuget** | ✅ registration-page rewrite (`/v3/registration*/...`) + flat-container index via registration lookup | ✅ `403` on `.nupkg` download |
 
-The legacy HTML Simple index (pypi) still passes through unchanged
-(no inline publish time); pinned fetches downstream fail hard at the
-tarball layer.
+All four ecosystems' metadata paths now rewrite silently — pnpm-style
+`minimumReleaseAge` across the board, no fail-hard in the common case.
 
 ---
 
@@ -766,14 +765,10 @@ Honest assessment. Full details in [CLAUDE.md](CLAUDE.md).
 
 ### Proxy
 
-- **pypi HTML Simple index** (PEP 503) is passed through unmodified
-  — the HTML has no upload time inline, so silent filtering would
-  require a separate JSON lookup. Pinned fetches downstream on
-  `files.pythonhosted.org` still hard-deny. Modern pip/uv prefer
-  the JSON endpoints anyway.
-<!-- nuget flat-container is now silently filtered via an out-of-band
-     registration-endpoint lookup (cached in-proxy for 10 min). No
-     limitation to document here anymore. -->
+<!-- pypi HTML Simple index (PEP 503) and nuget flat-container are
+     now silently filtered via out-of-band JSON-API / registration
+     lookups (cached in-proxy for 10 min). No limitation to document
+     here anymore. -->
 - **Sigstore bundle verification** (not just claim presence) is a
   roadmap item. `--require-provenance` currently checks that the
   `dist.attestations.provenance.predicateType` field is non-empty,
