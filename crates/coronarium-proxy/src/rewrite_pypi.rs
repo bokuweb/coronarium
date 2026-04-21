@@ -14,11 +14,14 @@
 //!    a top-level `versions: [...]` listing. We filter `files[]`
 //!    per-file on `upload-time`.
 //!
-//! The Simple index HTML (PEP 503) is a separate story: it has no
-//! upload time in the response, so we'd need an out-of-band lookup.
-//! Modern pip/uv prefer the JSON endpoints anyway, so we leave HTML
-//! as pass-through for now (the `files.pythonhosted.org` tarball
-//! deny still catches too-young fetches there, just fail-hard).
+//! 3. **Simple index (PEP 503 HTML)**: `GET /simple/<pkg>/` with
+//!    `Accept: text/html` — bare `<a href="…file…">filename</a>`
+//!    rows, no publish time in the response. We drop anchors whose
+//!    filename-derived version is too young per an out-of-band
+//!    oracle populated from the JSON API (see
+//!    [`crate::pypi_simple_client::PypiSimpleClient`]). Unknown
+//!    versions are left alone — the `files.pythonhosted.org`
+//!    tarball-deny path catches young pins downstream.
 //!
 //! Pure + synchronous; unit tests cover every branch.
 
@@ -90,6 +93,31 @@ pub fn rewrite_pypi_json_api(
 
     let out = serde_json::to_vec(&doc).unwrap_or_else(|_| body.to_vec());
     (out, stats)
+}
+
+/// Extract `{version → earliest upload_time}` from a Warehouse JSON
+/// API body (`/pypi/<pkg>/json`). Used by the HTML rewriter's
+/// out-of-band oracle. Returns an empty map if the body can't be
+/// parsed or has no `releases` object.
+pub fn extract_publish_times_from_pypi_json(
+    body: &[u8],
+) -> std::collections::HashMap<String, DateTime<Utc>> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(doc): Result<Value, _> = serde_json::from_slice(body) else {
+        return out;
+    };
+    let Some(releases) = doc.get("releases").and_then(Value::as_object) else {
+        return out;
+    };
+    for (vers, files) in releases {
+        let Some(files) = files.as_array() else {
+            continue;
+        };
+        if let Some(t) = earliest_upload_time_json_api(files) {
+            out.insert(vers.clone(), t);
+        }
+    }
+    out
 }
 
 fn earliest_upload_time_json_api(files: &[Value]) -> Option<DateTime<Utc>> {
@@ -167,6 +195,221 @@ pub fn rewrite_pypi_simple_json(
 
     let out = serde_json::to_vec(&doc).unwrap_or_else(|_| body.to_vec());
     (out, stats)
+}
+
+/// Rewrite a PEP 503 Simple HTML index (`/simple/<pkg>/` with
+/// `Accept: text/html`). For each `<a href="…">filename</a>` entry,
+/// consult `oracle(version)` for the publish time and drop the
+/// entire anchor (plus one optional trailing `<br>`/`<br/>` and
+/// newline) when it is younger than `min_age`. All other HTML —
+/// doctype, head, wrapping body, PEP 691 data-* attributes — is
+/// left byte-for-byte identical so pip's tolerant parser sees the
+/// exact same document minus the filtered rows.
+///
+/// `oracle` is expected to be populated out-of-band (see
+/// [`crate::pypi_simple_client::PypiSimpleClient`]) by hitting
+/// `/pypi/<pkg>/json` once per package. Entries whose version the
+/// oracle doesn't know are left alone — the files.pythonhosted.org
+/// tarball-deny path catches young pins downstream.
+pub fn rewrite_pypi_simple_html<F>(
+    body: &[u8],
+    min_age: Duration,
+    now: DateTime<Utc>,
+    oracle: F,
+) -> (Vec<u8>, PypiRewriteStats)
+where
+    F: Fn(&str) -> Option<DateTime<Utc>>,
+{
+    let mut stats = PypiRewriteStats::default();
+    let Ok(s) = std::str::from_utf8(body) else {
+        log::debug!("pypi-rewrite(html): pass-through, body not UTF-8");
+        return (body.to_vec(), stats);
+    };
+    let cutoff = chrono::Duration::from_std(min_age).unwrap_or_default();
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for the start of the next anchor element. Case-
+        // insensitive match on `<a` followed by whitespace or `>`.
+        if let Some(anchor_start) = find_anchor_start(&bytes[i..]) {
+            let abs = i + anchor_start;
+            out.extend_from_slice(&bytes[i..abs]);
+            // Find the closing `</a>` (also case-insensitive).
+            let remainder = &bytes[abs..];
+            let Some(close_rel) = find_case_insensitive(remainder, b"</a>") else {
+                // Malformed — emit the rest and stop scanning for anchors.
+                out.extend_from_slice(remainder);
+                break;
+            };
+            let anchor_end = abs + close_rel + b"</a>".len();
+            let anchor = std::str::from_utf8(&bytes[abs..anchor_end]).unwrap_or("");
+
+            // Extract href + filename + version. Unknown / malformed
+            // entries default to keep.
+            let drop = anchor_drop_decision(anchor, &oracle, now, cutoff);
+            if drop {
+                stats.dropped += 1;
+                // Eat one optional trailing `<br>` or `<br/>` plus
+                // up to one newline so we don't leave stray markup.
+                let mut next = anchor_end;
+                next = eat_optional_br(bytes, next);
+                next = eat_optional_newline(bytes, next);
+                i = next;
+            } else {
+                stats.kept += 1;
+                out.extend_from_slice(&bytes[abs..anchor_end]);
+                i = anchor_end;
+            }
+        } else {
+            out.extend_from_slice(&bytes[i..]);
+            i = bytes.len();
+        }
+    }
+    (out, stats)
+}
+
+fn anchor_drop_decision<F>(
+    anchor: &str,
+    oracle: &F,
+    now: DateTime<Utc>,
+    cutoff: chrono::Duration,
+) -> bool
+where
+    F: Fn(&str) -> Option<DateTime<Utc>>,
+{
+    let Some(href) = extract_href_value(anchor) else {
+        return false;
+    };
+    let filename = url_basename_no_fragment(&href);
+    let Some(version) = extract_version_from_filename(filename) else {
+        return false;
+    };
+    let Some(t) = oracle(&version) else {
+        return false;
+    };
+    (now - t) < cutoff
+}
+
+/// Find the first `<a` that starts an anchor tag (followed by
+/// whitespace or `>`). Returns byte offset or None.
+fn find_anchor_start(hay: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 2 <= hay.len() {
+        if hay[i] == b'<'
+            && (hay[i + 1] == b'a' || hay[i + 1] == b'A')
+            && i + 2 < hay.len()
+            && (hay[i + 2].is_ascii_whitespace() || hay[i + 2] == b'>')
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_case_insensitive(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    'outer: for i in 0..=hay.len() - needle.len() {
+        for (k, nb) in needle.iter().enumerate() {
+            if !hay[i + k].eq_ignore_ascii_case(nb) {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
+fn eat_optional_br(bytes: &[u8], start: usize) -> usize {
+    let rest = &bytes[start..];
+    // Skip a run of ASCII spaces/tabs between `</a>` and `<br>`.
+    let mut k = 0;
+    while k < rest.len() && (rest[k] == b' ' || rest[k] == b'\t') {
+        k += 1;
+    }
+    // Match `<br`, any attributes up to `>`, optional `/` before `>`.
+    if rest.len() >= k + 3
+        && rest[k] == b'<'
+        && (rest[k + 1] == b'b' || rest[k + 1] == b'B')
+        && (rest[k + 2] == b'r' || rest[k + 2] == b'R')
+        && let Some(gt) = rest[k + 3..].iter().position(|&b| b == b'>')
+    {
+        return start + k + 3 + gt + 1;
+    }
+    start
+}
+
+fn eat_optional_newline(bytes: &[u8], start: usize) -> usize {
+    if start < bytes.len() && bytes[start] == b'\r' {
+        if start + 1 < bytes.len() && bytes[start + 1] == b'\n' {
+            return start + 2;
+        }
+        return start + 1;
+    }
+    if start < bytes.len() && bytes[start] == b'\n' {
+        return start + 1;
+    }
+    start
+}
+
+/// Pull the `href` attribute value out of an anchor element string.
+/// Supports both double- and single-quoted values. Returns the raw
+/// attribute value without any HTML-entity decoding (PEP 503 URLs
+/// don't contain entity-encoded characters in practice).
+fn extract_href_value(anchor: &str) -> Option<String> {
+    let bytes = anchor.as_bytes();
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        // Match `href` case-insensitively at a word boundary.
+        let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if at_boundary
+            && bytes[i..].len() >= 4
+            && bytes[i].eq_ignore_ascii_case(&b'h')
+            && bytes[i + 1].eq_ignore_ascii_case(&b'r')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'e')
+            && bytes[i + 3].eq_ignore_ascii_case(&b'f')
+        {
+            let mut j = i + 4;
+            // Skip whitespace then `=`.
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'=' {
+                i += 1;
+                continue;
+            }
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let quote = bytes.get(j).copied()?;
+            if quote != b'"' && quote != b'\'' {
+                return None;
+            }
+            j += 1;
+            let start = j;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return None;
+            }
+            return Some(std::str::from_utf8(&bytes[start..j]).ok()?.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the filename portion of a PyPI file URL: path basename,
+/// stripped of any `#sha256=…` fragment and `?query`.
+fn url_basename_no_fragment(url: &str) -> &str {
+    let before_fragment = url.split('#').next().unwrap_or(url);
+    let before_query = before_fragment.split('?').next().unwrap_or(before_fragment);
+    before_query.rsplit('/').next().unwrap_or(before_query)
 }
 
 /// Cheap-and-cheerful "pull the version out of a PyPI filename":
@@ -384,5 +627,177 @@ mod tests {
         );
         assert_eq!(extract_version_from_filename("weird.txt"), None);
         assert_eq!(extract_version_from_filename(""), None);
+    }
+
+    // ---------- Simple HTML (PEP 503) ----------
+
+    fn simple_html(rows: &[&str]) -> String {
+        let mut s = String::from(
+            "<!DOCTYPE html>\n<html><head><title>Links for pkg</title></head><body>\n",
+        );
+        for r in rows {
+            s.push_str(r);
+            s.push('\n');
+        }
+        s.push_str("</body></html>\n");
+        s
+    }
+
+    fn oracle_from(
+        pairs: &[(&str, DateTime<Utc>)],
+    ) -> impl Fn(&str) -> Option<DateTime<Utc>> + use<> {
+        let map: std::collections::HashMap<String, DateTime<Utc>> =
+            pairs.iter().map(|(v, t)| ((*v).into(), *t)).collect();
+        move |v| map.get(v).copied()
+    }
+
+    #[test]
+    fn simple_html_drops_young_anchors_keeps_old() {
+        let now = utc(2025, 1, 10);
+        let oracle = oracle_from(&[
+            ("1.0.0", utc(2024, 1, 1)),
+            ("2.0.0", utc(2025, 1, 9)), // young
+        ]);
+        let body = simple_html(&[
+            r#"<a href="https://files.pythonhosted.org/packages/aa/pkg-1.0.0.tar.gz#sha256=abc">pkg-1.0.0.tar.gz</a><br/>"#,
+            r#"<a href="https://files.pythonhosted.org/packages/bb/pkg-2.0.0.tar.gz#sha256=def">pkg-2.0.0.tar.gz</a><br/>"#,
+        ]);
+        let (out, stats) =
+            rewrite_pypi_simple_html(body.as_bytes(), min_age_hours(168), now, oracle);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("pkg-1.0.0.tar.gz"));
+        assert!(!s.contains("pkg-2.0.0.tar.gz"));
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.kept, 1);
+        // Surrounding markup intact.
+        assert!(s.contains("<!DOCTYPE html>"));
+        assert!(s.contains("</body></html>"));
+    }
+
+    #[test]
+    fn simple_html_keeps_anchors_with_unknown_version() {
+        // Oracle returns None → we can't judge, leave it. The
+        // tarball-deny path catches these downstream.
+        let now = utc(2025, 1, 10);
+        let oracle = oracle_from(&[]);
+        let body = simple_html(&[
+            r#"<a href="https://files.pythonhosted.org/packages/aa/pkg-2.0.0.tar.gz">pkg-2.0.0.tar.gz</a><br/>"#,
+        ]);
+        let (out, stats) =
+            rewrite_pypi_simple_html(body.as_bytes(), min_age_hours(168), now, oracle);
+        assert!(String::from_utf8(out).unwrap().contains("pkg-2.0.0.tar.gz"));
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    #[test]
+    fn simple_html_keeps_anchors_without_parseable_filename() {
+        // href points to something that isn't an sdist/wheel — we
+        // can't extract a version, so keep it.
+        let now = utc(2025, 1, 10);
+        let oracle = oracle_from(&[("1.0.0", utc(2025, 1, 9))]);
+        let body = simple_html(&[r#"<a href="https://example.com/weird.txt">weird.txt</a>"#]);
+        let (out, stats) =
+            rewrite_pypi_simple_html(body.as_bytes(), min_age_hours(168), now, oracle);
+        assert!(String::from_utf8(out).unwrap().contains("weird.txt"));
+        assert_eq!(stats.dropped, 0);
+    }
+
+    #[test]
+    fn simple_html_handles_single_quoted_and_mixed_case_attrs() {
+        let now = utc(2025, 1, 10);
+        let oracle = oracle_from(&[("2.0.0", utc(2025, 1, 9))]);
+        let body = "<!DOCTYPE html>\n<HTML><BODY>\n<A HREF='https://files.pythonhosted.org/packages/xx/pkg-2.0.0.tar.gz'>pkg-2.0.0.tar.gz</A>\n</BODY></HTML>\n";
+        let (out, stats) =
+            rewrite_pypi_simple_html(body.as_bytes(), min_age_hours(168), now, oracle);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("pkg-2.0.0.tar.gz"));
+        assert!(s.contains("</BODY></HTML>"));
+        assert_eq!(stats.dropped, 1);
+    }
+
+    #[test]
+    fn simple_html_preserves_pep691_data_attrs_on_kept_anchors() {
+        // PEP 691 adds data-* attributes (data-dist-info-metadata,
+        // data-requires-python, data-yanked). They must survive on
+        // anchors we keep.
+        let now = utc(2025, 1, 10);
+        let oracle = oracle_from(&[("1.0.0", utc(2024, 1, 1))]);
+        let body = simple_html(&[
+            r#"<a href="https://files.pythonhosted.org/packages/aa/pkg-1.0.0.tar.gz" data-requires-python="&gt;=3.8" data-yanked="">pkg-1.0.0.tar.gz</a>"#,
+        ]);
+        let (out, _) = rewrite_pypi_simple_html(body.as_bytes(), min_age_hours(168), now, oracle);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("data-requires-python"));
+        assert!(s.contains("data-yanked"));
+    }
+
+    #[test]
+    fn simple_html_empty_body_passes_through() {
+        let (out, stats) =
+            rewrite_pypi_simple_html(b"", min_age_hours(168), utc(2025, 1, 10), oracle_from(&[]));
+        assert_eq!(out, b"");
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(stats.kept, 0);
+    }
+
+    #[test]
+    fn simple_html_malformed_anchor_does_not_lose_trailing_content() {
+        // `<a ...` without `</a>` — we stop anchor scanning but keep
+        // the rest of the body verbatim.
+        let body = "<body>\n<a href=\"x.tar.gz\">oops (never closed)\n</body>";
+        let (out, stats) = rewrite_pypi_simple_html(
+            body.as_bytes(),
+            min_age_hours(168),
+            utc(2025, 1, 10),
+            oracle_from(&[]),
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), body);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    #[test]
+    fn simple_html_non_utf8_body_passes_through() {
+        let body = b"\xff\xfe\xfa garbage";
+        let (out, stats) =
+            rewrite_pypi_simple_html(body, min_age_hours(168), utc(2025, 1, 10), oracle_from(&[]));
+        assert_eq!(out, body);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    #[test]
+    fn url_basename_strips_fragment_and_query() {
+        assert_eq!(
+            url_basename_no_fragment(
+                "https://files.pythonhosted.org/packages/aa/pkg-1.0.0.tar.gz#sha256=abc"
+            ),
+            "pkg-1.0.0.tar.gz"
+        );
+        assert_eq!(
+            url_basename_no_fragment("https://x/y/pkg-2.0.0.tar.gz?foo=bar"),
+            "pkg-2.0.0.tar.gz"
+        );
+        assert_eq!(
+            url_basename_no_fragment("pkg-1.0.0.tar.gz"),
+            "pkg-1.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn extract_href_handles_both_quote_styles_and_whitespace() {
+        assert_eq!(
+            extract_href_value(r#"<a href="x">y</a>"#).as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            extract_href_value(r#"<a href = 'z'>y</a>"#).as_deref(),
+            Some("z")
+        );
+        assert_eq!(
+            extract_href_value(r#"<a HREF="ALLCAPS">y</a>"#).as_deref(),
+            Some("ALLCAPS")
+        );
+        // No href at all.
+        assert_eq!(extract_href_value(r#"<a class="foo">y</a>"#), None);
     }
 }

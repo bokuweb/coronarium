@@ -72,8 +72,8 @@ older deps.
   (notably `latest`) that pointed at a removed version is
   retargeted to the highest remaining semver. npm's resolver then
   picks the newest in-range surviving version — no error.
-- **pypi** — ✅ implemented for the two JSON endpoints modern pip
-  and uv actually consult:
+- **pypi** — ✅ implemented for all three metadata shapes pip / uv /
+  legacy tools consult:
   - Warehouse JSON API (`pypi.org/pypi/<pkg>/json`) — drops version
     keys from `releases` whose earliest `upload_time_iso_8601` is
     too young, plus stripping the `urls` shortcut.
@@ -81,11 +81,16 @@ older deps.
     `Accept: application/vnd.pypi.simple.v1+json`) — drops
     too-young `files[]`, prunes `versions[]` to only those with
     surviving files.
-
-  The legacy HTML Simple index (PEP 503) carries no upload time in
-  the response; it passes through unchanged. pip fall-back to
-  tarball-level `files.pythonhosted.org` deny still catches those
-  installs fail-hard.
+  - PEP 503 Simple HTML (`pypi.org/simple/<pkg>/` with
+    `Accept: text/html`) — carries no inline publish time, so the
+    rewriter consults an out-of-band lookup to the Warehouse JSON
+    API via `PypiSimpleClient` (cached per-package for 10 min).
+    Anchors whose filename-derived version is too young are dropped
+    byte-for-byte from the HTML; surrounding markup is preserved so
+    pip's tolerant parser sees the exact same document minus the
+    filtered rows. Failed lookups yield an empty map → fail-open,
+    but pinned `files.pythonhosted.org` fetches still hard-deny at
+    the tarball layer.
 - **nuget** — ✅ implemented for the **registration** endpoints
   (`api.nuget.org/v3/registration<X>*/<id>/index.json` and the
   paged `.../page/<lower>/<upper>.json`). Leaves whose
