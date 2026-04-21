@@ -32,3 +32,10 @@ http = "1"
 http-body-util = "0.1"
 bytes = "1"
 semver = "1"
+
+# Sigstore bundle parsing + semantic verification (P0-1 stage 1).
+# Crypto verification (DSSE signature, Fulcio cert chain, Rekor SET)
+# is the next stage and will introduce p256 / x509-parser / ed25519
+# deps. We keep this list intentionally small for now.
+base64 = "0.22"
+sha2 = "0.10"
