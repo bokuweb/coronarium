@@ -38,10 +38,14 @@ pub struct Supervisor {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     bpf: Option<Arc<Mutex<aya::Ebpf>>>,
+
+    /// Stop signal for the DNS refresh loop (Linux-only; `None` when
+    /// `dns_refresh` is zero or on non-Linux platforms).
+    refresh_stop: Option<crate::resolve_refresh::StopHandle>,
 }
 
 impl Supervisor {
-    pub async fn start(policy: Policy, mode: Mode) -> Result<Self> {
+    pub async fn start(policy: Policy, mode: Mode, dns_refresh: Duration) -> Result<Self> {
         let stats = Arc::new(Mutex::new(Stats::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let file_matcher = Arc::new(FileMatcher::from_policy(&policy.file));
@@ -98,6 +102,47 @@ impl Supervisor {
         #[cfg(not(target_os = "linux"))]
         let _ = Resolver::from_system; // silence unused warning
 
+        // Spawn the DNS refresh loop if requested and we actually
+        // have a BPF object to write into. `refresh_stop` is None
+        // when the feature is off, which is the overwhelming default.
+        #[cfg(target_os = "linux")]
+        let refresh_stop = match (dns_refresh.is_zero(), bpf.as_ref()) {
+            (false, Some(bpf_arc)) => {
+                let resolver = Resolver::from_system()?;
+                let sink = crate::enforcer::BpfEndpointSink::new(Arc::clone(bpf_arc));
+                let loop_ = crate::resolve_refresh::RefreshLoop::new(
+                    resolver,
+                    sink,
+                    policy.network.allow.clone(),
+                    policy.network.deny.clone(),
+                    dns_refresh,
+                );
+                let stop_handle = loop_.stop_handle();
+                let mut seen = std::collections::HashSet::new();
+                // Prime `seen` with the startup population so the
+                // first tick doesn't rewrite every address.
+                let prime = crate::enforcer::current_bpf_entries(bpf_arc).await;
+                crate::resolve_refresh::RefreshLoop::<
+                    Resolver,
+                    crate::enforcer::BpfEndpointSink,
+                >::prime_seen(&mut seen, &prime);
+                tokio::task::spawn(async move {
+                    let _ = loop_.run(seen).await;
+                });
+                log::info!(
+                    "dns-refresh: scheduling re-resolution every {}s",
+                    dns_refresh.as_secs()
+                );
+                Some(stop_handle)
+            }
+            _ => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let refresh_stop: Option<crate::resolve_refresh::StopHandle> = {
+            let _ = dns_refresh;
+            None
+        };
+
         let this = Self {
             policy,
             mode,
@@ -106,6 +151,7 @@ impl Supervisor {
             cgroup,
             #[cfg(target_os = "linux")]
             bpf: bpf.clone(),
+            refresh_stop,
         };
 
         #[cfg(target_os = "linux")]
@@ -160,6 +206,9 @@ impl Supervisor {
         // that arrived just before the child exited, then tell it to stop.
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(s) = &self.refresh_stop {
+            s.stop();
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(self.stats.lock().await.clone())
     }

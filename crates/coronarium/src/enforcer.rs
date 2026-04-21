@@ -3,6 +3,16 @@
 
 use crate::{cgroup::Cgroup, policy::Policy, resolve::Resolver};
 
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use tokio::sync::Mutex;
+
+#[cfg(target_os = "linux")]
+use crate::resolve::Endpoint;
+#[cfg(target_os = "linux")]
+use crate::resolve_refresh::{EndpointSink, Verdict};
+
 #[allow(dead_code)]
 pub struct Enforcer;
 
@@ -125,6 +135,107 @@ async fn resolve_all(
         match resolver.expand(rule).await {
             Ok(mut eps) => out.append(&mut eps),
             Err(err) => log::warn!("resolving {}: {err:#}", rule.target),
+        }
+    }
+    out
+}
+
+/// [`EndpointSink`] implementation that writes into the live NET4 /
+/// NET6 eBPF hash maps owned by the supervisor's shared `Ebpf`
+/// object. Locks the async `Mutex<Ebpf>` only for the duration of one
+/// insert, so it composes cleanly with the existing ringbuf drain
+/// task (which doesn't hold the lock either, having taken EVENTS out
+/// at startup).
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct BpfEndpointSink {
+    bpf: Arc<Mutex<aya::Ebpf>>,
+}
+
+#[cfg(target_os = "linux")]
+impl BpfEndpointSink {
+    pub fn new(bpf: Arc<Mutex<aya::Ebpf>>) -> Self {
+        Self { bpf }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl EndpointSink for BpfEndpointSink {
+    async fn insert(&self, endpoint: Endpoint, verdict: Verdict) -> anyhow::Result<()> {
+        use std::net::IpAddr;
+
+        use coronarium_common::{Ipv4Key, Ipv6Key};
+
+        let mut guard = self.bpf.lock().await;
+        match endpoint.addr {
+            IpAddr::V4(v4) => {
+                let Some(map) = guard.map_mut("NET4") else {
+                    return Ok(());
+                };
+                let mut m: aya::maps::HashMap<_, Ipv4Key, u8> = aya::maps::HashMap::try_from(map)?;
+                let key = Ipv4Key {
+                    addr: u32::from(v4).to_be(),
+                    port: endpoint.port.to_be(),
+                    _pad: 0,
+                };
+                m.insert(key, verdict.0, 0)?;
+            }
+            IpAddr::V6(v6) => {
+                let Some(map) = guard.map_mut("NET6") else {
+                    return Ok(());
+                };
+                let mut m: aya::maps::HashMap<_, Ipv6Key, u8> = aya::maps::HashMap::try_from(map)?;
+                let key = Ipv6Key {
+                    addr: v6.octets(),
+                    port: endpoint.port.to_be(),
+                    _pad: [0; 6],
+                };
+                m.insert(key, verdict.0, 0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read back the `(endpoint, verdict)` pairs currently populated in
+/// NET4 / NET6. Used to prime the refresh loop's `seen` set at
+/// startup so the very first tick doesn't re-write addresses that
+/// [`populate_network_maps`] already installed.
+#[cfg(target_os = "linux")]
+pub async fn current_bpf_entries(bpf: &Arc<Mutex<aya::Ebpf>>) -> Vec<(Endpoint, Verdict)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use coronarium_common::{Ipv4Key, Ipv6Key};
+
+    let mut out = Vec::new();
+    let guard = bpf.lock().await;
+    if let Some(map) = guard.map("NET4")
+        && let Ok(m) = aya::maps::HashMap::<_, Ipv4Key, u8>::try_from(map)
+    {
+        for r in m.iter().flatten() {
+            let (k, v) = r;
+            let addr = Ipv4Addr::from(u32::from_be(k.addr));
+            out.push((
+                Endpoint {
+                    addr: IpAddr::V4(addr),
+                    port: u16::from_be(k.port),
+                },
+                Verdict(v),
+            ));
+        }
+    }
+    if let Some(map) = guard.map("NET6")
+        && let Ok(m) = aya::maps::HashMap::<_, Ipv6Key, u8>::try_from(map)
+    {
+        for r in m.iter().flatten() {
+            let (k, v) = r;
+            out.push((
+                Endpoint {
+                    addr: IpAddr::V6(Ipv6Addr::from(k.addr)),
+                    port: u16::from_be(k.port),
+                },
+                Verdict(v),
+            ));
         }
     }
     out

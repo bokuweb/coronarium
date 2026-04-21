@@ -10,6 +10,7 @@ mod loader;
 mod policy;
 mod resolve;
 mod resolve_hostnames;
+mod resolve_refresh;
 
 use anyhow::Result;
 use clap::Parser;
