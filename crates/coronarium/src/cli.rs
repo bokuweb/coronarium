@@ -100,6 +100,73 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ActionsCommand,
     },
+    /// Workspace tamper detection — snapshot file hashes before a
+    /// build, diff afterwards. Surfaces unexpected edits made by
+    /// dependency post-install scripts or any other process the
+    /// supervised step exec'd.
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    /// Walk a directory and emit a JSON snapshot of every regular
+    /// file's size + SHA-256. Writes to stdout by default.
+    Snapshot(WorkspaceSnapshotArgs),
+    /// Compare a previously-taken snapshot against the current
+    /// state of `<dir>` and report added / modified / removed
+    /// files. Exits non-zero when there's any drift (suppress with
+    /// `--allow-drift`).
+    Diff(WorkspaceDiffArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceSnapshotArgs {
+    /// Directory to snapshot.
+    pub dir: PathBuf,
+    /// Output file. `-` (default) writes to stdout.
+    #[arg(long, short = 'o', default_value = "-")]
+    pub output: PathBuf,
+    /// Extra directory basenames to skip on top of the built-in
+    /// list (`.git`, `node_modules`, `target`, `dist`, `build`,
+    /// `vendor`, `__pycache__`, `.venv`, `venv`, `.next`, `.turbo`,
+    /// `.cache`). Repeatable.
+    #[arg(long = "skip")]
+    pub skip: Vec<String>,
+    /// Files larger than this many bytes get a size-only entry
+    /// (no hash). 0 means unlimited.
+    #[arg(long, default_value_t = coronarium_core::tamper::DEFAULT_MAX_FILE_BYTES)]
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceDiffArgs {
+    /// Baseline snapshot JSON, as produced by
+    /// `coronarium workspace snapshot`.
+    pub baseline: PathBuf,
+    /// Directory to diff against the baseline.
+    pub dir: PathBuf,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: WorkspaceDiffFormat,
+    /// Extra directory basenames to skip — must match what was
+    /// passed to `snapshot`, otherwise added/removed entries will
+    /// fire spuriously.
+    #[arg(long = "skip")]
+    pub skip: Vec<String>,
+    #[arg(long, default_value_t = coronarium_core::tamper::DEFAULT_MAX_FILE_BYTES)]
+    pub max_file_bytes: u64,
+    /// Don't exit non-zero when drift is found. Useful for an
+    /// audit-only step where you just want the report.
+    #[arg(long)]
+    pub allow_drift: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum WorkspaceDiffFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -654,7 +721,86 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Actions {
             cmd: ActionsCommand::Audit(args),
         } => run_actions_audit(args),
+        Command::Workspace {
+            cmd: WorkspaceCommand::Snapshot(args),
+        } => run_workspace_snapshot(args),
+        Command::Workspace {
+            cmd: WorkspaceCommand::Diff(args),
+        } => run_workspace_diff(args),
     }
+}
+
+fn tamper_options(skip: Vec<String>, max_file_bytes: u64) -> coronarium_core::tamper::Options {
+    coronarium_core::tamper::Options {
+        skip_extra: skip,
+        max_file_bytes: if max_file_bytes == 0 {
+            u64::MAX
+        } else {
+            max_file_bytes
+        },
+    }
+}
+
+fn run_workspace_snapshot(args: WorkspaceSnapshotArgs) -> Result<()> {
+    let opts = tamper_options(args.skip, args.max_file_bytes);
+    let snap = coronarium_core::tamper::Snapshot::take(&args.dir, &opts)
+        .with_context(|| format!("snapshotting {}", args.dir.display()))?;
+    let json = snap.to_json_pretty()?;
+    if args.output.as_os_str() == "-" {
+        println!("{json}");
+    } else {
+        std::fs::write(&args.output, json)
+            .with_context(|| format!("writing {}", args.output.display()))?;
+        eprintln!(
+            "coronarium: wrote snapshot of {} files to {}",
+            snap.files.len(),
+            args.output.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
+    let baseline_json = std::fs::read_to_string(&args.baseline)
+        .with_context(|| format!("reading baseline {}", args.baseline.display()))?;
+    let baseline = coronarium_core::tamper::Snapshot::from_json(&baseline_json)?;
+    let opts = tamper_options(args.skip, args.max_file_bytes);
+    let current = coronarium_core::tamper::Snapshot::take(&args.dir, &opts)
+        .with_context(|| format!("snapshotting {}", args.dir.display()))?;
+    let dif = coronarium_core::tamper::diff(&baseline, &current);
+
+    match args.format {
+        WorkspaceDiffFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&dif)?);
+        }
+        WorkspaceDiffFormat::Text => {
+            if dif.is_clean() {
+                eprintln!("coronarium: workspace clean — no changes detected");
+            } else {
+                eprintln!(
+                    "coronarium: {} changes ({} added, {} modified, {} removed)\n",
+                    dif.total(),
+                    dif.added.len(),
+                    dif.modified.len(),
+                    dif.removed.len(),
+                );
+                for p in &dif.added {
+                    println!("+  {}", p.display());
+                }
+                for m in &dif.modified {
+                    println!("~  {}", m.path.display());
+                }
+                for p in &dif.removed {
+                    println!("-  {}", p.display());
+                }
+            }
+        }
+    }
+
+    if !dif.is_clean() && !args.allow_drift {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {

@@ -19,4 +19,5 @@ ureq = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
 notify = { workspace = true }
+sha2 = "0.10"
 coronarium-common = { path = "../coronarium-common", features = ["user"] }

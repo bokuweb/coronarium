@@ -456,6 +456,41 @@ coronarium deps watch ~/code --min-age 7d --notifier stdout
 See [packaging/macos/README.md](packaging/macos/README.md) for the
 launchd plist.
 
+### `workspace snapshot` / `workspace diff`
+
+Detect unexpected file edits made during a build — the supply-chain
+analogue of "did this `npm install` rewrite my source files /
+`.git/config` / CI configuration?". Pure offline; no network.
+
+```bash
+# Before the build
+coronarium workspace snapshot $GITHUB_WORKSPACE -o /tmp/before.json
+
+cargo build               # …or whatever you actually want to audit
+
+# After the build — exits non-zero on any drift
+coronarium workspace diff /tmp/before.json $GITHUB_WORKSPACE
+```
+
+What the diff reports: files **added**, **modified** (size or
+SHA-256 changed), or **removed** between the two snapshots.
+
+Always-skipped directory basenames (anywhere in the tree):
+`.git`, `node_modules`, `target`, `dist`, `build`, `vendor`,
+`__pycache__`, `.venv`, `venv`, `.next`, `.turbo`, `.cache`.
+The list is hardcoded — `.gitignore` is **not** honoured because
+an attacker can write into it. Pass `--skip <name>` (repeatable)
+to extend the list for your own build artefacts.
+
+Symlinks are recorded by target string; the link target is not
+dereferenced. Files larger than 64 MiB default to a size-only
+entry (no SHA), so two oversized files with identical sizes but
+different contents will read as unchanged — bump
+`--max-file-bytes` if that matters for your repo.
+
+`--format json` for machine-readable output. `--allow-drift`
+suppresses the non-zero exit when you only want the report.
+
 ### `actions audit`
 
 Static analysis for `.github/workflows/*.yml`. Walks every `uses:`
