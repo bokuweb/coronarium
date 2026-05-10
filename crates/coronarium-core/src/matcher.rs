@@ -26,15 +26,19 @@ impl FileMatcher {
     /// Deny entries win over allow entries (same precedence as the
     /// network map).
     pub fn is_denied(&self, path: &str) -> bool {
-        // The eBPF ringbuf occasionally emits open events with an
-        // empty filename — typically anonymous mmaps, deleted files,
-        // or memfd-style opens where the kernel can't recover an
-        // absolute path. Empty isn't actually a path we can
-        // meaningfully police, but with `default: deny` it would
-        // fall through every prefix check and get tagged as denied,
-        // inflating `stats.denied` and tripping block-mode exits on
-        // runs where nothing real was blocked. Treat as not-denied.
-        if path.is_empty() {
+        // The eBPF ringbuf emits open events for things that aren't
+        // filesystem paths at all — empty strings (anonymous mmap,
+        // deleted file), or kernel-synthesised tags like `pipe:[123]`,
+        // `anon_inode:[eventfd]`, `socket:[N]`, `memfd:...`. Under
+        // `default: deny` these fall through every allow prefix
+        // (none of them start with `/lib/`, `/usr/`, etc.) and get
+        // tagged as denied, even though there's no real path to
+        // police. A single `pnpm install` (Node spawning eventfds /
+        // pipes for hundreds of packages) easily produces 7k+ such
+        // events and trips block-mode exit on a run where nothing
+        // real was denied. Treat as not-denied — the file matcher
+        // is for filesystem paths, and these aren't.
+        if !is_real_fs_path(path) {
             return false;
         }
         for pat in &self.deny {
@@ -108,6 +112,26 @@ fn basename_match(path: &str, pattern: &str) -> bool {
     false
 }
 
+/// True when `path` looks like a real filesystem path the file policy
+/// can meaningfully reason about. False for empty strings and for the
+/// kernel-synthesised pseudo-path shapes (`pipe:[…]`, `anon_inode:[…]`,
+/// `socket:[…]`, `memfd:…`) that show up as the openat filename when a
+/// program reads through `/proc/<pid>/fd/N` symlinks or otherwise
+/// reaches non-inode-backed objects. Under `default: deny` these
+/// otherwise fall through every allow prefix and balloon
+/// `stats.denied`.
+fn is_real_fs_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    for tag in ["pipe:", "anon_inode:", "socket:", "memfd:"] {
+        if path.starts_with(tag) {
+            return false;
+        }
+    }
+    true
+}
+
 fn prefix_match(path: &str, pattern: &str) -> bool {
     // Exact prefix, with a boundary check so `/etc/shadow` doesn't match
     // `/etc/shadowed`. A trailing slash in the pattern forces directory
@@ -157,6 +181,26 @@ mod tests {
         let fm = m(DefaultDecision::Allow, &["/etc"], &["/etc/shadow"]);
         assert!(fm.is_denied("/etc/shadow"));
         assert!(!fm.is_denied("/etc/hostname"));
+    }
+
+    #[test]
+    fn anon_fd_pseudo_paths_are_not_denied_under_default_deny() {
+        // Node spawns thousands of eventfd / pipe / socket / memfd
+        // objects during a typical pnpm install. Their filenames flow
+        // through sys_enter_openat as kernel-synthesised tags like
+        // `pipe:[12345]`, which match no `/lib/`, `/usr/`, etc. allow
+        // prefix and otherwise inflate `stats.denied` by 7000+ on a
+        // run where nothing real was denied. Treat as not-fs.
+        let fm = m(DefaultDecision::Deny, &["/usr", "/lib"], &["/etc/shadow"]);
+        for p in [
+            "pipe:[12345]",
+            "anon_inode:[eventfd]",
+            "anon_inode:[timerfd]",
+            "socket:[42]",
+            "memfd:foo",
+        ] {
+            assert!(!fm.is_denied(p), "{p} should not be denied");
+        }
     }
 
     #[test]
