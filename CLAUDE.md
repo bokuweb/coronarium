@@ -206,14 +206,20 @@ of value-per-implementation-cost.
    harden-runner users expect (`*.githubusercontent.com:443`
    etc.). Doable on top of the existing hudsucker stack; depends
    on `install-gate` already being on the user's shell.
-9. **Workspace tamper detection** — at `run` start, snapshot the
-   git index + working tree hashes for files under `$GITHUB_WORKSPACE`;
-   at exit, diff and flag any files that were modified by the
-   supervised step but weren't expected to change (e.g. by
-   comparing against a per-step manifest). Goal: catch a
-   compromised dependency rewriting `.git/config` or source files
-   during install. Detection-only initially; could escalate to
-   git-revert in `--action revert` mode.
+9. **Workspace tamper detection** — ✅ implemented in v0.22 as
+   standalone `coronarium workspace snapshot <dir>` +
+   `coronarium workspace diff <baseline.json> <dir>`. Walks every
+   regular file under the root, hashes with SHA-256, skips a
+   hardcoded build-artefact list (`.git`, `node_modules`, `target`,
+   `dist`, `build`, `vendor`, `__pycache__`, `.venv`, `venv`,
+   `.next`, `.turbo`, `.cache` — deliberately not honouring
+   `.gitignore`, since an attacker can write into it). Symlinks are
+   recorded by target string, not followed. Files over 64 MiB
+   default to size-only entries (configurable). Diff exits non-zero
+   on drift unless `--allow-drift`. Auto-integration into
+   `coronarium run` (snapshot before / diff after exec) is a
+   follow-up — kept standalone first so users can compose it with
+   any build, not just an eBPF-supervised one.
 10. **Floating-tag → SHA-pin static check** — ✅ implemented in v0.21
     as `coronarium actions audit <workflow.yml...>`. Walks every
     `uses:` in `jobs.<id>.steps[]` and `jobs.<id>.uses` (reusable

@@ -20,6 +20,7 @@ pub mod policy;
 pub mod report;
 pub mod stats;
 pub mod suggest;
+pub mod tamper;
 
 pub use events::Event;
 pub use policy::{
