@@ -18,6 +18,18 @@ jobs:
   use-as-action:
     runs-on: ubuntu-latest
     steps:
+      # 1.1.1.1, 8.8.8.8 are the audit-mode deny targets — the curl
+      # below has to actually reach them so coronarium can audit (and
+      # tag denied) the connect at the eBPF layer.
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            1.1.1.1:443
+            8.8.8.8:443
       - uses: actions/checkout@v4
 
       # The exact pattern third-party consumers will write.
@@ -123,6 +135,17 @@ jobs:
     # happens. Runs alongside use-as-action (doesn't need its results).
     runs-on: ubuntu-latest
     steps:
+      # The block-mode test attempts http://93.184.216.34 specifically
+      # so coronarium's eBPF can deny the connect; allow it through
+      # harden-runner so the kernel hook sees the syscall.
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            93.184.216.34:80
       - uses: actions/checkout@v4
       - uses: bokuweb/coronarium@v0
         with:

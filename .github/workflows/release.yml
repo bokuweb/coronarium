@@ -19,6 +19,23 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            static.rust-lang.org:443
+            index.crates.io:443
+            static.crates.io:443
+            crates.io:443
+            archive.ubuntu.com:80
+            security.ubuntu.com:80
+            azure.archive.ubuntu.com:80
+            ports.ubuntu.com:80
+            esm.ubuntu.com:443
+            motd.ubuntu.com:443
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
@@ -139,6 +156,14 @@ jobs:
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            uploads.github.com:443
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
@@ -163,6 +188,13 @@ jobs:
     runs-on: ubuntu-latest
     if: "!contains(github.ref_name, '-')"
     steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

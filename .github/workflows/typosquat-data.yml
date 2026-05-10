@@ -32,6 +32,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            hugovk.dev:443
+            crates.io:443
+            anvaka.github.io:443
+            azuresearch-usnc.nuget.org:443
       - uses: actions/checkout@v4
         with:
           ref: main
