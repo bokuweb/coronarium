@@ -202,8 +202,8 @@ impl Supervisor {
             // rustup-installed toolchains, …). Surface the workaround
             // in the error rather than letting users debug it raw.
             let is_relative = !std::path::Path::new(program).is_absolute();
-            let under_sudo = std::env::var_os("SUDO_USER").is_some()
-                || std::env::var_os("SUDO_UID").is_some();
+            let under_sudo =
+                std::env::var_os("SUDO_USER").is_some() || std::env::var_os("SUDO_UID").is_some();
             if is_relative && under_sudo {
                 format!(
                     "spawning {program}: not found on sudo's PATH. \
