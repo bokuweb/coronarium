@@ -179,19 +179,42 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
 6. **Retroactive CVE notification for past installs** — log every
    resolved install the proxy sees to a local append-only file
    (`~/.sakimori/installs.jsonl`: ecosystem, name, version,
-   resolved_at, project_path) and add `sakimori advisories scan`
-   that batch-queries [OSV.dev](https://osv.dev)'s
-   `POST /v1/querybatch` for matching advisories. Local-first:
-   no server, no upload, private dep trees never leave the machine.
-   OSV covers npm / crates.io / PyPI / NuGet so one client handles
-   all four ecosystems. A central-server / push-notification mode
-   (ingest endpoint + Postgres + OSV mirror + webhook dispatcher)
-   is a possible follow-up but must remain opt-in self-host —
-   centralised SaaS is explicitly out of scope per the philosophy
-   above. **npx** works for free here (same `registry.npmjs.org`
-   path the npm rewriter already handles); **Homebrew** does *not*
-   fit minimumReleaseAge (formula updates are PRs to a git repo,
-   not registry publishes with structured publish-time per version)
+   resolved_at, project_path, attribution) and add
+   `sakimori advisories scan` that batch-queries
+   [OSV.dev](https://osv.dev)'s `POST /v1/querybatch` for matching
+   advisories. Local-first: no server, no upload, private dep
+   trees never leave the machine. OSV covers npm / crates.io /
+   PyPI / NuGet so one client handles all four ecosystems.
+
+   For users who *do* want to fan installs out to a backend, the
+   canonical wire format is the same `InstallEvent` JSON schema,
+   exposed via an **opt-in OTLP exporter** (`sakimori proxy start
+   --otlp-endpoint <url>`) that emits each install as an OTLP
+   LogRecord with `package.*` attributes
+   (`package.ecosystem`, `package.name`, `package.version`,
+   `package.resolved_at`, `package.project_path`). This means we
+   do *not* ship a proprietary `/ingest` HTTP endpoint — users
+   point sakimori at their existing OTel collector / Datadog /
+   Honeycomb / Loki / etc. Aligned with the local-first philosophy:
+   no sakimori-hosted service required, and the same pipe can
+   later carry install-rate / advisory-hit metrics.
+
+   Separately, we **do** want to ship **`sakimori-hub`** as an
+   optional self-hostable companion: a small Rust service that
+   accepts the same OTLP stream (or the native JSON), keeps an
+   OSV mirror, runs the advisory-vs-install JOIN server-side, and
+   dispatches webhooks / email / Slack when a past install
+   matches a newly-published advisory. It is **strictly opt-in
+   self-host** — there will be no Anthropic/coronarium-operated
+   instance — and it speaks OTLP on ingest so it slots into the
+   same architecture as any other backend. Centralised SaaS
+   remains out of scope; sakimori-hub is "here's the server you
+   can run yourself if you want push notifications across a team."
+
+   **npx** works for free here (same `registry.npmjs.org` path
+   the npm rewriter already handles); **Homebrew** does *not* fit
+   minimumReleaseAge (formula updates are PRs to a git repo, not
+   registry publishes with structured publish-time per version)
    but its installs can still be logged via HTTPS_PROXY for the
    advisory-scan side.
 
