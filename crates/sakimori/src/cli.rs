@@ -599,6 +599,24 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 15, value_name = "SECS")]
     pub dns_refresh_interval: u64,
 
+    /// Snapshot the contents of this directory before exec'ing the
+    /// supervised command, take a fresh snapshot afterwards, and
+    /// surface any files added / modified / removed by the build
+    /// in the JSON log (under `workspace_drift`) and the step
+    /// summary. Off by default — same skip list as
+    /// `sakimori workspace snapshot` (`.git`, `node_modules`,
+    /// `target`, …). In `mode: block`, any drift causes a non-zero
+    /// exit (the same way denied events do); in `mode: audit` the
+    /// drift is reported but doesn't change exit code.
+    #[arg(long, value_name = "DIR")]
+    pub snapshot_workspace: Option<PathBuf>,
+
+    /// Extra directory basenames to skip during the workspace
+    /// snapshot, on top of the built-in build-artefact list.
+    /// Repeatable. Only meaningful with `--snapshot-workspace`.
+    #[arg(long = "snapshot-skip", value_name = "NAME")]
+    pub snapshot_skip: Vec<String>,
+
     /// Command + args to execute under supervision.
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -1046,6 +1064,29 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         args.command
     );
 
+    // Workspace tamper baseline. Taken BEFORE the eBPF supervisor
+    // starts so we don't accidentally hash any files the supervisor
+    // itself writes (cgroup state etc.). Off-path failure is a hard
+    // error — if the user explicitly asked for tamper detection, a
+    // missing snapshot would silently make every later diff "clean".
+    let baseline = match &args.snapshot_workspace {
+        Some(dir) => {
+            let opts = sakimori_core::tamper::Options {
+                skip_extra: args.snapshot_skip.clone(),
+                ..Default::default()
+            };
+            let snap = sakimori_core::tamper::Snapshot::take(dir, &opts)
+                .with_context(|| format!("snapshotting workspace {} before run", dir.display()))?;
+            log::info!(
+                "workspace baseline: {} files under {}",
+                snap.files.len(),
+                dir.display()
+            );
+            Some(snap)
+        }
+        None => None,
+    };
+
     let supervised = loader::Supervisor::start(
         policy.clone(),
         mode,
@@ -1054,6 +1095,28 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
     .await?;
     let exit = supervised.run_child(&args.command).await?;
     let mut stats = supervised.shutdown().await?;
+
+    // After-snapshot + diff. Errors here are non-fatal: the audit
+    // log + summary still go out, just without `workspace_drift`.
+    let drift = if let Some(baseline) = baseline.as_ref() {
+        let dir = args
+            .snapshot_workspace
+            .as_ref()
+            .expect("baseline implies dir");
+        let opts = sakimori_core::tamper::Options {
+            skip_extra: args.snapshot_skip.clone(),
+            ..Default::default()
+        };
+        match sakimori_core::tamper::Snapshot::take(dir, &opts) {
+            Ok(after) => Some(sakimori_core::tamper::diff(baseline, &after)),
+            Err(e) => {
+                log::warn!("post-run workspace snapshot failed: {e:#} — skipping drift section");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Best-effort PTR enrichment so the HTML report shows hostnames
     // next to raw IPs. Failures are silent — the report is still
@@ -1069,8 +1132,11 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         command: command_str.as_str(),
         mode,
         policy: &policy,
+        workspace_drift: drift.as_ref().filter(|d| !d.is_clean()),
     };
     sakimori_core::report::write(&report_args, &stats)?;
+
+    let drift_violation = drift.as_ref().map(|d| !d.is_clean()).unwrap_or(false);
 
     if stats.denied > 0 && matches!(mode, policy::Mode::Block) {
         // GitHub Actions error annotation — renders as a red banner on the
@@ -1078,6 +1144,13 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         eprintln!(
             "::error title=sakimori::policy violation: {} events denied in block mode",
             stats.denied
+        );
+        std::process::exit(1);
+    }
+    if drift_violation && matches!(mode, policy::Mode::Block) {
+        let n = drift.as_ref().map(|d| d.total()).unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::workspace tamper detected: {n} files added/modified/removed during the supervised step"
         );
         std::process::exit(1);
     }

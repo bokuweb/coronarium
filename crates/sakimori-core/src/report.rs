@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{events::Event, html, policy::Policy, stats::Stats};
+use crate::{events::Event, html, policy::Policy, stats::Stats, tamper::Diff};
 
 /// How many rows we surface per breakdown table in the step summary.
 /// Picked to fit comfortably in a GitHub run page without scrolling
@@ -35,16 +35,30 @@ pub struct ReportArgs<'a> {
     pub mode: crate::policy::Mode,
     /// Policy passed through to the HTML "Effective policy" section.
     pub policy: &'a Policy,
+    /// Optional workspace tamper-detection diff. When `Some` and
+    /// non-empty, surfaces in the JSON log under `workspace_drift`
+    /// and in the step summary as a "Workspace drift" section. The
+    /// supervisor sets this only when the user passed
+    /// `--snapshot-workspace`.
+    pub workspace_drift: Option<&'a Diff>,
 }
 
 pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
     // --- JSON ---
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "observed": stats.observed,
         "denied": stats.denied,
         "lost": stats.lost,
         "samples": stats.samples,
     });
+    // Only emit `workspace_drift` when the user actually opted into
+    // a snapshot AND something changed — empty diffs would just
+    // bloat every audit log with noise.
+    if let Some(drift) = args.workspace_drift
+        && !drift.is_clean()
+    {
+        payload["workspace_drift"] = serde_json::to_value(drift)?;
+    }
     let serialized = serde_json::to_string_pretty(&payload)?;
 
     if args.log == "-" {
@@ -69,7 +83,7 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
     // --- $GITHUB_STEP_SUMMARY markdown ---
     if let Some(path) = args.summary {
         let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-        let body = render_step_summary(args.command, stats);
+        let body = render_step_summary(args.command, stats, args.workspace_drift);
         writeln!(f, "{body}")?;
     }
 
@@ -96,7 +110,7 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
 /// caps live in `stats::PER_KIND_CAP` — the tables can undercount
 /// if a single kind floods, but `stats.observed` / `stats.denied`
 /// totals are exact and shown above.
-pub fn render_step_summary(command: &str, stats: &Stats) -> String {
+pub fn render_step_summary(command: &str, stats: &Stats, drift: Option<&Diff>) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## sakimori\n");
     let _ = writeln!(out, "Command: `{}`\n", escape_pipe(command));
@@ -105,6 +119,9 @@ pub fn render_step_summary(command: &str, stats: &Stats) -> String {
     let _ = writeln!(out, "| observed | **{}** |", stats.observed);
     let _ = writeln!(out, "| denied   | **{}** |", stats.denied);
     let _ = writeln!(out, "| lost     | {} |", stats.lost);
+    if let Some(d) = drift {
+        let _ = writeln!(out, "| drift    | **{}** |", d.total());
+    }
     if stats.lost > 0 {
         let _ = writeln!(
             out,
@@ -139,7 +156,86 @@ pub fn render_step_summary(command: &str, stats: &Stats) -> String {
         "source",
         source_breakdown(&stats.samples),
     );
+    if let Some(d) = drift {
+        push_drift_section(&mut out, d);
+    }
     out
+}
+
+/// How many drift rows to surface per category (added / modified /
+/// removed) before the table gets a "… N more" footnote.
+const DRIFT_TOP_N: usize = 25;
+
+fn push_drift_section(out: &mut String, drift: &Diff) {
+    if drift.is_clean() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "\n### Workspace drift — files changed by the supervised step\n",
+    );
+    let _ = writeln!(out, "| | | path | note |\n|:-:|---|---|---|",);
+    for p in drift.added.iter().take(DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            "| ➕ | added    | `{}` |  |",
+            escape_pipe(&p.display().to_string())
+        );
+    }
+    for m in drift.modified.iter().take(DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            "| 🔧 | modified | `{}` | {} |",
+            escape_pipe(&m.path.display().to_string()),
+            modification_note(m),
+        );
+    }
+    for p in drift.removed.iter().take(DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            "| ➖ | removed  | `{}` |  |",
+            escape_pipe(&p.display().to_string())
+        );
+    }
+    let total = drift.total();
+    let shown = drift.added.len().min(DRIFT_TOP_N)
+        + drift.modified.len().min(DRIFT_TOP_N)
+        + drift.removed.len().min(DRIFT_TOP_N);
+    if total > shown {
+        let _ = writeln!(
+            out,
+            "\n_… {} more rows omitted; full diff is in `workspace_drift` of the JSON log._",
+            total - shown,
+        );
+    }
+}
+
+fn modification_note(m: &crate::tamper::ModifiedEntry) -> String {
+    use crate::tamper::Entry;
+    match (&m.before, &m.after) {
+        (
+            Entry::File {
+                size: a,
+                sha256: ha,
+            },
+            Entry::File {
+                size: b,
+                sha256: hb,
+            },
+        ) => {
+            if a != b {
+                format!("{} → {} bytes", a, b)
+            } else if ha != hb {
+                "contents changed".to_string()
+            } else {
+                "metadata changed".to_string()
+            }
+        }
+        (Entry::Symlink { target: a }, Entry::Symlink { target: b }) => {
+            format!("link target {} → {}", a, b)
+        }
+        _ => "type changed".to_string(),
+    }
 }
 
 /// One row in a breakdown table: label, total occurrences, and how
@@ -344,7 +440,7 @@ mod tests {
         stats.ingest(ev_open("/etc/hosts", false));
         stats.ingest(ev_exec("/bin/sh", false));
 
-        let s = render_step_summary("npm install", &stats);
+        let s = render_step_summary("npm install", &stats, None);
         // Header + command line.
         assert!(s.contains("## sakimori"));
         assert!(s.contains("`npm install`"));
@@ -370,7 +466,7 @@ mod tests {
         }
         stats.ingest(ev_connect(Some("evil.example"), "9.9.9.9", 443, true));
 
-        let s = render_step_summary("cmd", &stats);
+        let s = render_step_summary("cmd", &stats, None);
         let evil_pos = s.find("evil.example").expect("evil row present");
         let good_pos = s.find("good.example").expect("good row present");
         assert!(
@@ -387,7 +483,7 @@ mod tests {
         // headers in the summary).
         let mut stats = Stats::default();
         stats.ingest(ev_open("/x", false));
-        let s = render_step_summary("cmd", &stats);
+        let s = render_step_summary("cmd", &stats, None);
         assert!(s.contains("### Files"));
         assert!(!s.contains("### Network"));
         assert!(!s.contains("### Processes"));
@@ -396,7 +492,7 @@ mod tests {
     #[test]
     fn pipe_in_command_is_escaped_so_table_doesnt_break() {
         let stats = Stats::default();
-        let s = render_step_summary("bash -c 'foo | bar'", &stats);
+        let s = render_step_summary("bash -c 'foo | bar'", &stats, None);
         assert!(s.contains(r"bash -c 'foo \| bar'"));
     }
 
@@ -406,7 +502,7 @@ mod tests {
         for i in 0..(SUMMARY_TOP_N + 5) {
             stats.ingest(ev_open(&format!("/tmp/file-{i}"), false));
         }
-        let s = render_step_summary("cmd", &stats);
+        let s = render_step_summary("cmd", &stats, None);
         assert!(s.contains("more rows omitted"));
     }
 
@@ -417,7 +513,7 @@ mod tests {
             ..Stats::default()
         };
         stats.ingest(ev_open("/x", false));
-        let s = render_step_summary("cmd", &stats);
+        let s = render_step_summary("cmd", &stats, None);
         assert!(s.contains("⚠️"));
         assert!(s.contains("7 events were dropped"));
     }
@@ -429,7 +525,7 @@ mod tests {
         // No source attribution anywhere → table suppressed.
         let mut stats = Stats::default();
         stats.ingest(ev_connect(Some("a.example"), "1.1.1.1", 443, false));
-        let s = render_step_summary("cmd", &stats);
+        let s = render_step_summary("cmd", &stats, None);
         assert!(
             !s.contains("### Sources"),
             "with zero attribution the section must be hidden, got:\n{s}"
@@ -463,10 +559,90 @@ mod tests {
         stats.ingest(e2);
         stats.ingest(e3);
 
-        let s = render_step_summary("cmd", &stats);
+        let s = render_step_summary("cmd", &stats, None);
         assert!(s.contains("### Sources"), "section header missing");
         assert!(s.contains("`npm`"));
         assert!(s.contains("`pip`"));
         assert!(s.contains("(unattributed)"));
+    }
+
+    #[test]
+    fn drift_section_renders_added_modified_removed() {
+        use crate::tamper::{Diff, Entry, ModifiedEntry};
+        use std::path::PathBuf;
+
+        let drift = Diff {
+            added: vec![PathBuf::from("src/new.rs")],
+            modified: vec![ModifiedEntry {
+                path: PathBuf::from("src/lib.rs"),
+                before: Entry::File {
+                    size: 100,
+                    sha256: Some("a".repeat(64)),
+                },
+                after: Entry::File {
+                    size: 100,
+                    sha256: Some("b".repeat(64)),
+                },
+            }],
+            removed: vec![PathBuf::from("src/old.rs")],
+        };
+        let stats = Stats::default();
+        let s = render_step_summary("cmd", &stats, Some(&drift));
+
+        assert!(s.contains("| drift    | **3** |"), "drift count missing");
+        assert!(s.contains("### Workspace drift"), "drift section missing");
+        assert!(s.contains("`src/new.rs`"));
+        assert!(s.contains("`src/lib.rs`"));
+        assert!(s.contains("`src/old.rs`"));
+        // Modification note for same-size, different-hash file.
+        assert!(s.contains("contents changed"), "expected note: {s}");
+    }
+
+    #[test]
+    fn drift_section_suppressed_when_clean() {
+        use crate::tamper::Diff;
+        let stats = Stats::default();
+        let s = render_step_summary("cmd", &stats, Some(&Diff::default()));
+        assert!(!s.contains("### Workspace drift"));
+        // Clean diff still gets a "drift | 0" row so the user knows
+        // the snapshot ran.
+        assert!(s.contains("| drift    | **0** |"));
+    }
+
+    #[test]
+    fn drift_section_truncates_with_remainder_note() {
+        use crate::tamper::Diff;
+        use std::path::PathBuf;
+
+        let drift = Diff {
+            added: (0..(DRIFT_TOP_N + 5))
+                .map(|i| PathBuf::from(format!("a-{i}")))
+                .collect(),
+            modified: vec![],
+            removed: vec![],
+        };
+        let stats = Stats::default();
+        let s = render_step_summary("cmd", &stats, Some(&drift));
+        assert!(s.contains("more rows omitted"), "{s}");
+    }
+
+    #[test]
+    fn modification_note_size_change_overrides_hash_check() {
+        use crate::tamper::{Entry, ModifiedEntry};
+        use std::path::PathBuf;
+
+        let m = ModifiedEntry {
+            path: PathBuf::from("p"),
+            before: Entry::File {
+                size: 100,
+                sha256: Some("a".into()),
+            },
+            after: Entry::File {
+                size: 200,
+                sha256: Some("b".into()),
+            },
+        };
+        let note = modification_note(&m);
+        assert!(note.contains("100 → 200"), "{note}");
     }
 }
