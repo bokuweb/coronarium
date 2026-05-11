@@ -85,8 +85,24 @@ if (container) {
 const runnerTemp = process.env.RUNNER_TEMP || os.tmpdir();
 const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
 const installDir = path.join(runnerTemp, "sakimori");
-const binPath = path.join(installDir, "sakimori");
-const bpfPath = path.join(installDir, "sakimori.bpf.o");
+
+// Honour pre-installed binaries — primarily so our own CI can exercise
+// the action against a locally-built sakimori, but also useful for
+// air-gapped runners that mirror the binary themselves. Both SAKIMORI_BIN
+// and SAKIMORI_BPF_OBJ must be set AND point at existing files; partial
+// configuration falls through to the normal download path.
+const presetBin = process.env.SAKIMORI_BIN || "";
+const presetBpf = process.env.SAKIMORI_BPF_OBJ || "";
+const preInstalled =
+  presetBin.length > 0 &&
+  presetBpf.length > 0 &&
+  fs.existsSync(presetBin) &&
+  fs.existsSync(presetBpf);
+
+const binPath = preInstalled ? presetBin : path.join(installDir, "sakimori");
+const bpfPath = preInstalled
+  ? presetBpf
+  : path.join(installDir, "sakimori.bpf.o");
 const pidFile = path.join(runnerTemp, "sakimori-job.pid");
 const daemonStdout = path.join(runnerTemp, "sakimori-daemon.stdout.log");
 const daemonStderr = path.join(runnerTemp, "sakimori-daemon.stderr.log");
@@ -253,5 +269,9 @@ function startDaemon() {
   );
 }
 
-installBinary();
+if (preInstalled) {
+  notice(`using pre-installed sakimori at ${binPath} (bpf=${bpfPath})`);
+} else {
+  installBinary();
+}
 startDaemon();
