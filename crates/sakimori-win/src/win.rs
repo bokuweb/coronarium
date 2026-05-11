@@ -262,6 +262,10 @@ pub fn run() -> Result<()> {
         command: command_str.as_str(),
         mode,
         policy: &policy,
+        // Workspace tamper detection isn't wired into the Windows
+        // ETW supervisor yet — Linux supervisor opted in via
+        // `--snapshot-workspace`. Adding it here is a follow-up.
+        workspace_drift: None,
     };
     sakimori_core::report::write(&report_args, &final_stats)?;
 

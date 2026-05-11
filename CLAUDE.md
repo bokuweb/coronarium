@@ -221,10 +221,13 @@ of value-per-implementation-cost.
    `.gitignore`, since an attacker can write into it). Symlinks are
    recorded by target string, not followed. Files over 64 MiB
    default to size-only entries (configurable). Diff exits non-zero
-   on drift unless `--allow-drift`. Auto-integration into
-   `coronarium run` (snapshot before / diff after exec) is a
-   follow-up — kept standalone first so users can compose it with
-   any build, not just an eBPF-supervised one.
+   on drift unless `--allow-drift`. Also wired into `sakimori run`
+   via `--snapshot-workspace <DIR>` (v0.34): supervisor takes the
+   baseline before exec'ing the supervised command, takes a fresh
+   snapshot at exit, attaches the diff to the JSON log under
+   `workspace_drift`, surfaces it as a "Workspace drift" section in
+   the step summary, and (in `mode: block`) exits non-zero on any
+   drift the same way denied events do.
 10. **Floating-tag → SHA-pin static check** — ✅ implemented in v0.21
     as `coronarium actions audit <workflow.yml...>`. Walks every
     `uses:` in `jobs.<id>.steps[]` and `jobs.<id>.uses` (reusable

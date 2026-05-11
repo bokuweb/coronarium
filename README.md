@@ -579,9 +579,14 @@ Flags:
 | `--log` | — | `-` (stdout) | JSON audit log destination |
 | `--summary` | `GITHUB_STEP_SUMMARY` | — | markdown summary |
 | `--html` | — | — | self-contained HTML report (dark-mode aware, filterable) |
+| `--snapshot-workspace` | — | — | dir to hash before/after the run; drift goes into the JSON log + step summary, and (in block mode) makes the run fail |
+| `--snapshot-skip` | — | — | extra dir basenames to skip during the snapshot (repeatable) |
 
-Exit code: child's exit code, unless `mode=block` and at least one
-event was denied → exits `1`.
+Exit code: child's exit code, unless `mode=block` and **either**:
+- at least one event was denied, **or**
+- a `--snapshot-workspace` baseline was taken and the post-run diff is non-empty
+
+→ exits `1` either way.
 
 Policy format:
 
