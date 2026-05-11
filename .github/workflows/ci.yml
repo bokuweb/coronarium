@@ -813,16 +813,38 @@ jobs:
           echo "HTTPS_PROXY=$HTTPS_PROXY"
           echo "CA=$NODE_EXTRA_CA_CERTS"
 
-      - name: Verify a request is routed through the proxy and rewritten
+      - name: Verify the proxy is reachable (TCP probe)
         run: |
           set -euxo pipefail
-          # crates.io's sparse index for `serde` returns one JSONL
-          # line per version. The proxy's `--min-age 7d` filter
-          # removes any version published in the last week, so the
-          # via-proxy response must have <= the direct line count.
-          # serde gets a release roughly weekly, so we expect strict
-          # < almost always.
-          direct=$(curl -fsS https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
+          # Cross-OS TCP-port probe. The action's main job is to
+          # spawn the proxy + export env; this confirms the spawn
+          # actually produced a listening server that survives into
+          # this later step.
+          node -e "
+          const net = require('net');
+          const s = net.createConnection({ host: '127.0.0.1', port: 18910 }, () => {
+            console.log('proxy port open');
+            s.destroy();
+          });
+          s.on('error', e => { console.error('proxy port closed:', e.message); process.exit(1); });
+          "
+
+      # Rewriter end-to-end verification runs on Linux only — the
+      # existing `proxy-smoke` job covers it more thoroughly than we
+      # can here. On Windows the Git-Bash curl uses the schannel
+      # TLS backend, which ignores `--cacert` and doesn't trust our
+      # self-signed MITM CA without an explicit certutil install
+      # into the system store. That's out of scope: trusting the CA
+      # on Windows runners is the consumer's responsibility (e.g.
+      # via `bokuweb/sakimori proxy install-ca`), not the action's.
+      - name: Verify rewriter pruned recent serde versions (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          # Direct fetch — bypass our own env exports so we don't
+          # measure through the proxy by accident.
+          direct=$(env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
+                   curl -fsS https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
           via=$(curl -fsS --cacert "$NODE_EXTRA_CA_CERTS" -x "$HTTPS_PROXY" \
                   https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
           echo "serde versions: direct=$direct via=$via"
