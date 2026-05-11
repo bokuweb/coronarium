@@ -215,6 +215,40 @@ kernel-enforced; `network.default: deny` is audit-only + warn.
    but its installs can still be logged via HTTPS_PROXY for the
    advisory-scan side.
 
+   **`InstallEvent.execution_mode`** — the schema distinguishes
+   two install shapes, because retroactive CVE notification means
+   different things for each:
+
+   - `persistent` (`npm install`, `cargo add`, `pip install`,
+     `dotnet add package`, etc.) — the package lands in a lockfile
+     and stays there. Advisory notification → "bump and re-install"
+     remediation. Standard SCA model.
+   - `ephemeral` (`npx`, `pnpm dlx`, `yarn dlx`, `uvx`,
+     `pipx run`, `cargo install`, `go run <remote>`, etc.) — the
+     package is fetched, executed once, and (often) cached but not
+     pinned in any project lockfile. Advisory notification cannot
+     mean "bump"; it means **"this code ran on your machine on
+     <date> with the running user's privileges — investigate
+     potential compromise"**. The host UI must surface these
+     differently (different colour / different recommended action)
+     so reviewers don't try to "fix" them by editing a lockfile
+     that doesn't reference them.
+
+   Classification happens at proxy time from the User-Agent and
+   the URL path shape (e.g. `npm` UA + a fetch under
+   `/<pkg>/-/<pkg>-<ver>.tgz` without a preceding packument GET
+   pattern matching a project resolution → `ephemeral`; same fetch
+   following a packument GET from `node` + `npm-cli` context →
+   `persistent`). When ambiguous, default to `persistent` and let
+   the host UI mark it `mode: unknown` rather than mis-categorise
+   as ephemeral and hide a real dependency.
+
+   This is one of sakimori-hub's strongest differentiators —
+   Dependabot / Snyk / Socket only see what's committed to a repo
+   lockfile, so they fundamentally cannot notify on `npx` /
+   `pipx run` / `cargo install` history. sakimori is positioned
+   at the fetch layer, so it can.
+
 ### harden-runner parity gaps (tracked but not yet scheduled)
 
 These are features `step-security/harden-runner` ships that
