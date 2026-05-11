@@ -47,6 +47,41 @@ if (process.platform !== "linux") {
   );
 }
 
+function detectContainer() {
+  // `/.dockerenv` — written by docker (and most OCI runtimes) into every
+  // container's rootfs. Cheap and reliable for hosted-runner cases.
+  if (fs.existsSync("/.dockerenv")) return "docker";
+  // `/proc/1/cgroup` shows the cgroup membership of pid 1 from the
+  // namespace's view. Inside a container that line typically contains
+  // a slug like `/docker/<id>`, `/kubepods/...`, or `/system.slice/
+  // docker-<id>.scope`. Outside a container it's the host's path.
+  try {
+    const cg = fs.readFileSync("/proc/1/cgroup", "utf8");
+    if (/\b(docker|containerd|kubepods|libpod|crio)\b/.test(cg)) {
+      return "cgroup-pattern";
+    }
+  } catch {
+    // /proc/1/cgroup not readable → assume host
+  }
+  return null;
+}
+
+const container = detectContainer();
+if (container) {
+  // Warn-and-continue: the daemon will fail at attach time with a
+  // precise error (root cgroup refused, or no v2 hierarchy visible)
+  // and that's the actually-useful diagnostic. We just give the user
+  // a heads-up so they aren't surprised.
+  process.stdout.write(
+    `::warning title=sakimori::detected container environment (${container}). ` +
+      "bokuweb/sakimori/job observes processes via the host's cgroup v2 hierarchy " +
+      "and is not designed for `jobs.<id>.container:` workflows — steps run " +
+      "inside the container and are isolated from the host-side BPF attach. " +
+      "Either drop the `container:` key or run sakimori on a host job that " +
+      "spawns the container as a child step.\n",
+  );
+}
+
 const runnerTemp = process.env.RUNNER_TEMP || os.tmpdir();
 const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
 const installDir = path.join(runnerTemp, "sakimori");
