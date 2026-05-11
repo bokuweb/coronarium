@@ -756,3 +756,66 @@ jobs:
             ${{ runner.temp }}/sakimori-job.html
             ${{ runner.temp }}/sakimori-daemon.stdout.log
             ${{ runner.temp }}/sakimori-daemon.stderr.log
+
+  proxy-action-smoke:
+    # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper
+    # that downloads the binary, starts the proxy, and exports
+    # HTTPS_PROXY via $GITHUB_ENV) actually works on all three
+    # supported OSes. The existing `proxy-smoke` job tests the proxy
+    # *binary* directly; this one tests the action wiring.
+    #
+    # Uses `uses: ./proxy` so we test the code in *this* PR.
+    # `./` action references skip pre/post hooks, but the proxy action
+    # only declares main + post — post is "kill the proxy" cleanup
+    # which the runner image teardown handles anyway. main runs.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pick an uncommon port to avoid colliding with anything the
+      # runner image might be listening on.
+      - uses: ./proxy
+        with:
+          min-age: 7d
+          listen: 127.0.0.1:18910
+
+      - name: Verify env vars are exported to subsequent steps
+        run: |
+          set -euxo pipefail
+          test -n "$HTTPS_PROXY"
+          test -n "$NODE_EXTRA_CA_CERTS"
+          test -f "$NODE_EXTRA_CA_CERTS"
+          echo "HTTPS_PROXY=$HTTPS_PROXY"
+          echo "CA=$NODE_EXTRA_CA_CERTS"
+          # cross-OS test that the daemon is alive: the curl below
+          # is the actually-useful proof.
+
+      - name: Verify a request is routed through the proxy and rewritten
+        run: |
+          set -euxo pipefail
+          # crates.io's sparse index for `serde` returns one JSONL
+          # line per version. The proxy's `--min-age 7d` filter
+          # removes any version published in the last week — so the
+          # via-proxy response must have FEWER lines than the direct
+          # one (or the same, if no versions have been published in
+          # the past week, which is unlikely for serde).
+          direct=$(curl -fsS https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
+          via=$(curl -fsS --cacert "$NODE_EXTRA_CA_CERTS" -x "$HTTPS_PROXY" \
+                  https://index.crates.io/se/rd/serde | wc -l | tr -d ' ')
+          echo "serde versions: direct=$direct via=$via"
+          if [ "$via" -gt "$direct" ]; then
+            echo "::error::proxy returned MORE versions than direct fetch ($via > $direct) — rewriter broken"
+            exit 1
+          fi
+          if [ "$via" -lt 50 ]; then
+            echo "::error::proxy kept implausibly few versions ($via) — rewriter likely returned empty body"
+            exit 1
+          fi
+          echo "✓ proxy is filtering crates.io responses"
