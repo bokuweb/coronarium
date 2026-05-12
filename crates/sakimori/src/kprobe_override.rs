@@ -58,6 +58,10 @@ pub enum KprobeOverrideStatus {
 }
 
 impl KprobeOverrideStatus {
+    // Not used by the doctor surface — only the loader's kprobe-attach
+    // gate calls this, which lands in the follow-up PR. Kept here so
+    // that PR doesn't have to also touch this file.
+    #[allow(dead_code)]
     pub fn is_available(&self) -> bool {
         matches!(self, KprobeOverrideStatus::Available { .. })
     }
