@@ -851,7 +851,9 @@ jobs:
         # `userspace` only runs on Linux. We want the platform-neutral
         # crates exercised on macOS / Windows too, especially the
         # filesystem append path in `installs`.
-        run: "cargo test -p sakimori-core installs:: advisories::"
+        run: |
+          cargo test -p sakimori-core installs::
+          cargo test -p sakimori-core advisories::
 
       - name: Hand-craft an installs.jsonl with one known-malicious entry
         run: |
