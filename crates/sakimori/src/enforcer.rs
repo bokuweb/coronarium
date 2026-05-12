@@ -104,10 +104,10 @@ fn env_opt_in(name: &str) -> bool {
     // Common truthy values; everything else (unset, "0", "false",
     // empty) is treated as opt-out so users can paste a `=0` into
     // CI to disable without removing the assignment.
-    match std::env::var(name).ok().as_deref() {
-        Some("1" | "true" | "yes" | "on") => true,
-        _ => false,
-    }
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 #[cfg(target_os = "linux")]
