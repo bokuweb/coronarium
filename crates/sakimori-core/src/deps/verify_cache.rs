@@ -22,8 +22,11 @@
 //!   rewrite of both the index and every blob it references would
 //!   verify clean — we can't re-derive the tarball hash without the
 //!   .tgz, which pnpm discards. Catches realistic single-file
-//!   tampering. pnpm v10's SQLite `index.db` layout is not yet
-//!   supported.
+//!   tampering. pnpm v11's SQLite `index.db` layout (a single
+//!   msgpack-encoded blob per `(integrity, pkgId)` key, written
+//!   with msgpackr's non-standard `useRecords: true` extension) is
+//!   not yet supported — detected and flagged with a clear error
+//!   rather than silently passing.
 //! - **cargo registry** (`Cargo.lock`): each `[[package]]` from a
 //!   registry source carries `checksum = "<hex>"` — SHA-256 of the
 //!   `.crate` tarball. We hash `<cargo_home>/registry/cache/<reg>/<name>-<version>.crate`
@@ -441,16 +444,16 @@ fn strip_peer_suffix_from_version(ver: &str) -> String {
 ///
 /// Caller passes the full path including the `v3` segment.
 ///
-/// pnpm v10 replaced per-package `<rest>-index.json` files with a
-/// single SQLite database at `<store>/index.db`. We detect that
+/// pnpm v11 replaced the per-package `<rest>-index.json` files with
+/// a single SQLite database at `<store>/index.db`. We detect that
 /// layout and short-circuit every entry to `Unsupported` with a
 /// pointed message rather than silently reporting everything as
 /// missing — the user gets an actionable error instead of a false
-/// negative.
+/// negative. (Note: v10 still uses JSON; only v11+ ships SQLite.)
 pub fn verify_pnpm_store(entries: &[IntegrityEntry], store_root: &Path) -> VerifyReport {
     let mut report = VerifyReport::default();
 
-    if is_pnpm_v10_store(store_root) {
+    if is_pnpm_sqlite_store(store_root) {
         for entry in entries {
             report.unsupported += 1;
             report.checked += 1;
@@ -462,8 +465,11 @@ pub fn verify_pnpm_store(entries: &[IntegrityEntry], store_root: &Path) -> Verif
                 expected_sha_hex: None,
                 actual_sha_hex: None,
                 message: Some(
-                    "pnpm v10 SQLite store (`index.db`) not yet supported — see CLAUDE.md \
-                     roadmap #14. Re-run against a pnpm v8/v9 store or pin pnpm to <10."
+                    "pnpm v11+ SQLite store (`index.db`) not yet supported. The blobs use \
+                     msgpackr's non-standard `useRecords: true` extension which standard \
+                     msgpack decoders cannot read; reader implementation is tracked in \
+                     CLAUDE.md roadmap #14. Workaround: pass `--cache <root>/v3` to verify \
+                     against a still-present v8/v9 store, or pin pnpm to <11."
                         .into(),
                 ),
             });
@@ -643,12 +649,13 @@ fn verify_pnpm_file(
     }
 }
 
-/// Heuristic: pnpm v10 writes `<store>/index.db` (SQLite) and stops
+/// Heuristic: pnpm v11+ writes `<store>/index.db` (SQLite) and stops
 /// writing the per-package `<rest>-index.json` files. The presence
-/// of `index.db` is a strong-enough signal — pnpm v8/v9 never write
-/// it. We don't try to detect mixed stores; a user mid-migration
-/// should pass `--cache` explicitly to a known-good store.
-fn is_pnpm_v10_store(store_root: &Path) -> bool {
+/// of `index.db` is a strong-enough signal — pnpm v8/v9/v10 never
+/// write it. We don't try to detect mixed stores; a user
+/// mid-migration should pass `--cache` explicitly to a known-good
+/// store directory.
+fn is_pnpm_sqlite_store(store_root: &Path) -> bool {
     store_root.join("index.db").is_file()
 }
 
@@ -1302,12 +1309,14 @@ mod tests {
     }
 
     #[test]
-    fn verify_pnpm_store_flags_v10_sqlite_layout_explicitly() {
-        // pnpm v10 writes <store>/index.db and drops the per-package
-        // -index.json files. We don't yet parse SQLite/msgpack; the
-        // detector must short-circuit with a clear message rather
-        // than silently report everything as missing.
-        let root = tmpdir("pnpm-v10");
+    fn verify_pnpm_store_flags_sqlite_layout_explicitly() {
+        // pnpm v11+ writes <store>/index.db and drops the per-package
+        // -index.json files. The blobs use msgpackr's `useRecords:
+        // true` extension which standard msgpack decoders cannot
+        // read; until we have a records-aware reader, the detector
+        // must short-circuit with a clear message rather than
+        // silently report everything as missing.
+        let root = tmpdir("pnpm-v11");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("index.db"), b"fake sqlite").unwrap();
 
@@ -1320,7 +1329,9 @@ mod tests {
         assert_eq!(report.unsupported, 1);
         let v = &report.packages[0];
         assert_eq!(v.outcome, Outcome::Unsupported);
-        assert!(v.message.as_deref().unwrap().contains("pnpm v10"));
+        let msg = v.message.as_deref().unwrap();
+        assert!(msg.contains("v11"));
+        assert!(msg.contains("msgpackr"));
     }
 
     #[test]

@@ -505,10 +505,13 @@ Exit codes:
 > `<rest>-index.json` to find per-file hashes — pnpm discards the
 > tarball after extraction, so a fully coordinated rewrite of both
 > the index and every blob it references would verify clean. The
-> realistic single-file tampering pattern is caught. **pnpm v10**
-> replaced the per-package JSON index with a SQLite `index.db`;
-> v10 stores are not yet supported and `verify-cache` will surface
-> a clear `Unsupported` error rather than silently passing.
+> realistic single-file tampering pattern is caught. **pnpm v11+**
+> (the next major after v10 — v10 itself still uses JSON) replaces
+> the per-package JSON index with a single SQLite `index.db` whose
+> BLOB values use msgpackr's non-standard `useRecords: true`
+> extension. v11 stores are not yet supported and `verify-cache`
+> will surface a clear `Unsupported` error rather than silently
+> passing. Workaround until the reader lands: pin pnpm to `<11`.
 
 The same check is wrapped as a one-line GitHub Actions step —
 see [CI usage](#ci-usage-github-actions) below.
@@ -864,9 +867,9 @@ auto-picks the cache root for the runner OS. Inputs:
 | `token` | `${{ github.token }}` | Used by `gh release download`. |
 
 Exit codes match the CLI: `0` clean, `1` on any mismatch / missing
-entry. **pnpm v10 SQLite stores are not yet supported** — the
+entry. **pnpm v11+ SQLite stores are not yet supported** — the
 action exits with a clear `Unsupported` error rather than passing
-silently.
+silently. (v10 still uses the JSON layout and works fine.)
 
 ### eBPF-supervised test run — job-scoped form (Linux only)
 

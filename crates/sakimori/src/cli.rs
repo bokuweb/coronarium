@@ -1291,8 +1291,13 @@ fn default_pnpm_store_root() -> Result<PathBuf> {
     //   Linux:   ~/.local/share/pnpm/store
     //   macOS:   ~/Library/pnpm/store
     //   Windows: %LOCALAPPDATA%\pnpm\store
-    // pnpm appends `v3` itself, so the path the verifier walks is
-    // <storeDir>/v3 — that's what we return.
+    // pnpm appends a STORE_VERSION segment itself. v8/v9/v10 use
+    // `v3`; v11+ uses `v11` (and ships a SQLite `index.db` we don't
+    // yet read — surfaces as `Unsupported`). Prefer the highest
+    // version directory present so a user on v11 gets a clear
+    // "not yet supported" message rather than a "store missing"
+    // false negative; fall back to v3 otherwise. Override with
+    // `--cache` when the layout is non-default.
     let base = if cfg!(target_os = "windows") {
         local_app_data()?.join("pnpm").join("store")
     } else if cfg!(target_os = "macos") {
@@ -1307,6 +1312,10 @@ fn default_pnpm_store_root() -> Result<PathBuf> {
             .join("pnpm")
             .join("store")
     };
+    let v11 = base.join("v11");
+    if v11.is_dir() {
+        return Ok(v11);
+    }
     Ok(base.join("v3"))
 }
 

@@ -481,12 +481,21 @@ of value-per-implementation-cost.
       coordinated rewrite of both the index.json and every blob
       verifies clean — we can't re-derive the tarball hash without
       the .tgz, which pnpm discards. Catches the realistic single-
-      file tampering pattern. **pnpm v10** replaces per-package
-      index.json with a SQLite `<store>/index.db` (msgpack values
-      keyed by `${integrity}\t${pkgId}`); the verifier detects this
-      layout and short-circuits every entry to `Unsupported` with
-      an actionable message rather than silently passing — full
-      SQLite/msgpack support is the remaining sub-task.
+      file tampering pattern. **pnpm v11+** (note: v10 still uses
+      JSON; SQLite ships in the next major after v10) replaces the
+      per-package index.json with a single `<store>/index.db`
+      SQLite database keyed by `${integrity}\t${pkgId}`. The
+      verifier detects `<store>/v11/index.db` and short-circuits
+      every entry to `Unsupported` rather than silently passing.
+      Implementation footgun: the BLOB values are encoded with
+      msgpackr's `useRecords: true` extension, which is **not
+      standard msgpack** — `rmp-serde` / `rmp` will mis-decode it.
+      A reader needs either (a) a hand-rolled msgpackr-records
+      decoder (~100-200 lines; ext-type 0x69 introduces a record
+      shape, subsequent occurrences reference it by id) or (b) a
+      Node sidecar invoking `msgpackr.unpack`. See
+      `https://github.com/pnpm/pnpm/blob/main/store/index/src/index.ts`
+      and `https://github.com/kriszyp/msgpackr#structured-cloning--records`.
     - **cargo registry** (`Cargo.lock`) — each `[[package]]` from a
       registry source carries `checksum = "<hex>"` (SHA-256 of the
       .crate tarball, the same value as the sparse-index `cksum`).
@@ -506,7 +515,8 @@ of value-per-implementation-cost.
 
     Doesn't replace `deps check` (release-age) — pairs with it:
     age check at fetch time, cache verify between cache-restore
-    and install. Remaining follow-up: pnpm v10 SQLite reader.
+    and install. Remaining follow-up: pnpm v11 SQLite + msgpackr-
+    records reader (see above for the implementation footgun).
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
