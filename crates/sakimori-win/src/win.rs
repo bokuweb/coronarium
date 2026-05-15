@@ -248,9 +248,30 @@ pub fn run() -> Result<()> {
             )
         })?;
 
-    // Drain tail events. ETW is async; bursts take a second or so to
-    // percolate through the buffering path into our callback.
-    thread::sleep(Duration::from_millis(1000));
+    // Drain tail events. ETW is async; the kernel-process provider's
+    // buffer flush latency is typically 1–2 seconds, and a too-tight
+    // drain causes the supervised child's own ProcessStart event to
+    // arrive *after* we snapshot Stats — producing `denied: 0` in
+    // block mode even when the policy matched. If the policy denies
+    // any exec, wait longer and poll for a denied event so we don't
+    // race the buffer flush; otherwise a single fixed drain is fine.
+    let needs_exec_event = !exec_matcher.is_empty();
+    if needs_exec_event {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            if stats.lock().unwrap().denied > 0 {
+                // Give a small tail so other matching events still land.
+                thread::sleep(Duration::from_millis(300));
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    } else {
+        thread::sleep(Duration::from_millis(1500));
+    }
 
     let final_stats = stats.lock().unwrap().clone();
 

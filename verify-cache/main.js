@@ -164,6 +164,8 @@ function downloadAndExtract(version, triple, tmpDir, token) {
   if (cache) args.push("--cache", cache);
   const format = input("format", "text");
   if (format) args.push("--format", format);
+  const strict = input("strict", "false");
+  if (strict === "true" || strict === "1") args.push("--strict");
 
   console.log(`sakimori-verify-cache: running ${binPath} ${args.join(" ")}`);
   const child = spawn(binPath, args, { stdio: "inherit" });

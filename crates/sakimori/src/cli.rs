@@ -686,6 +686,15 @@ pub struct DepsVerifyCacheArgs {
     pub cache: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "text")]
     pub format: DepsFormat,
+    /// Also fail when blobs are merely *missing* from the cache.
+    /// Default: only `mismatch` (the actual tampering signal) fails
+    /// the run. Cargo.lock legitimately lists platform-conditional
+    /// crates (`windows-*`, `fsevent-sys`, `wasm-bindgen`, …) that
+    /// never land in a Linux runner's cache, so a strict missing
+    /// check is a false alarm there. Opt in for npm/pnpm runs where
+    /// you want post-install completeness checking too.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1254,7 +1263,26 @@ fn run_deps_verify_cache(args: DepsVerifyCacheArgs) -> Result<()> {
         }
     }
 
-    if !report.is_clean() {
+    // Threat model: mismatch = bytes don't match what the lockfile
+    // pinned = real cache-poisoning signal. Missing = blob isn't in
+    // the cache yet (normal for Cargo.lock's platform-conditional
+    // crates on a single-OS runner; not a security event). Default
+    // exit predicate is mismatch-only; `--strict` opts into the
+    // older "fail on anything not Ok" behaviour.
+    if report.missing > 0 && !args.strict {
+        eprintln!(
+            "note: {} entr{} not in cache (treated as warnings; \
+             pass --strict to fail the run on missing too)",
+            report.missing,
+            if report.missing == 1 { "y" } else { "ies" }
+        );
+    }
+    let fatal = if args.strict {
+        !report.is_clean()
+    } else {
+        report.mismatched > 0
+    };
+    if fatal {
         std::process::exit(1);
     }
     Ok(())
