@@ -476,8 +476,9 @@ sakimori deps verify-cache --lockfile pnpm-lock.yaml
 # cargo registry cache (walks $CARGO_HOME/registry/cache/*/)
 sakimori deps verify-cache --lockfile Cargo.lock
 
-# Override the store path (Windows, monorepos with isolated stores,
-# corporate runners with non-standard layouts):
+# Override the store path (monorepos with isolated stores, corporate
+# runners with non-standard layouts). Windows defaults are auto-
+# detected (`%LOCALAPPDATA%\npm-cache\_cacache`, `%LOCALAPPDATA%\pnpm\store\v3`).
 sakimori deps verify-cache --lockfile pnpm-lock.yaml --cache /opt/pnpm-store/v3
 
 # Machine-readable for CI gating
@@ -504,10 +505,13 @@ Exit codes:
 > `<rest>-index.json` to find per-file hashes — pnpm discards the
 > tarball after extraction, so a fully coordinated rewrite of both
 > the index and every blob it references would verify clean. The
-> realistic single-file tampering pattern is caught. **pnpm v10**
-> replaced the per-package JSON index with a SQLite `index.db`;
-> v10 stores are not yet supported and `verify-cache` will surface
-> a clear `Unsupported` error rather than silently passing.
+> realistic single-file tampering pattern is caught. **pnpm v11+**
+> (the next major after v10 — v10 itself still uses JSON) replaces
+> the per-package JSON index with a single SQLite `index.db` whose
+> BLOB values use msgpackr's non-standard `useRecords: true`
+> extension. v11 stores are not yet supported and `verify-cache`
+> will surface a clear `Unsupported` error rather than silently
+> passing. Workaround until the reader lands: pin pnpm to `<11`.
 
 The same check is wrapped as a one-line GitHub Actions step —
 see [CI usage](#ci-usage-github-actions) below.
@@ -857,15 +861,15 @@ auto-picks the cache root for the runner OS. Inputs:
 | input | default | description |
 |---|---|---|
 | `lockfile` | (required) | Path to `package-lock.json`, `pnpm-lock.yaml`, or `Cargo.lock`. |
-| `cache` | (auto) | Override the store root. Required on Windows; auto-detects `~/.npm/_cacache`, `~/.local/share/pnpm/store/v3` (Linux), `~/Library/pnpm/store/v3` (macOS), `$CARGO_HOME/.cargo/registry/cache` on other platforms. |
+| `cache` | (auto) | Override the store root. Auto-detected from the runner OS — `~/.npm/_cacache` (Linux/macOS) or `%LOCALAPPDATA%\npm-cache\_cacache` (Windows) for npm; `~/.local/share/pnpm/store/v3` / `~/Library/pnpm/store/v3` / `%LOCALAPPDATA%\pnpm\store\v3` for pnpm; `$CARGO_HOME` (default `~/.cargo` or `%USERPROFILE%\.cargo`) for cargo. |
 | `format` | `text` | `text` or `json`. |
 | `version` | `v0` | sakimori release tag. |
 | `token` | `${{ github.token }}` | Used by `gh release download`. |
 
 Exit codes match the CLI: `0` clean, `1` on any mismatch / missing
-entry. **pnpm v10 SQLite stores are not yet supported** — the
+entry. **pnpm v11+ SQLite stores are not yet supported** — the
 action exits with a clear `Unsupported` error rather than passing
-silently.
+silently. (v10 still uses the JSON layout and works fine.)
 
 ### eBPF-supervised test run — job-scoped form (Linux only)
 

@@ -686,6 +686,15 @@ pub struct DepsVerifyCacheArgs {
     pub cache: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "text")]
     pub format: DepsFormat,
+    /// Also fail when blobs are merely *missing* from the cache.
+    /// Default: only `mismatch` (the actual tampering signal) fails
+    /// the run. Cargo.lock legitimately lists platform-conditional
+    /// crates (`windows-*`, `fsevent-sys`, `wasm-bindgen`, …) that
+    /// never land in a Linux runner's cache, so a strict missing
+    /// check is a false alarm there. Opt in for npm/pnpm runs where
+    /// you want post-install completeness checking too.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1254,7 +1263,26 @@ fn run_deps_verify_cache(args: DepsVerifyCacheArgs) -> Result<()> {
         }
     }
 
-    if !report.is_clean() {
+    // Threat model: mismatch = bytes don't match what the lockfile
+    // pinned = real cache-poisoning signal. Missing = blob isn't in
+    // the cache yet (normal for Cargo.lock's platform-conditional
+    // crates on a single-OS runner; not a security event). Default
+    // exit predicate is mismatch-only; `--strict` opts into the
+    // older "fail on anything not Ok" behaviour.
+    if report.missing > 0 && !args.strict {
+        eprintln!(
+            "note: {} entr{} not in cache (treated as warnings; \
+             pass --strict to fail the run on missing too)",
+            report.missing,
+            if report.missing == 1 { "y" } else { "ies" }
+        );
+    }
+    let fatal = if args.strict {
+        !report.is_clean()
+    } else {
+        report.mismatched > 0
+    };
+    if fatal {
         std::process::exit(1);
     }
     Ok(())
@@ -1268,43 +1296,65 @@ fn default_cargo_home() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("CARGO_HOME") {
         return Ok(PathBuf::from(p));
     }
-    let home = std::env::var_os("HOME")
+    Ok(home_or_userprofile()?.join(".cargo"))
+}
+
+fn home_or_userprofile() -> Result<PathBuf> {
+    std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .ok_or_else(|| {
-            anyhow::anyhow!("neither $CARGO_HOME nor $HOME set — pass --cache explicitly")
-        })?;
-    Ok(home.join(".cargo"))
+            anyhow::anyhow!("neither $HOME nor $USERPROFILE set — pass --cache explicitly")
+        })
+}
+
+fn local_app_data() -> Result<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("$LOCALAPPDATA not set — pass --cache explicitly"))
 }
 
 fn default_pnpm_store_root() -> Result<PathBuf> {
     // pnpm settings docs: storeDir defaults are
     //   Linux:   ~/.local/share/pnpm/store
     //   macOS:   ~/Library/pnpm/store
-    //   Windows: ~/AppData/Local/pnpm/store
-    // pnpm appends `v3` itself, so the path the verifier walks is
-    // <storeDir>/v3 — that's what we return. Windows isn't auto-
-    // detected here; users on Windows pass `--cache` explicitly.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("$HOME not set — pass --cache explicitly"))?;
-    let base = if cfg!(target_os = "macos") {
-        home.join("Library").join("pnpm").join("store")
+    //   Windows: %LOCALAPPDATA%\pnpm\store
+    // pnpm appends a STORE_VERSION segment itself. v8/v9/v10 use
+    // `v3`; v11+ uses `v11` (and ships a SQLite `index.db` we don't
+    // yet read — surfaces as `Unsupported`). Prefer the highest
+    // version directory present so a user on v11 gets a clear
+    // "not yet supported" message rather than a "store missing"
+    // false negative; fall back to v3 otherwise. Override with
+    // `--cache` when the layout is non-default.
+    let base = if cfg!(target_os = "windows") {
+        local_app_data()?.join("pnpm").join("store")
+    } else if cfg!(target_os = "macos") {
+        home_or_userprofile()?
+            .join("Library")
+            .join("pnpm")
+            .join("store")
     } else {
-        home.join(".local").join("share").join("pnpm").join("store")
+        home_or_userprofile()?
+            .join(".local")
+            .join("share")
+            .join("pnpm")
+            .join("store")
     };
+    let v11 = base.join("v11");
+    if v11.is_dir() {
+        return Ok(v11);
+    }
     Ok(base.join("v3"))
 }
 
 fn default_npm_cacache_root() -> Result<PathBuf> {
-    // npm puts cacache at `~/.npm/_cacache` on Linux/macOS. On
-    // Windows it's `%LOCALAPPDATA%\npm-cache\_cacache`, but the
-    // first-call MVP only targets the Unix layout — point users
-    // explicitly via `--cache` on Windows.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("$HOME not set — pass --cache explicitly"))?;
-    Ok(home.join(".npm").join("_cacache"))
+    // npm puts cacache at `~/.npm/_cacache` on Linux/macOS and at
+    // `%LOCALAPPDATA%\npm-cache\_cacache` on Windows. Override with
+    // `--cache` if your runner uses a non-default location.
+    if cfg!(target_os = "windows") {
+        return Ok(local_app_data()?.join("npm-cache").join("_cacache"));
+    }
+    Ok(home_or_userprofile()?.join(".npm").join("_cacache"))
 }
 
 fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
