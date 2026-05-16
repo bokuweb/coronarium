@@ -53,6 +53,10 @@ pub const BUNDLED_CATALOG_YAML: &str = include_str!("../iocs/coronarium-iocs.yml
 /// Returns `None` only when every candidate env var is unset, in
 /// which case the CLI tells the operator to pass `--output`.
 pub fn default_override_path() -> Option<PathBuf> {
+    // Closure (not bare `std::env::var_os`) because `var_os` is
+    // generic over `AsRef<OsStr>` and the resolver needs a concrete
+    // `Fn(&str) -> _`. Clippy is fine with this form; the bare path
+    // would also trip type inference.
     resolve_override_path(|k| std::env::var_os(k))
 }
 
