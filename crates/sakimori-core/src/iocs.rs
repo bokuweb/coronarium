@@ -261,44 +261,45 @@ fn walk_for_content(
                 continue;
             }
             walk_for_content(root, &path, skip, patterns, hits);
-        } else if ft.is_file() {
-            // Hash lazily, only if at least one Sha256 pattern
-            // applies to this basename (or is unscoped). Bare
-            // Basename matches don't need the hash at all.
-            let mut hash: Option<String> = None;
-            for pat in patterns {
-                match &pat.match_spec {
-                    MatchSpec::Basename { name: target } if name_str == target.as_str() => {
+            continue;
+        }
+
+        // Basename matches fire on both regular files and symlinks
+        // — a worm dropping a marker file as a symlink (e.g. into
+        // a tmpfs decoy) must still be flagged by name. Sha256
+        // matches only fire on regular files: following a symlink
+        // would let an attacker point at a benign target and evade
+        // the content hash.
+        if !ft.is_file() && !ft.is_symlink() {
+            continue;
+        }
+        let mut hash: Option<String> = None;
+        for pat in patterns {
+            match &pat.match_spec {
+                MatchSpec::Basename { name: target } if name_str == target.as_str() => {
+                    push_hit(pat, root, &path, hits);
+                }
+                MatchSpec::Sha256 {
+                    sha256: expected,
+                    basename,
+                } if ft.is_file() => {
+                    if let Some(b) = basename
+                        && name_str != b.as_str()
+                    {
+                        continue;
+                    }
+                    if hash.is_none() {
+                        hash = hash_file_capped(&path, MAX_HASH_BYTES);
+                    }
+                    if let Some(h) = &hash
+                        && h == expected
+                    {
                         push_hit(pat, root, &path, hits);
                     }
-                    MatchSpec::Sha256 {
-                        sha256: expected,
-                        basename,
-                    } => {
-                        if let Some(b) = basename
-                            && name_str != b.as_str()
-                        {
-                            continue;
-                        }
-                        if hash.is_none() {
-                            hash = hash_file_capped(&path, MAX_HASH_BYTES);
-                        }
-                        if let Some(h) = &hash
-                            && h == expected
-                        {
-                            push_hit(pat, root, &path, hits);
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
-        // Symlinks are not followed: a worm dropper could symlink
-        // to a benign file to escape a Sha256 match. The Basename
-        // path could in principle still match the link name, but
-        // we leave it out — the tamper module already records
-        // symlinks by target string and is the right home for that
-        // class of detection.
     }
 }
 
@@ -472,6 +473,64 @@ mod tests {
         let cat = Catalog::bundled().unwrap();
         let err = scan(&f, &cat, &BTreeSet::new()).unwrap_err().to_string();
         assert!(err.contains("not a directory"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn basename_pattern_matches_symlink_by_name_sha256_skips_it() {
+        // Regression for the codex review on 87f2a24: switching the
+        // walker from `is_file() || is_symlink()` to `is_file()`
+        // had silently dropped basename matches on symlinks. The
+        // sha256 path must still skip them (no symlink-following).
+        use std::os::unix::fs::symlink;
+        let tmp = Tmp::new();
+        let target = tmp.0.join("real-target.txt");
+        let link = tmp.0.join("dropper.js");
+        fs::write(&target, b"payload\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let expected_hash = {
+            let mut h = Sha256::new();
+            h.update(b"payload\n");
+            format!("{:x}", h.finalize())
+        };
+        let yaml = format!(
+            "version: 1\npatterns:\n\
+             - id: by-name\n  description: t\n  severity: warn\n  \
+             match: {{kind: basename, name: dropper.js}}\n\
+             - id: by-hash\n  description: t\n  severity: warn\n  \
+             match: {{kind: sha256, sha256: {expected_hash}}}\n"
+        );
+        let cat = Catalog::from_yaml(&yaml).unwrap();
+        let report = scan(&tmp.0, &cat, &BTreeSet::new()).unwrap();
+
+        let by_name: Vec<_> = report
+            .hits
+            .iter()
+            .filter(|h| h.pattern_id == "by-name")
+            .collect();
+        assert_eq!(
+            by_name.len(),
+            1,
+            "basename must match the symlink, got {:?}",
+            report.hits
+        );
+        assert_eq!(by_name[0].path, "dropper.js");
+
+        // The real target ("real-target.txt") is the only regular
+        // file matching the hash. The symlink is not followed and
+        // does not double-count.
+        let by_hash: Vec<_> = report
+            .hits
+            .iter()
+            .filter(|h| h.pattern_id == "by-hash")
+            .collect();
+        assert_eq!(
+            by_hash.len(),
+            1,
+            "sha256 must fire once (the regular file only)"
+        );
+        assert_eq!(by_hash[0].path, "real-target.txt");
     }
 
     #[test]
