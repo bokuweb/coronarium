@@ -294,6 +294,28 @@ pub enum WorkspaceCommand {
     /// files. Exits non-zero when there's any drift (suppress with
     /// `--allow-drift`).
     Diff(WorkspaceDiffArgs),
+    /// Scan a directory against the bundled known-IOC index and
+    /// report any matching files (Shai-Hulud-class fingerprints).
+    /// Exits non-zero on any Error-severity hit; Warn-severity hits
+    /// surface but don't gate. Use `--allow-id` to suppress a
+    /// pattern the operator has already triaged as benign.
+    ScanIocs(WorkspaceScanIocsArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct WorkspaceScanIocsArgs {
+    /// Directory to scan.
+    pub dir: PathBuf,
+    /// Override the bundled IOC catalog with a custom YAML file
+    /// (same schema as `crates/sakimori-core/iocs/coronarium-iocs.yml`).
+    #[arg(long, value_name = "FILE")]
+    pub index: Option<PathBuf>,
+    /// Suppress a specific pattern by id. Repeatable.
+    #[arg(long = "allow-id", value_name = "ID")]
+    pub allow_id: Vec<String>,
+    /// Emit machine-readable JSON instead of the default text report.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -393,6 +415,30 @@ pub enum PolicyCommand {
     /// block so you can pick which to deny — the suggester never
     /// auto-populates `process.deny_exec`.
     Suggest(PolicySuggestArgs),
+    /// Emit a curated rule pack for a known supply-chain attack
+    /// pattern (persistence-write, cloud-secret egress, ...) as a
+    /// ready-to-merge YAML block. See `--help` for the available
+    /// preset names.
+    Preset(PolicyPresetArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct PolicyPresetArgs {
+    /// Preset name. Known values:
+    ///   `persistence` — file.deny tripwire for launchd / systemd /
+    ///   cron / shell-rc / ~/.ssh.
+    ///   `cloud-secret-egress` — network.deny tripwire for cloud
+    ///   metadata services (AWS / GCP / Azure IMDS + STS).
+    pub name: String,
+    /// Where to write the rendered policy. Defaults to stdout.
+    #[arg(long, short = 'o')]
+    pub output: Option<PathBuf>,
+    /// Home directory used to expand `~/.ssh` etc. into absolute
+    /// paths. Defaults to `$HOME`. Only consulted by the
+    /// `persistence` preset; omitted entries cause the corresponding
+    /// per-user paths to be skipped.
+    #[arg(long, value_name = "PATH")]
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1011,6 +1057,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Policy {
             cmd: PolicyCommand::Suggest(args),
         } => run_policy_suggest(args),
+        Command::Policy {
+            cmd: PolicyCommand::Preset(args),
+        } => run_policy_preset(args),
         Command::Actions {
             cmd: ActionsCommand::Audit(args),
         } => run_actions_audit(args),
@@ -1020,6 +1069,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Workspace {
             cmd: WorkspaceCommand::Diff(args),
         } => run_workspace_diff(args),
+        Command::Workspace {
+            cmd: WorkspaceCommand::ScanIocs(args),
+        } => run_workspace_scan_iocs(args),
         Command::Daemon {
             cmd: DaemonCommand::Start(args),
         } => run_daemon_start(args).await,
@@ -1175,6 +1227,47 @@ fn run_workspace_diff(args: WorkspaceDiffArgs) -> Result<()> {
     }
 
     if !dif.is_clean() && !args.allow_drift {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_workspace_scan_iocs(args: WorkspaceScanIocsArgs) -> Result<()> {
+    use std::collections::BTreeSet;
+    let catalog = match &args.index {
+        Some(p) => sakimori_core::iocs::Catalog::from_file(p)?,
+        None => sakimori_core::iocs::Catalog::bundled()?,
+    };
+    let allow: BTreeSet<String> = args.allow_id.into_iter().collect();
+    let report = sakimori_core::iocs::scan(&args.dir, &catalog, &allow)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.is_clean() {
+        eprintln!(
+            "sakimori: scanned {} — no known IOCs matched (catalog v{}, {} pattern(s))",
+            report.root.display(),
+            catalog.version,
+            catalog.patterns.len(),
+        );
+    } else {
+        eprintln!(
+            "sakimori: {} IOC hit(s) in {} (catalog v{})\n",
+            report.hits.len(),
+            report.root.display(),
+            catalog.version,
+        );
+        for h in &report.hits {
+            let tag = match h.severity {
+                sakimori_core::iocs::Severity::Error => "ERROR",
+                sakimori_core::iocs::Severity::Warn => "WARN ",
+            };
+            println!("[{}] {}  {}", tag, h.pattern_id, h.path);
+            println!("        {}", h.description.replace('\n', " "));
+        }
+    }
+
+    if report.has_error() {
         std::process::exit(1);
     }
     Ok(())
@@ -1519,6 +1612,30 @@ fn run_policy_suggest(args: PolicySuggestArgs) -> Result<()> {
             std::fs::write(&path, yaml)
                 .with_context(|| format!("writing suggested policy to {}", path.display()))?;
             eprintln!("sakimori: wrote suggested policy to {}", path.display());
+        }
+        None => print!("{yaml}"),
+    }
+    Ok(())
+}
+
+fn run_policy_preset(args: PolicyPresetArgs) -> Result<()> {
+    use std::str::FromStr;
+    let preset = sakimori_core::presets::Preset::from_str(&args.name)?;
+    let home = args
+        .home
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("HOME").ok());
+    let ctx = sakimori_core::presets::PresetCtx { home };
+    let yaml = sakimori_core::presets::format_yaml(preset, &ctx)?;
+    match args.output {
+        Some(path) => {
+            std::fs::write(&path, yaml)
+                .with_context(|| format!("writing preset policy to {}", path.display()))?;
+            eprintln!(
+                "sakimori: wrote preset `{}` to {}",
+                preset.name(),
+                path.display()
+            );
         }
         None => print!("{yaml}"),
     }

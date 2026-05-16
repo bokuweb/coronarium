@@ -573,16 +573,25 @@ of value-per-implementation-cost.
     with `deps watch` — the proxy is the only layer that can
     catch the script *before* it runs.
 16. **Persistence-write rule pack** (Shai-Hulud-class defence) —
-    a curated `file.deny` rule set covering the locations
-    worm-style malware writes for OS-level persistence:
-    `~/Library/LaunchAgents/**`, `~/Library/LaunchDaemons/**`,
-    `/Library/Launch{Agents,Daemons}/**`, `~/.config/systemd/user/**`,
-    `/etc/systemd/system/**`, crontab spool dirs, `~/.ssh/**`
-    (especially `authorized_keys` / `config`), shell rc files
-    (`~/.bashrc`, `~/.zshrc`, `~/.profile`), and Claude/VS Code
-    workspace hooks (`.claude/**.mjs`, `.vscode/tasks.json`).
-    Ships as `coronarium policy preset persistence` that prints
-    a ready-to-merge YAML block. Combined with the v0.23
+    ✅ implemented as `sakimori policy preset persistence`. Renders
+    a `file.deny` YAML block covering OS-level persistence
+    locations: macOS launchd (`/Library/Launch{Agents,Daemons}/`,
+    `$HOME/Library/Launch{Agents,Daemons}/`), Linux systemd
+    (`/etc/systemd/system/`, `$HOME/.config/systemd/user/`,
+    `$HOME/.config/autostart/`), cron spool / drop-in dirs
+    (`/var/spool/cron/`, `/etc/cron.{d,hourly,daily,weekly,monthly}/`,
+    `/etc/init.d/`), SSH (`$HOME/.ssh/`), and shell rc / profile
+    files (`.bashrc`, `.bash_profile`, `.bash_logout`, `.profile`,
+    `.zshrc`, `.zprofile`, `.zshenv`). Per-user paths expand from
+    `$HOME` or `--home /path`; omitted home falls back to system
+    paths plus a comment noting the gap. The preset deliberately
+    exceeds the Linux 8-entry kernel cap on `file.deny` under
+    `mode: block` — the YAML header tells the operator to prune to
+    the 8 highest-value entries or use `mode: audit` (uncapped).
+    Workspace-relative paths (`.claude/setup.mjs`, `.vscode/tasks.json`)
+    are deliberately *not* in this preset — the file matcher is
+    absolute-prefix only, so those belong to the IOC workspace
+    scanner (item 18). Combined with the v0.23
     attribution layer, a write to any of these paths from a
     package-manager-attributed subtree is the highest-confidence
     "this install is malicious" signal sakimori can produce —
@@ -590,40 +599,47 @@ of value-per-implementation-cost.
     legitimate reason for `npm install` to touch
     `~/Library/LaunchAgents/`. Block-mode SIGKILLs the writer.
 17. **Cloud-credential exfiltration tripwire** (Shai-Hulud-class
-    defence) — a curated `network.deny` rule pack covering the
-    egress patterns observed in the May 2026 wave: AWS IMDS
-    (`169.254.169.254`), `sts.amazonaws.com`,
-    `secretsmanager.*.amazonaws.com`, `ssm.*.amazonaws.com`,
-    GCP metadata (`metadata.google.internal`,
-    `169.254.169.254` with `Metadata-Flavor: Google`), Azure IMDS,
-    Vault default ports, and the well-known crypto-wallet
-    exfiltration endpoints. Pairs with v0.33's SNI-based proxy
-    egress filter so the rule fires on the *hostname the client
-    asked for*, not a CDN-rotated IP. Attribution surface: when
-    the offending PID's ancestor chain contains a package
-    manager (already classified by `attribution::Attribution`),
-    the event is upgraded to a distinct `cloud_secret_egress`
-    category in the JSON log + step summary, with a different
-    UI affordance — "your install just touched your cloud
-    credentials" is qualitatively different from "your build
-    talked to S3". Ships as
-    `coronarium policy preset cloud-secret-egress`.
-18. **Known-IOC workspace scanner** — extend `coronarium
-    workspace diff` (and `sakimori run --snapshot-workspace`)
-    with a known-bad-path index of file paths and content
-    fingerprints observed in current supply-chain worm campaigns:
-    `.claude/setup.mjs`, `.github/workflows/codeql_analysis.yml`
-    (when the repo doesn't legitimately use CodeQL),
-    `{dune_word}-{dune_word}-{3-digit}` repo names created via
-    the GitHub API during install, and authored-by
-    `claude <claude@users.noreply.github.com>` commits where the
-    user did not invoke Claude. Distinct from the generic
-    workspace-drift check because it elevates specific drift
-    patterns from "something changed" to "this is the Shai-Hulud
-    fingerprint". The index ships as a versioned YAML
-    (`coronarium-iocs.yml`) bundled with the binary, refreshable
-    by `coronarium iocs update`. Conservatively scoped: hits
-    surface as ❌ in the step summary; no auto-quarantine.
+    defence) — ✅ first slice implemented as
+    `sakimori policy preset cloud-secret-egress`. Renders a
+    `network.deny` YAML block covering the link-local IMDS IP
+    (`169.254.169.254` — AWS / GCP / Azure all share it),
+    `metadata.google.internal`, `metadata.azure.com`, and
+    `sts.amazonaws.com`. `NetRule.target` is hostname/IP/CIDR
+    (no wildcards in the supervisor layer), so wildcarded
+    endpoints (`secretsmanager.*.amazonaws.com`,
+    `ssm.*.amazonaws.com`, regional STS variants) are not in
+    this preset — they'll land once the proxy gains a deny-list
+    HostMatcher and the preset learns to emit SNI patterns
+    alongside the cgroup-level rules. Follow-ups still on the
+    table: Vault default ports, crypto-wallet exfiltration
+    endpoints, and the "package-manager-attributed →
+    cloud_secret_egress" event category in the JSON log + step
+    summary (the proxy-side SNI deny pairing is the natural
+    pre-req for the latter).
+18. **Known-IOC workspace scanner** — ✅ first slice implemented as
+    `sakimori workspace scan-iocs <DIR>`. New
+    `sakimori_core::iocs` module walks the workspace honouring the
+    same skip list as `tamper` (`.git`, `node_modules`, `target`,
+    …) and reports hits against a bundled IOC catalog
+    (`crates/sakimori-core/iocs/coronarium-iocs.yml`, loaded via
+    `include_str!`). Pattern shapes: `relative_path` (exact-match
+    from the workspace root; cheap stat-only check) and `basename`
+    (basename anywhere in the tree; triggers the walk). Per-pattern
+    severity is `error` (fails the CLI with non-zero exit; gates
+    CI) or `warn` (surfaces only); operators suppress a triaged
+    false positive with `--allow-id <id>`. Custom feeds via
+    `--index <file>` (same schema). Hits are sorted stably by
+    `(pattern_id, path)` for snapshot-friendly output. Bundled
+    catalog seeded with two Shai-Hulud markers: the
+    `.claude/setup.mjs` drop (error) and the spoofed
+    `codeql_analysis.yml` (warn — real CodeQL workflows are
+    confusable). Follow-ups: content-fingerprint patterns (hash of
+    a known-bad blob), commit-author IOCs (the
+    `claude@users.noreply.github.com` worm marker — needs git
+    inspection, not just file walk), repo-name IOCs (the
+    dune-word-pattern names — needs GitHub API), and
+    `sakimori iocs update` to refresh the bundled YAML from an
+    upstream feed.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):

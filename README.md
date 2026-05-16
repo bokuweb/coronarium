@@ -745,6 +745,43 @@ commented `# observed_exec:` block — `process.deny_exec` is
 deliberately left empty because the suggester can't know which of
 the binaries the build actually wanted.
 
+**Curated rule packs (`policy preset`):** ready-to-merge YAML blocks
+for known supply-chain attack patterns. Currently shipped:
+
+- `sakimori policy preset persistence` — `file.deny` tripwire for
+  OS-level persistence writes (launchd / systemd / cron / shell rc
+  / `~/.ssh`). Per-user paths expand from `$HOME` (override with
+  `--home /path`); system paths always included.
+- `sakimori policy preset cloud-secret-egress` — `network.deny`
+  tripwire for AWS / GCP / Azure IMDS and STS-style secret
+  endpoints. Pairs with `sakimori proxy start --network-allow ...`
+  for SNI-level enforcement.
+
+Both presets print to stdout (or `-o policy.yml`) with explanatory
+comment headers so the operator can pick the entries that fit their
+threat model and merge into an existing policy. The persistence
+preset ships in `mode: audit` because its full list exceeds the
+Linux 8-entry kernel cap on `file.deny` under `mode: block`; to
+enforce, prune to your 8 most critical paths and flip the `mode:`
+field to `block`. The cloud-secret-egress preset ships in
+`mode: block` (no cap on `network.deny`).
+
+**Known-IOC workspace scan (`workspace scan-iocs`):** walk a
+workspace and flag files whose existence is a known supply-chain
+compromise marker (e.g. `.claude/setup.mjs` dropped by the
+Shai-Hulud npm worm). Distinct from `workspace diff` — diff catches
+"something changed during the build," scan-iocs catches "this file
+exists at all, which it shouldn't." The catalog is shipped bundled
+in the binary (versioned YAML); override with `--index <file>` for
+private feeds, suppress a triaged false positive with `--allow-id
+<id>`. Exits non-zero on any Error-severity hit so it composes with
+CI gates; Warn-severity hits surface but don't gate.
+
+```bash
+sakimori workspace scan-iocs $GITHUB_WORKSPACE
+sakimori workspace scan-iocs . --json
+```
+
 The HTML report includes:
 - verdict (ALLOW / DENY), kind, pid, comm
 - **host column** (PTR-resolved reverse DNS for connect events)
