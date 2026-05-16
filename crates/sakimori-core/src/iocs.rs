@@ -19,11 +19,14 @@
 
 use std::{
     collections::BTreeSet,
+    fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::tamper::DEFAULT_SKIP_DIRS;
 
@@ -52,7 +55,25 @@ pub enum MatchSpec {
     RelativePath { path: String },
     /// File basename, matched anywhere in the tree.
     Basename { name: String },
+    /// Content fingerprint — SHA-256 of the file contents in lowercase
+    /// hex. Walks the tree like `Basename` does. Optional `basename`
+    /// narrows which files are hashed so the catalog can stay cheap
+    /// (a bare `Sha256` with no `basename` would force hashing every
+    /// regular file under the root). Files larger than
+    /// [`MAX_HASH_BYTES`] are skipped without being hashed.
+    Sha256 {
+        sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basename: Option<String>,
+    },
 }
+
+/// Hard cap on file size for content-fingerprint matches. The scanner
+/// silently skips bigger files rather than spending unbounded IO; in
+/// practice every worm dropper observed in the wild has been < 1 MiB,
+/// and an attacker who pads a 16 MiB blob is also one a `Basename`
+/// pattern would catch. 16 MiB is a generous margin over that.
+pub const MAX_HASH_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pattern {
@@ -94,6 +115,22 @@ impl Catalog {
         for p in &self.patterns {
             if !seen.insert(p.id.as_str()) {
                 anyhow::bail!("duplicate IOC pattern id `{}`", p.id);
+            }
+            if let MatchSpec::Sha256 { sha256, .. } = &p.match_spec {
+                // 64 lowercase hex chars. Reject early so a typo in
+                // the catalog surfaces at load time, not at scan time
+                // (where it would silently never match).
+                if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "IOC pattern `{}`: sha256 must be 64 hex chars, got `{}` (len {})",
+                        p.id,
+                        sha256,
+                        sha256.len()
+                    );
+                }
+                if sha256.chars().any(|c| c.is_ascii_uppercase()) {
+                    anyhow::bail!("IOC pattern `{}`: sha256 must be lowercase hex", p.id);
+                }
             }
         }
         Ok(())
@@ -172,18 +209,23 @@ pub fn scan(root: &Path, catalog: &Catalog, allow_ids: &BTreeSet<String>) -> Res
         }
     }
 
-    // Basename patterns require a walk. Only walk if at least one
-    // such pattern is present and unallowed — saves the IO cost
-    // when the catalog only has relative_path entries.
-    let basename_patterns: Vec<&Pattern> = catalog
+    // Basename + sha256 patterns require a walk. Only walk if at
+    // least one such pattern is present and unallowed — saves the
+    // IO cost when the catalog only has relative_path entries.
+    let walk_patterns: Vec<&Pattern> = catalog
         .patterns
         .iter()
         .filter(|p| !allow_ids.contains(&p.id))
-        .filter(|p| matches!(p.match_spec, MatchSpec::Basename { .. }))
+        .filter(|p| {
+            matches!(
+                p.match_spec,
+                MatchSpec::Basename { .. } | MatchSpec::Sha256 { .. }
+            )
+        })
         .collect();
 
-    if !basename_patterns.is_empty() {
-        walk_for_basenames(&canon, &canon, &skip, &basename_patterns, &mut report.hits);
+    if !walk_patterns.is_empty() {
+        walk_for_content(&canon, &canon, &skip, &walk_patterns, &mut report.hits);
     }
 
     // Stable order: pattern id then path. Useful both for human
@@ -195,14 +237,14 @@ pub fn scan(root: &Path, catalog: &Catalog, allow_ids: &BTreeSet<String>) -> Res
     Ok(report)
 }
 
-fn walk_for_basenames(
+fn walk_for_content(
     root: &Path,
     dir: &Path,
     skip: &BTreeSet<&str>,
     patterns: &[&Pattern],
     hits: &mut Vec<Hit>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match fs::read_dir(dir) {
         Ok(it) => it,
         Err(_) => return,
     };
@@ -218,26 +260,77 @@ fn walk_for_basenames(
             if skip.contains(name_str.as_ref()) {
                 continue;
             }
-            walk_for_basenames(root, &path, skip, patterns, hits);
-        } else if ft.is_file() || ft.is_symlink() {
+            walk_for_content(root, &path, skip, patterns, hits);
+        } else if ft.is_file() {
+            // Hash lazily, only if at least one Sha256 pattern
+            // applies to this basename (or is unscoped). Bare
+            // Basename matches don't need the hash at all.
+            let mut hash: Option<String> = None;
             for pat in patterns {
-                if let MatchSpec::Basename { name: target } = &pat.match_spec
-                    && name_str == target.as_str()
-                {
-                    let rel = path
-                        .strip_prefix(root)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
-                    hits.push(Hit {
-                        pattern_id: pat.id.clone(),
-                        description: pat.description.clone(),
-                        severity: pat.severity,
-                        path: normalise_rel(&rel),
-                    });
+                match &pat.match_spec {
+                    MatchSpec::Basename { name: target } if name_str == target.as_str() => {
+                        push_hit(pat, root, &path, hits);
+                    }
+                    MatchSpec::Sha256 {
+                        sha256: expected,
+                        basename,
+                    } => {
+                        if let Some(b) = basename
+                            && name_str != b.as_str()
+                        {
+                            continue;
+                        }
+                        if hash.is_none() {
+                            hash = hash_file_capped(&path, MAX_HASH_BYTES);
+                        }
+                        if let Some(h) = &hash
+                            && h == expected
+                        {
+                            push_hit(pat, root, &path, hits);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
+        // Symlinks are not followed: a worm dropper could symlink
+        // to a benign file to escape a Sha256 match. The Basename
+        // path could in principle still match the link name, but
+        // we leave it out — the tamper module already records
+        // symlinks by target string and is the right home for that
+        // class of detection.
     }
+}
+
+fn push_hit(pat: &Pattern, root: &Path, path: &Path, hits: &mut Vec<Hit>) {
+    let rel = path
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+    hits.push(Hit {
+        pattern_id: pat.id.clone(),
+        description: pat.description.clone(),
+        severity: pat.severity,
+        path: normalise_rel(&rel),
+    });
+}
+
+fn hash_file_capped(path: &Path, max_bytes: u64) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if meta.len() > max_bytes {
+        return None;
+    }
+    let mut f = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn normalise_rel(path: &str) -> String {
@@ -379,6 +472,113 @@ mod tests {
         let cat = Catalog::bundled().unwrap();
         let err = scan(&f, &cat, &BTreeSet::new()).unwrap_err().to_string();
         assert!(err.contains("not a directory"), "got: {err}");
+    }
+
+    #[test]
+    fn sha256_pattern_matches_by_content_not_path() {
+        let tmp = Tmp::new();
+        let body = b"// shai-hulud dropper payload\n";
+        // Same payload at two different paths — both must hit.
+        fs::create_dir_all(tmp.0.join("a")).unwrap();
+        fs::create_dir_all(tmp.0.join("b/nested")).unwrap();
+        fs::write(tmp.0.join("a/innocent-name.js"), body).unwrap();
+        fs::write(tmp.0.join("b/nested/another.js"), body).unwrap();
+        fs::write(tmp.0.join("decoy.js"), b"// completely different\n").unwrap();
+
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(body);
+            format!("{:x}", h.finalize())
+        };
+        let yaml = format!(
+            "version: 1\npatterns:\n\
+             - id: known-dropper\n  description: t\n  severity: error\n  \
+             match: {{kind: sha256, sha256: {expected}}}\n"
+        );
+        let cat = Catalog::from_yaml(&yaml).unwrap();
+        let report = scan(&tmp.0, &cat, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            report.hits.len(),
+            2,
+            "both copies must hit, got {:?}",
+            report.hits
+        );
+        assert!(report.has_error());
+    }
+
+    #[test]
+    fn sha256_with_basename_scope_skips_other_filenames() {
+        // Same bytes at two paths. Catalog scopes to one basename
+        // → only that file is hashed + matched.
+        let tmp = Tmp::new();
+        let body = b"payload\n";
+        fs::write(tmp.0.join("dropper.js"), body).unwrap();
+        fs::write(tmp.0.join("README.md"), body).unwrap();
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(body);
+            format!("{:x}", h.finalize())
+        };
+        let yaml = format!(
+            "version: 1\npatterns:\n\
+             - id: scoped\n  description: t\n  severity: warn\n  \
+             match: {{kind: sha256, sha256: {expected}, basename: dropper.js}}\n"
+        );
+        let cat = Catalog::from_yaml(&yaml).unwrap();
+        let report = scan(&tmp.0, &cat, &BTreeSet::new()).unwrap();
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].path, "dropper.js");
+    }
+
+    #[test]
+    fn sha256_mismatch_does_not_fire() {
+        let tmp = Tmp::new();
+        fs::write(tmp.0.join("a.txt"), b"hello").unwrap();
+        // 64 zeros — won't match anything real.
+        let cat = Catalog::from_yaml(
+            "version: 1\npatterns:\n\
+             - id: never\n  description: t\n  severity: error\n  \
+             match: {kind: sha256, sha256: 0000000000000000000000000000000000000000000000000000000000000000}\n",
+        )
+        .unwrap();
+        let report = scan(&tmp.0, &cat, &BTreeSet::new()).unwrap();
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn sha256_catalog_rejects_short_or_uppercase_hex() {
+        let short = "version: 1\npatterns:\n\
+                     - id: x\n  description: t\n  severity: warn\n  \
+                     match: {kind: sha256, sha256: deadbeef}\n";
+        let err = Catalog::from_yaml(short).unwrap_err().to_string();
+        assert!(err.contains("64 hex chars"), "got: {err}");
+
+        let upper = format!(
+            "version: 1\npatterns:\n\
+             - id: y\n  description: t\n  severity: warn\n  \
+             match: {{kind: sha256, sha256: {}}}\n",
+            "A".repeat(64)
+        );
+        let err = Catalog::from_yaml(&upper).unwrap_err().to_string();
+        assert!(err.contains("lowercase"), "got: {err}");
+    }
+
+    #[test]
+    fn sha256_skips_files_over_size_cap() {
+        // Build a catalog whose sha256 we'll never compute (the
+        // file is > MAX_HASH_BYTES so the hasher short-circuits).
+        // Match is by-basename in addition so the test is fast.
+        let tmp = Tmp::new();
+        // Write a small placeholder; we'll override MAX_HASH_BYTES
+        // by checking the hash_file_capped helper directly because
+        // 16 MiB writes would make the test slow.
+        let f = tmp.0.join("payload");
+        fs::write(&f, b"abc").unwrap();
+        // 1-byte cap → 3-byte file is over the cap → returns None.
+        assert!(hash_file_capped(&f, 1).is_none());
+        // Plenty-large cap → hashes fine.
+        let h = hash_file_capped(&f, 1024).expect("hash should succeed under the cap");
+        assert_eq!(h.len(), 64);
     }
 
     #[test]
