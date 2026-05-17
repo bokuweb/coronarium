@@ -886,6 +886,34 @@ is genuinely flaky (e.g. nanos-based tmpdir collisions under
 parallel runs) re-run once and, if it still fails, fix the flake
 in a separate commit rather than ignoring it.
 
+## DCO sign-off (every commit, no exceptions)
+
+This repo runs a DCO check (`.github/workflows/dco.yml`) that fails
+any push whose commits lack a `Signed-off-by:` trailer. **Always
+pass `-s` / `--signoff` to `git commit`** — including amends,
+cherry-picks, and rebases. Agents have repeatedly tripped on this
+because the default Claude Code commit flow does not add `-s`.
+
+```bash
+git commit -s -m "fix(thing): ..."
+# or, retroactively, on the current branch:
+git rebase --signoff <merge-base> && git push --force-with-lease
+```
+
+Two practical rules so this stops costing a round-trip:
+
+1. **First commit on a branch**: always `git commit -s`. If you
+   forget, the DCO job in CI is your reminder — fix with
+   `git rebase --signoff origin/main` then `--force-with-lease`.
+2. **Do not add `Co-Authored-By: Claude ...` trailers.** This
+   repo's auto-mode classifier blocks them as misrepresented
+   authorship. The author identity is whatever `git config user.*`
+   resolves to; the `Signed-off-by:` line is the only attribution
+   trailer the project wants.
+
+The detailed DCO text lives in [CONTRIBUTING.md](CONTRIBUTING.md);
+this section is the operational shorthand so you don't forget.
+
 ## Testing conventions
 
 - **Test-first whenever possible.** Handler traits are specifically
