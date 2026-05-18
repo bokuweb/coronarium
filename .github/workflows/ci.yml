@@ -30,9 +30,17 @@ jobs:
       # mutable third-party tags (`@v0`) trip an Error finding, so
       # we eat our own dogfood and pin the action by commit. Bump
       # the comment + SHA when cutting a new floating-v0 release.
+      #
+      # `version: v0` is required because `job/pre.js` derives the
+      # release tag from `GITHUB_ACTION_REF`, which here is the
+      # 40-char SHA. The installer treats unknown refs as literal
+      # release tags and 404s. Passing `version` explicitly skips
+      # that path — supply-chain integrity stays on the SHA pin,
+      # the installer just learns which release tarball to fetch.
       - uses: bokuweb/sakimori/job@8491d10e50cf65e438bedb87cd6f4e496140ac29 # v0
         with:
           mode: audit
+          version: v0
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
