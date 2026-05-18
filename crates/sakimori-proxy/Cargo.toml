@@ -53,7 +53,11 @@ toml = { workspace = true }
 hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "logging", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 webpki-roots = "0.26"
-rustls-pemfile = "2"
+# NB: PEM parsing uses `rustls_pki_types::pem::PemObject` (reached
+# via `hudsucker::rustls::pki_types`). The `rustls-pemfile` crate
+# would be the obvious dep but it was archived in August 2025
+# (RUSTSEC-2025-0134) and its maintainers point users at
+# rustls-pki-types' built-in `PemObject` trait.
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -223,11 +223,12 @@ fn https_get_through_proxy(
     target_url: &str,
 ) -> Result<(u16, Vec<u8>), String> {
     use rustls::RootCertStore;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
 
     let pem_bytes = std::fs::read(proxy_ca_pem).map_err(|e| e.to_string())?;
     let mut roots = RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(&pem_bytes);
-    for cert in rustls_pemfile::certs(&mut cursor) {
+    for cert in CertificateDer::pem_slice_iter(&pem_bytes) {
         let cert = cert.map_err(|e| e.to_string())?;
         roots.add(cert).map_err(|e| e.to_string())?;
     }

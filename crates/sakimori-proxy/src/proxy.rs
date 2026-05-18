@@ -429,6 +429,8 @@ fn build_upstream_client_with_extra_roots(
     // that re-export keeps us off the workspace's direct
     // `rustls 0.23` dep — `hyper-rustls 0.26` won't accept types
     // from a different rustls crate compilation unit.
+    use hudsucker::rustls::pki_types::CertificateDer;
+    use hudsucker::rustls::pki_types::pem::PemObject;
     use hudsucker::rustls::{ClientConfig, RootCertStore};
 
     // `webpki_roots::TLS_SERVER_ROOTS` is `&[TrustAnchor<'static>]`
@@ -441,10 +443,15 @@ fn build_upstream_client_with_extra_roots(
     for path in extras {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading --upstream-ca-file {}", path.display()))?;
-        let mut cursor = std::io::Cursor::new(&bytes);
         let mut file_added = 0usize;
-        for cert in rustls_pemfile::certs(&mut cursor) {
-            let cert = cert.with_context(|| format!("parsing PEM cert in {}", path.display()))?;
+        // PEM parsing via `rustls_pki_types::pem::PemObject` —
+        // the `rustls-pemfile` crate was archived in August 2025
+        // (RUSTSEC-2025-0134) and its maintainers redirect users
+        // here. `CertificateDer::pem_slice_iter` yields one
+        // owned cert per BEGIN/END CERTIFICATE block.
+        for cert in CertificateDer::pem_slice_iter(&bytes) {
+            let cert =
+                cert.map_err(|e| anyhow::anyhow!("parsing PEM cert in {}: {e}", path.display()))?;
             roots
                 .add(cert)
                 .with_context(|| format!("adding cert from {}", path.display()))?;
