@@ -142,6 +142,16 @@ pub struct ProxyConfig {
     /// rewriters / lifecycle gate fire on internal-mirror traffic.
     /// See [`RegistryHosts`].
     pub registries: RegistryHosts,
+    /// PEM-encoded CA certificate files to add to the rustls
+    /// **upstream** trust store. Needed when the proxy forwards to
+    /// an internal mirror (Verdaccio, Artifactory, GitHub Packages
+    /// internal, Takumi Guard, …) whose TLS chain is signed by a
+    /// private CA that webpki-roots doesn't carry. Empty (default)
+    /// preserves the original `with_rustls_client()` behaviour
+    /// byte-for-byte. Each file is parsed at startup; a missing
+    /// file or a PEM that contains zero certs is a hard error so
+    /// the user knows the trust hole was never closed.
+    pub extra_upstream_roots: Vec<std::path::PathBuf>,
 }
 
 impl ProxyConfig {
@@ -171,6 +181,7 @@ impl ProxyConfig {
             lifecycle_strip_limits: crate::lifecycle::StripLimits::default(),
             lifecycle_strip_cache_dir: None,
             registries: RegistryHosts::default(),
+            extra_upstream_roots: Vec::new(),
         })
     }
 }
@@ -361,15 +372,115 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
     };
 
     // `.build()` in hudsucker 0.22 returns Proxy<…> directly; no Result.
-    let proxy = Proxy::builder()
-        .with_addr(cfg.listen)
-        .with_rustls_client()
-        .with_ca(authority)
-        .with_http_handler(handler)
+    //
+    // Branch on whether the user supplied any extra upstream roots.
+    // The empty path stays on hudsucker's built-in
+    // `with_rustls_client()` so we don't perturb the default code
+    // path. With extras, we build the same connector shape
+    // (`https_or_http()` + `enable_http1()` +
+    // `http1_title_case_headers(true)` +
+    // `http1_preserve_header_case(true)`) but with an enlarged
+    // root store. HTTP/2 is deliberately NOT enabled — hudsucker
+    // only enables it under its own `http2` feature, which this
+    // crate doesn't opt into. Keeping HTTP/1-only matches today's
+    // behaviour byte-for-byte.
+    if cfg.extra_upstream_roots.is_empty() {
+        let proxy = Proxy::builder()
+            .with_addr(cfg.listen)
+            .with_rustls_client()
+            .with_ca(authority)
+            .with_http_handler(handler)
+            .build();
+        log::info!("sakimori-proxy listening on {}", cfg.listen);
+        proxy.start().await.context("proxy.start()")
+    } else {
+        let client = build_upstream_client_with_extra_roots(&cfg.extra_upstream_roots)?;
+        let proxy = Proxy::builder()
+            .with_addr(cfg.listen)
+            .with_client(client)
+            .with_ca(authority)
+            .with_http_handler(handler)
+            .build();
+        log::info!(
+            "sakimori-proxy listening on {} (with {} extra upstream root(s))",
+            cfg.listen,
+            cfg.extra_upstream_roots.len(),
+        );
+        proxy.start().await.context("proxy.start()")
+    }
+}
+
+/// Build a hyper client whose rustls config trusts the standard
+/// webpki-roots PLUS each PEM file in `extras`. Used by `run()`
+/// when `ProxyConfig.extra_upstream_roots` is non-empty.
+///
+/// Mirrors hudsucker 0.22's `with_rustls_client()` connector
+/// shape (HTTP/1 only, title-case + preserve-case headers) so the
+/// only behavioural delta vs the default path is the root store.
+fn build_upstream_client_with_extra_roots(
+    extras: &[std::path::PathBuf],
+) -> Result<
+    hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        hudsucker::Body,
+    >,
+> {
+    // hudsucker re-exports rustls 0.22 via tokio-rustls. Using
+    // that re-export keeps us off the workspace's direct
+    // `rustls 0.23` dep — `hyper-rustls 0.26` won't accept types
+    // from a different rustls crate compilation unit.
+    use hudsucker::rustls::{ClientConfig, RootCertStore};
+
+    // `webpki_roots::TLS_SERVER_ROOTS` is `&[TrustAnchor<'static>]`
+    // and `RootCertStore: Extend<TrustAnchor<'static>>`, so this
+    // populates the store with every webpki root in one shot.
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut added = 0usize;
+    for path in extras {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading --upstream-ca-file {}", path.display()))?;
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let mut file_added = 0usize;
+        for cert in rustls_pemfile::certs(&mut cursor) {
+            let cert = cert.with_context(|| format!("parsing PEM cert in {}", path.display()))?;
+            roots
+                .add(cert)
+                .with_context(|| format!("adding cert from {}", path.display()))?;
+            file_added += 1;
+            added += 1;
+        }
+        if file_added == 0 {
+            anyhow::bail!(
+                "--upstream-ca-file {} contained zero PEM certificates",
+                path.display()
+            );
+        }
+    }
+    log::info!(
+        "upstream trust store: {} webpki root(s) + {} extra cert(s) from {} file(s)",
+        webpki_roots::TLS_SERVER_ROOTS.len(),
+        added,
+        extras.len(),
+    );
+
+    let tls = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
         .build();
 
-    log::info!("sakimori-proxy listening on {}", cfg.listen);
-    proxy.start().await.context("proxy.start()")
+    Ok(
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .http1_title_case_headers(true)
+            .http1_preserve_header_case(true)
+            .build(https),
+    )
 }
 
 fn rcgen_cert_from_pem(pem: &[u8]) -> Result<rcgen::Certificate> {

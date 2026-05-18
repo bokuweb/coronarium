@@ -299,7 +299,7 @@ sakimori proxy start [OPTIONS]
 | **Egress allow-list** | `--network-allow <HOST>` (repeatable), `--network-allow-file <PATH>` | Default-deny hostname filter. Patterns: `host.example.com` (exact) or `*.example.com` (any subdomain, excludes apex). Off by default. |
 | **Install log + advisories** | `--no-install-log`, `--install-log <PATH>` | The local-first append-only audit log feeding `sakimori advisories scan`. On by default at `~/.sakimori/installs.jsonl`. |
 | **OTLP fan-out** | `--otlp-endpoint <URL>`, `--otlp-header <K=V>` (repeatable) | Mirror every allowed install as an OTLP/HTTP `LogRecord` to Datadog / Honeycomb / Loki / a self-run otel-collector. |
-| **Custom registries** | `--npm-registry`, `--pypi-registry`, `--pypi-files-host`, `--cargo-registry-host`, `--cargo-sparse-host`, `--nuget-registry` (all repeatable), `--registries-config <FILE>` | Teach the proxy about internal mirrors / replacement registries so the rewriters + lifecycle gate fire on their traffic too. See the [Custom registries](#custom--internal-registries) subsection below. |
+| **Custom registries** | `--npm-registry`, `--pypi-registry`, `--pypi-files-host`, `--cargo-registry-host`, `--cargo-sparse-host`, `--nuget-registry` (all repeatable), `--registries-config <FILE>`, `--upstream-ca-file <PATH>` (repeatable) | Teach the proxy about internal mirrors / replacement registries so the rewriters + lifecycle gate fire on their traffic too. `--upstream-ca-file` adds a PEM CA to the upstream rustls trust store for mirrors behind a private CA. See the [Custom registries](#custom--internal-registries) subsection below. |
 
 **First-run side effect**: generates a self-signed root CA at the
 config dir and prints the OS-specific trust command. Subsequent runs
@@ -382,6 +382,19 @@ sakimori proxy start \
     --registries-config /etc/sakimori/registries.toml \
     --network-allow npm.corp.internal \
     --network-allow pypi.corp.internal
+```
+
+If the internal mirror's TLS chain is signed by a **private CA**
+not in the `webpki-roots`-shipped trust store, pass each CA PEM
+file with `--upstream-ca-file` (repeatable). Without this the
+upstream handshake fails with `UnknownIssuer` even when the
+hostname is on `--registries-config`:
+
+```bash
+sakimori proxy start \
+    --registries-config /etc/sakimori/registries.toml \
+    --upstream-ca-file /etc/ssl/corp-root-ca.pem \
+    --upstream-ca-file /etc/ssl/intermediate.pem
 ```
 
 **Non-goals** (intentionally not done):
