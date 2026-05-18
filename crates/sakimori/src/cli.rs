@@ -850,6 +850,19 @@ pub struct ProxyStartArgs {
     /// ```
     #[arg(long = "registries-config", value_name = "FILE")]
     pub registries_config: Option<PathBuf>,
+    /// PEM-encoded CA certificate file to add to the rustls
+    /// upstream trust store. Repeatable. Needed when sakimori
+    /// proxies traffic to an internal mirror whose TLS chain is
+    /// signed by a private CA not present in the
+    /// `webpki-roots`-shipped trust store (Verdaccio, JFrog
+    /// Artifactory / Nexus / GitHub Packages internal,
+    /// Takumi Guard, …). Without this, the upstream handshake
+    /// fails with `UnknownIssuer` even when `--registries-config`
+    /// names the mirror's hostname. Each file is parsed at
+    /// startup; a missing file or zero-cert PEM hard-errors so
+    /// the trust hole can't open silently.
+    #[arg(long = "upstream-ca-file", value_name = "PATH")]
+    pub upstream_ca_file: Vec<PathBuf>,
 }
 
 fn parse_kv(s: &str) -> std::result::Result<(String, String), String> {
@@ -1197,6 +1210,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 lifecycle_strip_limits: sakimori_proxy::lifecycle::StripLimits::default(),
                 lifecycle_strip_cache_dir,
                 registries,
+                extra_upstream_roots: args.upstream_ca_file,
             };
             sakimori_proxy::run(cfg).await?;
             Ok(())

@@ -2090,6 +2090,8 @@ dependencies = [
  "http",
  "http-body-util",
  "hudsucker",
+ "hyper-rustls",
+ "hyper-util",
  "log",
  "proptest",
  "rcgen",
@@ -2103,8 +2105,10 @@ dependencies = [
  "tar",
  "time",
  "tokio",
+ "tokio-rustls",
  "toml",
  "ureq",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
