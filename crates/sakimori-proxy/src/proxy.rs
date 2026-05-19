@@ -1306,21 +1306,30 @@ fn strip_failure_response(
 
 /// Speculative pre-strip on the post-rewrite packument. Called from
 /// the npm packument response branch when `--lifecycle-policy strip`
-/// is on. Finds the version that `dist-tags.latest` resolves to,
-/// fetches its tarball directly from the upstream registry (bypassing
-/// the proxy itself to avoid a recursion), runs `strip_npm_tarball`,
-/// populates the strip cache, and reapplies the cache to the
-/// packument so npm receives integrity values that match the bytes
-/// the tarball handler will serve. Bounded by a 10-second wall-clock
-/// budget — on any failure we leave the packument unchanged and let
-/// the lazy tarball-path strip take over.
+/// is on. Iterates over every entry in `dist-tags` (deduped by
+/// target version, `latest` always first, capped at
+/// [`MAX_PRE_STRIP_TAGS`]), fetches each version's tarball directly
+/// from the upstream registry (bypassing the proxy itself to avoid a
+/// recursion), runs `strip_npm_tarball`, populates the strip cache,
+/// and reapplies the cache to the packument so npm receives
+/// integrity values that match the bytes the tarball handler will
+/// serve. Per-version fetch is bounded by [`PRE_STRIP_PER_TARBALL_TIMEOUT`];
+/// the whole multi-tag fan-out is bounded by
+/// [`PRE_STRIP_TOTAL_BUDGET`]. Failures stay best-effort: leave that
+/// version's metadata untouched and let the lazy tarball-path strip
+/// apply on first install (which costs a single `EINTEGRITY`-then-
+/// retry round-trip).
 ///
-/// Only the `latest` tag is pre-stripped. Explicit pinned-version
-/// installs (`npm install pkg@1.2.3` for a non-latest version) hit
-/// the tarball handler's lazy path, populate the cache there, and
-/// then succeed on retry — the first attempt fails with EINTEGRITY
-/// because the packument advertised the original hash. Documented
-/// in CLAUDE.md roadmap #15.
+/// **Out of scope**: explicit pinned-version installs
+/// (`npm install pkg@1.2.3` for a version that isn't in
+/// `dist-tags`). The proxy has no way to predict the user's chosen
+/// pin without intercepting the install command. Documented in
+/// CLAUDE.md roadmap #15.
+const MAX_PRE_STRIP_TAGS: usize = 8;
+const PRE_STRIP_CONCURRENCY: usize = 4;
+const PRE_STRIP_PER_TARBALL_TIMEOUT: Duration = Duration::from_secs(10);
+const PRE_STRIP_TOTAL_BUDGET: Duration = Duration::from_secs(20);
+
 async fn speculative_pre_strip_packument(
     rewritten: Vec<u8>,
     strip_cache: std::sync::Arc<crate::strip_cache::StripCache>,
@@ -1341,124 +1350,245 @@ async fn speculative_pre_strip_packument(
     if lifecycle_allow.contains(&name) {
         return rewritten;
     }
-    let Some(latest) = obj
-        .get("dist-tags")
-        .and_then(|t| t.get("latest"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-    else {
+    let targets = collect_pre_strip_targets(obj);
+    if targets.is_empty() {
         return rewritten;
-    };
-    let (tarball_url, orig_integrity) = {
-        let Some(versions) = obj.get("versions").and_then(|v| v.as_object()) else {
-            return rewritten;
-        };
-        let Some(meta) = versions.get(&latest) else {
-            return rewritten;
-        };
-        let Some(dist) = meta.get("dist") else {
-            return rewritten;
-        };
-        let url = dist
-            .get("tarball")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let integ = dist
-            .get("integrity")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        match (url, integ) {
-            (Some(u), Some(i)) => (u, i),
-            _ => return rewritten,
-        }
-    };
-    let key = crate::strip_cache::StripKey {
-        name: name.clone(),
-        version: latest.clone(),
-        orig_integrity: orig_integrity.clone(),
-    };
-    if strip_cache.get(&key).is_none() {
-        let url = tarball_url.clone();
+    }
+
+    // Bounded concurrency fan-out. JoinSet owns each task; we drain
+    // it under an overall wall-clock budget so a hostile upstream
+    // cannot blow up packument latency.
+    let deadline = tokio::time::Instant::now() + PRE_STRIP_TOTAL_BUDGET;
+    let mut iter = targets.into_iter();
+    let mut joins: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let spawn_one = |joins: &mut tokio::task::JoinSet<()>, t: PreStripTarget| {
+        let cache = strip_cache.clone();
+        let limits = strip_limits;
         let ua = user_agent.clone();
-        let fetch = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, String> {
-                use std::io::Read;
-                let agent = ureq::AgentBuilder::new()
-                    .user_agent(&ua)
-                    .timeout(Duration::from_secs(8))
-                    .build();
-                let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                // Cap reads so a malicious upstream cannot bleed
-                // memory by sending an unbounded body.
-                resp.into_reader()
-                    .take(128 * 1024 * 1024)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| e.to_string())?;
-                Ok(buf)
-            }),
-        )
-        .await;
-        let bytes = match fetch {
-            Ok(Ok(Ok(b))) => b,
-            Ok(Ok(Err(e))) => {
-                log::warn!(
-                    "lifecycle(strip,speculative): upstream fetch failed for {name}@{latest}: {e}",
-                );
-                return rewritten;
-            }
-            Ok(Err(e)) => {
-                log::warn!(
-                    "lifecycle(strip,speculative): spawn_blocking join failed for {name}@{latest}: {e}",
-                );
-                return rewritten;
-            }
-            Err(_) => {
-                log::warn!(
-                    "lifecycle(strip,speculative): upstream fetch timed out for {name}@{latest} (10s budget)",
-                );
-                return rewritten;
-            }
-        };
-        let actual = sri_sha512_of(&bytes);
-        if actual != orig_integrity {
-            log::warn!(
-                "lifecycle(strip,speculative): {name}@{latest} bytes don't match advertised integrity (got {}, expected {}); skipping cache write",
-                actual,
-                orig_integrity,
-            );
-            return rewritten;
+        joins.spawn(async move {
+            pre_strip_one_version(t, cache, limits, ua).await;
+        });
+    };
+    for _ in 0..PRE_STRIP_CONCURRENCY {
+        if let Some(t) = iter.next() {
+            spawn_one(&mut joins, t);
         }
-        let entry = match crate::lifecycle::strip_npm_tarball(&bytes, &strip_limits) {
-            Ok(Some(out)) => {
-                log::info!(
-                    "lifecycle(strip,speculative): cached {name}@{latest} (removed [{}])",
-                    out.stripped_stages.join(", "),
-                );
-                crate::strip_cache::StripCacheEntry::Stripped {
-                    new_integrity: format!("sha512-{}", out.sha512_b64),
-                    new_shasum: out.sha1_hex,
-                    bytes: std::sync::Arc::new(out.bytes),
+    }
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            joins.abort_all();
+            log::warn!(
+                "lifecycle(strip,speculative): {}: overall budget exhausted, {} task(s) aborted",
+                name,
+                joins.len(),
+            );
+            break;
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(_)) => {
+                if let Some(t) = iter.next() {
+                    spawn_one(&mut joins, t);
                 }
             }
-            Ok(None) => {
-                log::debug!(
-                    "lifecycle(strip,speculative): {name}@{latest} carries no lifecycle scripts"
-                );
-                crate::strip_cache::StripCacheEntry::NoStripNeeded
-            }
-            Err(e) => {
+            Ok(None) => break, // all done
+            Err(_) => {
+                joins.abort_all();
                 log::warn!(
-                    "lifecycle(strip,speculative): rewriter error for {name}@{latest}: {e} — leaving packument untouched (lazy path will apply --lifecycle-strip-on-failure)",
+                    "lifecycle(strip,speculative): {}: overall budget exhausted while waiting, {} task(s) aborted",
+                    name,
+                    joins.len(),
                 );
-                return rewritten;
+                break;
             }
-        };
-        strip_cache.insert(key, entry);
+        }
     }
+
     crate::rewrite_npm::apply_strip_cache_to_packument(obj, &strip_cache);
     serde_json::to_vec(&doc).unwrap_or(rewritten)
+}
+
+#[derive(Debug, Clone)]
+struct PreStripTarget {
+    name: String,
+    version: String,
+    tarball_url: String,
+    orig_integrity: String,
+    /// Comma-joined list of dist-tag names pointing at this version
+    /// (e.g. `latest`, `latest,next`). Logged for operator visibility.
+    tags: String,
+}
+
+/// Walk `dist-tags`, dedupe by target version, gather each version's
+/// `(tarball, integrity)` from the rewritten packument. Returns an
+/// ordered list with the `latest` tag first (when present) and the
+/// remainder in deterministic dist-tag insertion order; capped at
+/// [`MAX_PRE_STRIP_TAGS`] to bound the fan-out against a registry
+/// that ships an unreasonable number of tags.
+fn collect_pre_strip_targets(
+    packument: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<PreStripTarget> {
+    let name = packument
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let Some(tags) = packument.get("dist-tags").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let Some(versions) = packument.get("versions").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    // Preserve dist-tags insertion order (serde_json::Map is built
+    // with `preserve_order` workspace-wide) but always pull `latest`
+    // to the front so it gets the first concurrency slot.
+    let mut ordered: Vec<(&String, &serde_json::Value)> = tags.iter().collect();
+    if let Some(idx) = ordered.iter().position(|(k, _)| k.as_str() == "latest") {
+        let latest = ordered.remove(idx);
+        ordered.insert(0, latest);
+    }
+
+    let mut by_version: std::collections::BTreeMap<String, PreStripTarget> = Default::default();
+    let mut order: Vec<String> = Vec::new();
+    for (tag, target) in ordered {
+        let Some(ver) = target.as_str() else { continue };
+        let Some(meta) = versions.get(ver) else {
+            continue;
+        };
+        let Some(dist) = meta.get("dist") else {
+            continue;
+        };
+        let Some(url) = dist.get("tarball").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(integ) = dist.get("integrity").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(existing) = by_version.get_mut(ver) {
+            // Same version, additional tag → just record the tag.
+            existing.tags.push(',');
+            existing.tags.push_str(tag);
+            continue;
+        }
+        order.push(ver.to_string());
+        by_version.insert(
+            ver.to_string(),
+            PreStripTarget {
+                name: name.clone(),
+                version: ver.to_string(),
+                tarball_url: url.to_string(),
+                orig_integrity: integ.to_string(),
+                tags: tag.clone(),
+            },
+        );
+    }
+
+    order
+        .into_iter()
+        .take(MAX_PRE_STRIP_TAGS)
+        .filter_map(|v| by_version.remove(&v))
+        .collect()
+}
+
+async fn pre_strip_one_version(
+    t: PreStripTarget,
+    strip_cache: std::sync::Arc<crate::strip_cache::StripCache>,
+    strip_limits: crate::lifecycle::StripLimits,
+    user_agent: String,
+) {
+    let PreStripTarget {
+        name,
+        version,
+        tarball_url,
+        orig_integrity,
+        tags,
+    } = t;
+    let key = crate::strip_cache::StripKey {
+        name: name.clone(),
+        version: version.clone(),
+        orig_integrity: orig_integrity.clone(),
+    };
+    if strip_cache.get(&key).is_some() {
+        return;
+    }
+    let url = tarball_url.clone();
+    let ua = user_agent.clone();
+    let fetch = tokio::time::timeout(
+        PRE_STRIP_PER_TARBALL_TIMEOUT,
+        tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, String> {
+            use std::io::Read;
+            let agent = ureq::AgentBuilder::new()
+                .user_agent(&ua)
+                .timeout(Duration::from_secs(8))
+                .build();
+            let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            // Cap reads so a malicious upstream cannot bleed
+            // memory by sending an unbounded body.
+            resp.into_reader()
+                .take(128 * 1024 * 1024)
+                .read_to_end(&mut buf)
+                .map_err(|e| e.to_string())?;
+            Ok(buf)
+        }),
+    )
+    .await;
+    let bytes = match fetch {
+        Ok(Ok(Ok(b))) => b,
+        Ok(Ok(Err(e))) => {
+            log::warn!(
+                "lifecycle(strip,speculative): upstream fetch failed for {name}@{version} (tags={tags}): {e}",
+            );
+            return;
+        }
+        Ok(Err(e)) => {
+            log::warn!(
+                "lifecycle(strip,speculative): spawn_blocking join failed for {name}@{version} (tags={tags}): {e}",
+            );
+            return;
+        }
+        Err(_) => {
+            log::warn!(
+                "lifecycle(strip,speculative): upstream fetch timed out for {name}@{version} (tags={tags}, 10s budget)",
+            );
+            return;
+        }
+    };
+    let actual = sri_sha512_of(&bytes);
+    if actual != orig_integrity {
+        log::warn!(
+            "lifecycle(strip,speculative): {name}@{version} (tags={tags}) bytes don't match advertised integrity (got {actual}, expected {orig_integrity}); skipping cache write",
+        );
+        return;
+    }
+    let entry = match crate::lifecycle::strip_npm_tarball(&bytes, &strip_limits) {
+        Ok(Some(out)) => {
+            log::info!(
+                "lifecycle(strip,speculative): cached {name}@{version} (tags={tags}, removed [{}])",
+                out.stripped_stages.join(", "),
+            );
+            crate::strip_cache::StripCacheEntry::Stripped {
+                new_integrity: format!("sha512-{}", out.sha512_b64),
+                new_shasum: out.sha1_hex,
+                bytes: std::sync::Arc::new(out.bytes),
+            }
+        }
+        Ok(None) => {
+            log::debug!(
+                "lifecycle(strip,speculative): {name}@{version} (tags={tags}) carries no lifecycle scripts",
+            );
+            crate::strip_cache::StripCacheEntry::NoStripNeeded
+        }
+        Err(e) => {
+            log::warn!(
+                "lifecycle(strip,speculative): rewriter error for {name}@{version} (tags={tags}): {e} — leaving packument untouched (lazy path will apply --lifecycle-strip-on-failure)",
+            );
+            return;
+        }
+    };
+    strip_cache.insert(key, entry);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
