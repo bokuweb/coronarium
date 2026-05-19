@@ -224,11 +224,22 @@ fn human_duration(d: chrono::Duration) -> String {
 /// `ureq` clients which don't honour `HTTPS_PROXY`.
 pub struct RegistryOracle {
     pub user_agent: String,
+    /// Per-ecosystem base URLs for the publish-date lookup.
+    /// Defaults to canonical public registries; the proxy CLI
+    /// doesn't currently expose flags to override this (the
+    /// existing `--registries-config` controls which incoming
+    /// hosts to MITM, not where the proxy's own age lookups
+    /// route). Wired via the field so a future flag can flip it
+    /// without revisiting every call site.
+    pub endpoints: sakimori_core::deps::registry::RegistryEndpoints,
 }
 
 impl RegistryOracle {
     pub fn new(user_agent: String) -> Self {
-        Self { user_agent }
+        Self {
+            user_agent,
+            endpoints: sakimori_core::deps::registry::RegistryEndpoints::default(),
+        }
     }
 }
 
@@ -240,11 +251,16 @@ impl AgeOracle for RegistryOracle {
         version: &str,
     ) -> Result<Option<DateTime<Utc>>> {
         use sakimori_core::deps::registry;
+        let ep = &self.endpoints;
         match eco {
-            Ecosystem::Crates => registry::crates::published(name, version, &self.user_agent),
-            Ecosystem::Npm => registry::npm::published(name, version, &self.user_agent),
-            Ecosystem::Pypi => registry::pypi::published(name, version, &self.user_agent),
-            Ecosystem::Nuget => registry::nuget::published(name, version, &self.user_agent),
+            Ecosystem::Crates => {
+                registry::crates::published(name, version, &self.user_agent, &ep.crates)
+            }
+            Ecosystem::Npm => registry::npm::published(name, version, &self.user_agent, &ep.npm),
+            Ecosystem::Pypi => registry::pypi::published(name, version, &self.user_agent, &ep.pypi),
+            Ecosystem::Nuget => {
+                registry::nuget::published(name, version, &self.user_agent, &ep.nuget)
+            }
         }
     }
 }

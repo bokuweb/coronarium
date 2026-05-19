@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
+use super::registry::RegistryEndpoints;
 use super::{CheckArgs, CheckReport, check};
 
 pub struct CliArgs {
@@ -19,6 +20,9 @@ pub struct CliArgs {
     pub cache_path: Option<PathBuf>,
     pub format: Format,
     pub user_agent: Option<String>,
+    /// Per-ecosystem base URLs. Empty default → canonical public
+    /// registries. Filled in from `--<eco>-registry` CLI flags.
+    pub endpoints: RegistryEndpoints,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +42,11 @@ pub struct WatchCliArgs {
     pub notifier: WatchNotifierKind,
     pub action: WatchActionKind,
     pub user_agent: Option<String>,
+    /// Per-ecosystem base URLs; shared with `deps check`. The
+    /// watch loop and the on-demand check should agree on which
+    /// registry to consult so a user's mirror is honoured in
+    /// both modes (Codex R1: explicit plumbing, no divergence).
+    pub endpoints: RegistryEndpoints,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +157,7 @@ pub fn run_watch(args: WatchCliArgs) -> Result<()> {
         cache_path,
         user_agent,
         tick: std::time::Duration::from_millis(args.tick_ms),
+        endpoints: args.endpoints,
         now: std::time::Instant::now,
     };
 
@@ -185,6 +195,7 @@ pub fn run(args: CliArgs) -> Result<i32> {
         fail_on_missing: args.fail_on_missing,
         cache: cache_path.as_deref(),
         user_agent: &user_agent,
+        endpoints: &args.endpoints,
     })?;
 
     print_report(&report, args.format)?;

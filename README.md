@@ -551,7 +551,32 @@ Exit codes:
 
 Cache location: `$XDG_CACHE_HOME/sakimori/deps-cache.json`
 (`%LOCALAPPDATA%\sakimori\…` on Windows). Publish dates are
-immutable, so there's no TTL.
+immutable, so there's no TTL. The cache key includes a
+per-endpoint fingerprint, so switching `--<eco>-registry` between
+runs produces fresh cache slots — no stale answers from a
+previous mirror.
+
+**Custom registry endpoints** (e.g. internal Verdaccio / JFrog /
+GitHub Packages internal / Takumi Guard mirror):
+
+```bash
+sakimori deps check --min-age 7d \
+    --npm-registry https://npm.corp.internal \
+    --cargo-registry https://crates.corp.internal \
+    --pypi-registry https://pypi.corp.internal \
+    --nuget-registry https://nuget.corp.internal \
+    package-lock.json Cargo.lock requirements.txt packages.lock.json
+```
+
+Each flag accepts a bare host or a full URL; trailing paths are
+stripped with a warn (host-only — the canonical path shape after
+the base is appended internally). The same flag set is available
+on `deps watch`. **Known limitation**: under
+`--nuget-registry`, NuGet `catalogEntry` URLs that point at a
+different host are treated as "publish date unknown" (fail-open
+to avoid following a possibly-malicious indirection in a
+compromised mirror). Combine with `--fail-on-missing` to deny in
+CI.
 
 ### `deps verify-cache`
 

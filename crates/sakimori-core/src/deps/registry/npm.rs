@@ -14,13 +14,18 @@ struct PackageDoc {
     time: std::collections::BTreeMap<String, String>,
 }
 
-pub fn published(name: &str, version: &str, user_agent: &str) -> Result<Option<DateTime<Utc>>> {
+pub fn published(
+    name: &str,
+    version: &str,
+    user_agent: &str,
+    base_url: &str,
+) -> Result<Option<DateTime<Utc>>> {
     let encoded = if let Some(rest) = name.strip_prefix('@') {
         format!("@{}", rest.replacen('/', "%2F", 1))
     } else {
         name.to_string()
     };
-    let url = format!("https://registry.npmjs.org/{encoded}");
+    let url = format!("{base_url}/{encoded}");
 
     let resp = super::agent()
         .get(&url)

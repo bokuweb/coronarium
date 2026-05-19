@@ -24,10 +24,15 @@ struct UploadedFile {
     upload_time: Option<String>,
 }
 
-pub fn published(name: &str, version: &str, user_agent: &str) -> Result<Option<DateTime<Utc>>> {
+pub fn published(
+    name: &str,
+    version: &str,
+    user_agent: &str,
+    base_url: &str,
+) -> Result<Option<DateTime<Utc>>> {
     // PyPI normalises package names (PEP 503) to lowercase + `-`/`_`/`.` → `-`.
     let normalised = normalise(name);
-    let url = format!("https://pypi.org/pypi/{normalised}/{version}/json");
+    let url = format!("{base_url}/pypi/{normalised}/{version}/json");
     let resp = super::agent()
         .get(&url)
         .set("User-Agent", user_agent)

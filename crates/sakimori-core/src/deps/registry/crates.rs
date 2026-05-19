@@ -19,8 +19,13 @@ struct VersionEntry {
     created_at: String,
 }
 
-pub fn published(name: &str, version: &str, user_agent: &str) -> Result<Option<DateTime<Utc>>> {
-    let url = format!("https://crates.io/api/v1/crates/{name}");
+pub fn published(
+    name: &str,
+    version: &str,
+    user_agent: &str,
+    base_url: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let url = format!("{base_url}/api/v1/crates/{name}");
     let resp = super::agent()
         .get(&url)
         .set("User-Agent", user_agent)

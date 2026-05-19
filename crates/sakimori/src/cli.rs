@@ -55,6 +55,33 @@ fn build_registries(args: &ProxyStartArgs) -> Result<sakimori_proxy::RegistryHos
     Ok(sakimori_proxy::RegistryHosts::merge(file, cli))
 }
 
+/// Build a `RegistryEndpoints` from 4 optional `--<eco>-registry`
+/// flags. Each `None` keeps the canonical public default; `Some`
+/// is normalised via `RegistryEndpoints::parse_base` (host-only,
+/// strips path with warn).
+fn build_deps_endpoints(
+    npm: Option<&str>,
+    cargo: Option<&str>,
+    pypi: Option<&str>,
+    nuget: Option<&str>,
+) -> Result<sakimori_core::deps::registry::RegistryEndpoints> {
+    use sakimori_core::deps::registry::RegistryEndpoints;
+    let mut out = RegistryEndpoints::default();
+    if let Some(v) = npm {
+        out.npm = RegistryEndpoints::parse_base("--npm-registry", v)?;
+    }
+    if let Some(v) = cargo {
+        out.crates = RegistryEndpoints::parse_base("--cargo-registry", v)?;
+    }
+    if let Some(v) = pypi {
+        out.pypi = RegistryEndpoints::parse_base("--pypi-registry", v)?;
+    }
+    if let Some(v) = nuget {
+        out.nuget = RegistryEndpoints::parse_base("--nuget-registry", v)?;
+    }
+    Ok(out)
+}
+
 fn build_network_allow(
     flags: &[String],
     file: &Option<PathBuf>,
@@ -958,6 +985,18 @@ pub struct DepsWatchArgs {
     ///   Destructive. Requires the lockfile to be git-tracked.
     #[arg(long, value_enum, default_value = "notify")]
     pub action: DepsAction,
+    /// Override the npm registry base URL. Same semantics as
+    /// `deps check --npm-registry`. Watch and check share the
+    /// same registry config — there's no use case for diverging
+    /// (Codex R1 finding).
+    #[arg(long = "npm-registry", value_name = "URL")]
+    pub npm_registry: Option<String>,
+    #[arg(long = "cargo-registry", value_name = "URL")]
+    pub cargo_registry: Option<String>,
+    #[arg(long = "pypi-registry", value_name = "URL")]
+    pub pypi_registry: Option<String>,
+    #[arg(long = "nuget-registry", value_name = "URL")]
+    pub nuget_registry: Option<String>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -997,6 +1036,32 @@ pub struct DepsCheckArgs {
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     pub format: DepsFormat,
+    /// Override the npm registry base URL used for publish-date
+    /// lookups. Default: `https://registry.npmjs.org`. Useful for
+    /// teams running an internal npm mirror (Verdaccio, GitHub
+    /// Packages internal, Takumi Guard, …). Accepts a bare host
+    /// (`npm.corp.internal`), with a leading scheme
+    /// (`https://npm.corp.internal`), or with a trailing slash
+    /// — any path component is ignored with a warn (host-only).
+    #[arg(long = "npm-registry", value_name = "URL")]
+    pub npm_registry: Option<String>,
+    /// Override the crates.io API base URL. Default:
+    /// `https://crates.io`. Same shape rules as `--npm-registry`.
+    #[arg(long = "cargo-registry", value_name = "URL")]
+    pub cargo_registry: Option<String>,
+    /// Override the PyPI Warehouse API base URL. Default:
+    /// `https://pypi.org`. Same shape rules as `--npm-registry`.
+    #[arg(long = "pypi-registry", value_name = "URL")]
+    pub pypi_registry: Option<String>,
+    /// Override the NuGet v3 base URL. Default:
+    /// `https://api.nuget.org`. Same shape rules as
+    /// `--npm-registry`. Note: a mirror that serves
+    /// `catalogEntry` URLs on a different host than this base
+    /// will have those entries treated as missing publish-dates
+    /// (fail-open) — use `--fail-on-missing` to escalate to
+    /// Deny in CI. Documented limitation.
+    #[arg(long = "nuget-registry", value_name = "URL")]
+    pub nuget_registry: Option<String>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -1087,6 +1152,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Deps {
             cmd: DepsCommand::Check(args),
         } => {
+            let endpoints = build_deps_endpoints(
+                args.npm_registry.as_deref(),
+                args.cargo_registry.as_deref(),
+                args.pypi_registry.as_deref(),
+                args.nuget_registry.as_deref(),
+            )?;
             let exit = sakimori_core::deps::cli::run(sakimori_core::deps::cli::CliArgs {
                 lockfiles: args.lockfiles,
                 min_age: args.min_age,
@@ -1099,6 +1170,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     DepsFormat::Json => sakimori_core::deps::cli::Format::Json,
                 },
                 user_agent: None,
+                endpoints,
             })?;
             std::process::exit(exit);
         }
@@ -1225,6 +1297,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Deps {
             cmd: DepsCommand::Watch(args),
         } => {
+            let endpoints = build_deps_endpoints(
+                args.npm_registry.as_deref(),
+                args.cargo_registry.as_deref(),
+                args.pypi_registry.as_deref(),
+                args.nuget_registry.as_deref(),
+            )?;
             sakimori_core::deps::cli::run_watch(sakimori_core::deps::cli::WatchCliArgs {
                 roots: args.roots,
                 min_age: args.min_age,
@@ -1243,6 +1321,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     DepsAction::Revert => sakimori_core::deps::cli::WatchActionKind::Revert,
                 },
                 user_agent: None,
+                endpoints,
             })?;
             Ok(())
         }

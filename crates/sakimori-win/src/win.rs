@@ -491,6 +491,14 @@ fn run_deps(raw: &[String]) -> Result<()> {
         cache: Option<std::path::PathBuf>,
         #[arg(long, value_enum, default_value = "text")]
         format: DepsFormatArg,
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+        #[arg(long = "cargo-registry", value_name = "URL")]
+        cargo_registry: Option<String>,
+        #[arg(long = "pypi-registry", value_name = "URL")]
+        pypi_registry: Option<String>,
+        #[arg(long = "nuget-registry", value_name = "URL")]
+        nuget_registry: Option<String>,
     }
     #[derive(Debug, Clone, ValueEnum)]
     enum DepsFormatArg {
@@ -514,6 +522,37 @@ fn run_deps(raw: &[String]) -> Result<()> {
         debounce_ms: u64,
         #[arg(long, default_value_t = 250)]
         tick_ms: u64,
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+        #[arg(long = "cargo-registry", value_name = "URL")]
+        cargo_registry: Option<String>,
+        #[arg(long = "pypi-registry", value_name = "URL")]
+        pypi_registry: Option<String>,
+        #[arg(long = "nuget-registry", value_name = "URL")]
+        nuget_registry: Option<String>,
+    }
+
+    fn build_endpoints(
+        npm: Option<&str>,
+        cargo: Option<&str>,
+        pypi: Option<&str>,
+        nuget: Option<&str>,
+    ) -> anyhow::Result<sakimori_core::deps::registry::RegistryEndpoints> {
+        use sakimori_core::deps::registry::RegistryEndpoints;
+        let mut out = RegistryEndpoints::default();
+        if let Some(v) = npm {
+            out.npm = RegistryEndpoints::parse_base("--npm-registry", v)?;
+        }
+        if let Some(v) = cargo {
+            out.crates = RegistryEndpoints::parse_base("--cargo-registry", v)?;
+        }
+        if let Some(v) = pypi {
+            out.pypi = RegistryEndpoints::parse_base("--pypi-registry", v)?;
+        }
+        if let Some(v) = nuget {
+            out.nuget = RegistryEndpoints::parse_base("--nuget-registry", v)?;
+        }
+        Ok(out)
     }
 
     // Drop argv[0] (binary) and argv[1] ("deps") so clap sees just the
@@ -522,6 +561,12 @@ fn run_deps(raw: &[String]) -> Result<()> {
     let parsed = DepsCli::try_parse_from(remainder).map_err(|e| anyhow::anyhow!("{e}"))?;
     match parsed.cmd {
         DepsCmd::Check(args) => {
+            let endpoints = build_endpoints(
+                args.npm_registry.as_deref(),
+                args.cargo_registry.as_deref(),
+                args.pypi_registry.as_deref(),
+                args.nuget_registry.as_deref(),
+            )?;
             let exit = sakimori_core::deps::cli::run(sakimori_core::deps::cli::CliArgs {
                 lockfiles: args.lockfiles,
                 min_age: args.min_age,
@@ -534,10 +579,17 @@ fn run_deps(raw: &[String]) -> Result<()> {
                     DepsFormatArg::Json => sakimori_core::deps::cli::Format::Json,
                 },
                 user_agent: None,
+                endpoints,
             })?;
             std::process::exit(exit);
         }
         DepsCmd::Watch(args) => {
+            let endpoints = build_endpoints(
+                args.npm_registry.as_deref(),
+                args.cargo_registry.as_deref(),
+                args.pypi_registry.as_deref(),
+                args.nuget_registry.as_deref(),
+            )?;
             sakimori_core::deps::cli::run_watch(sakimori_core::deps::cli::WatchCliArgs {
                 roots: args.roots,
                 min_age: args.min_age,
@@ -549,6 +601,7 @@ fn run_deps(raw: &[String]) -> Result<()> {
                 notifier: sakimori_core::deps::cli::WatchNotifierKind::Stdout,
                 action: sakimori_core::deps::cli::WatchActionKind::Notify,
                 user_agent: None,
+                endpoints,
             })?;
             Ok(())
         }

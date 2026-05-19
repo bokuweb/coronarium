@@ -84,6 +84,12 @@ pub struct CheckArgs<'a> {
     pub fail_on_missing: bool,
     pub cache: Option<&'a Path>,
     pub user_agent: &'a str,
+    /// Per-ecosystem base URLs for the publish-date lookup.
+    /// Default (`RegistryEndpoints::default()`) points at the
+    /// canonical public registries. Override via the CLI flags
+    /// `--<eco>-registry` when running against an internal
+    /// mirror. See [`registry::RegistryEndpoints`].
+    pub endpoints: &'a registry::RegistryEndpoints,
 }
 
 pub fn check(args: CheckArgs<'_>) -> Result<CheckReport> {
@@ -131,6 +137,7 @@ pub fn check(args: CheckArgs<'_>) -> Result<CheckReport> {
             &pkg.version,
             cache.as_mut(),
             args.user_agent,
+            args.endpoints,
         );
         let entry = match fetched {
             Ok(Some(published)) => {
@@ -196,21 +203,40 @@ fn fetch_published(
     version: &str,
     cache: Option<&mut Cache>,
     user_agent: &str,
+    endpoints: &registry::RegistryEndpoints,
 ) -> Result<Option<DateTime<Utc>>> {
+    let (base_url, fp) = match eco {
+        Ecosystem::Npm => (
+            endpoints.npm.as_str(),
+            registry::RegistryEndpoints::fingerprint(&endpoints.npm),
+        ),
+        Ecosystem::Crates => (
+            endpoints.crates.as_str(),
+            registry::RegistryEndpoints::fingerprint(&endpoints.crates),
+        ),
+        Ecosystem::Pypi => (
+            endpoints.pypi.as_str(),
+            registry::RegistryEndpoints::fingerprint(&endpoints.pypi),
+        ),
+        Ecosystem::Nuget => (
+            endpoints.nuget.as_str(),
+            registry::RegistryEndpoints::fingerprint(&endpoints.nuget),
+        ),
+    };
     // cache hit → skip network
     if let Some(c) = cache.as_deref()
-        && let Some(dt) = c.get(eco, name, version)
+        && let Some(dt) = c.get(eco, name, version, &fp)
     {
         return Ok(Some(dt));
     }
     let result = match eco {
-        Ecosystem::Npm => registry::npm::published(name, version, user_agent)?,
-        Ecosystem::Crates => registry::crates::published(name, version, user_agent)?,
-        Ecosystem::Pypi => registry::pypi::published(name, version, user_agent)?,
-        Ecosystem::Nuget => registry::nuget::published(name, version, user_agent)?,
+        Ecosystem::Npm => registry::npm::published(name, version, user_agent, base_url)?,
+        Ecosystem::Crates => registry::crates::published(name, version, user_agent, base_url)?,
+        Ecosystem::Pypi => registry::pypi::published(name, version, user_agent, base_url)?,
+        Ecosystem::Nuget => registry::nuget::published(name, version, user_agent, base_url)?,
     };
     if let (Some(dt), Some(c)) = (result, cache) {
-        c.put(eco, name, version, dt);
+        c.put(eco, name, version, &fp, dt);
     }
     Ok(result)
 }

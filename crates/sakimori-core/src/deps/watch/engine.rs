@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::deps::registry::RegistryEndpoints;
 use crate::deps::{CheckArgs, CheckReport, check};
 
 use super::{Debouncer, Notifier, ViolationHandler, format::format_violation};
@@ -33,6 +34,9 @@ pub struct WatchLoop<'a, S: EventSource, N: Notifier + ?Sized, H: ViolationHandl
     pub cache_path: Option<PathBuf>,
     pub user_agent: String,
     pub tick: Duration,
+    /// Per-ecosystem base URLs shared with `deps check`. Threaded
+    /// through every `check_and_notify` invocation.
+    pub endpoints: RegistryEndpoints,
     /// Test hook: clock source, so tests can advance time deterministically.
     pub now: fn() -> Instant,
 }
@@ -64,6 +68,7 @@ impl<'a, S: EventSource, N: Notifier + ?Sized, H: ViolationHandler + ?Sized>
             fail_on_missing: false,
             cache: self.cache_path.as_deref(),
             user_agent: &self.user_agent,
+            endpoints: &self.endpoints,
         };
         let report: CheckReport = check(args)?;
         if report.violations == 0 {
@@ -224,6 +229,7 @@ mod tests {
             cache_path: None,
             user_agent: "sakimori-test".into(),
             tick: Duration::from_millis(0),
+            endpoints: RegistryEndpoints::default(),
             now: Instant::now,
         };
         let emitted = wl.tick_once().unwrap();
@@ -252,6 +258,7 @@ mod tests {
             cache_path: None,
             user_agent: "sakimori-test".into(),
             tick: Duration::from_millis(0),
+            endpoints: RegistryEndpoints::default(),
             now: Instant::now,
         };
         for _ in 0..3 {
