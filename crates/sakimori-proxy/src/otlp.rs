@@ -125,6 +125,18 @@ fn build_payload(event: &InstallEvent, service_name: &str, service_version: &str
     if let Some(ua) = event.user_agent.as_deref() {
         attrs.push(attr_str("package.user_agent", ua));
     }
+    if let Some(g) = event.git.as_ref() {
+        attrs.push(attr_str("package.git.url", &g.url));
+        if let Some(r) = g.requested_ref.as_deref() {
+            attrs.push(attr_str("package.git.requested_ref", r));
+        }
+        if let Some(c) = g.resolved_commit.as_deref() {
+            attrs.push(attr_str("package.git.resolved_commit", c));
+        }
+        if let Some(s) = g.commit_source.as_deref() {
+            attrs.push(attr_str("package.git.commit_source", s));
+        }
+    }
 
     json!({
         "resourceLogs": [{

@@ -4,6 +4,7 @@
 pub mod ca;
 pub mod daemon;
 pub mod decision;
+pub mod git_fetch;
 pub mod host_allow;
 pub mod install;
 pub mod lifecycle;

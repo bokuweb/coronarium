@@ -18,7 +18,8 @@ use hudsucker::{
     rcgen::KeyPair,
 };
 
-use sakimori_core::installs::{ExecutionMode, InstallEvent, InstallLogger};
+use sakimori_core::deps::Ecosystem;
+use sakimori_core::installs::{ExecutionMode, GitProvenance, InstallEvent, InstallLogger};
 
 use crate::ca::{CaFiles, ensure_ca, trust_instructions};
 use crate::decision::{AgeOracle, Decider, Decision};
@@ -626,6 +627,49 @@ struct SakimoriHandler {
 }
 
 impl SakimoriHandler {
+    /// Build and emit an `InstallEvent` for a classified git fetch.
+    /// Mirrors the registry-fetch logging branch in `handle_request`
+    /// but with `Ecosystem::Git` and a `GitProvenance` block carrying
+    /// the URL, the requested ref, and (when the ref is itself a
+    /// 40-hex SHA) the resolved commit.
+    ///
+    /// Best-effort: log-write failures are warned about but never
+    /// surfaced to the upstream fetch — a broken log must not break
+    /// `cargo build` / `npm install`.
+    fn log_git_fetch(&self, fetch: &crate::git_fetch::GitFetch, user_agent: &str) {
+        // version field: the ref the client asked for. For
+        // clone-protocol discovery (no ref bound yet) and api.github
+        // tarballs without an explicit ref, fall back to "HEAD" so
+        // consumers don't trip on an empty version string.
+        let version = fetch.requested_ref.clone().unwrap_or_else(|| "HEAD".into());
+        let (resolved_commit, commit_source) = if fetch.ref_is_commit_sha() {
+            (fetch.requested_ref.clone(), Some("url".to_string()))
+        } else {
+            (None, None)
+        };
+        let provenance = GitProvenance {
+            url: fetch.url.clone(),
+            requested_ref: fetch.requested_ref.clone(),
+            resolved_commit,
+            commit_source,
+        };
+        let mode = classify_execution_mode(user_agent);
+        let mut ev = InstallEvent::new(Ecosystem::Git, fetch.name(), version)
+            .with_mode(mode)
+            .with_git(provenance);
+        if !user_agent.is_empty() {
+            ev = ev.with_user_agent(user_agent);
+        }
+        if let Some(logger) = self.install_logger.as_ref()
+            && let Err(e) = logger.record(&ev)
+        {
+            log::warn!("install log write failed (git fetch): {e:#}");
+        }
+        if let Some(exporter) = self.otlp_exporter.as_ref() {
+            exporter.dispatch(&ev);
+        }
+    }
+
     /// Buffer the tarball body, inspect `package.json` for
     /// install-time lifecycle scripts, then either audit-log + pass
     /// through (Audit) or return 403 (Block).
@@ -942,6 +986,28 @@ impl HttpHandler for SakimoriHandler {
             .next()
             .unwrap_or("")
             .to_string();
+        // Git-fetch logging runs before `should_intercept` because
+        // github.com / codeload.github.com / api.github.com are NOT
+        // registry hosts — they'd otherwise be CONNECT-tunnelled
+        // opaquely and the `installs.jsonl` log would never see direct
+        // git deps (`npm install github:o/r`, `cargo` `git = "..."`,
+        // `pip install git+https://...`). We never modify the request
+        // or response; the log line is the only side effect.
+        if self.install_logger.is_some() || self.otlp_exporter.is_some() {
+            let raw_path = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".into());
+            if let Some(fetch) = crate::git_fetch::classify(&host, &raw_path) {
+                let ua = req
+                    .headers()
+                    .get(http::header::USER_AGENT)
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("");
+                self.log_git_fetch(&fetch, ua);
+            }
+        }
         if !should_intercept(&host, &self.parsers) {
             self.last_host = None;
             self.last_path = None;

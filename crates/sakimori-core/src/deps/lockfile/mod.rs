@@ -33,6 +33,12 @@ pub fn parse(eco: Ecosystem, path: &Path) -> Result<Vec<Package>> {
         Ecosystem::Crates => cargo::parse(path),
         Ecosystem::Pypi => pypi::parse(path),
         Ecosystem::Nuget => nuget::parse(path),
+        // No lockfile shape is detected as `Git`; the variant only
+        // shows up via the proxy's install logger.
+        Ecosystem::Git => anyhow::bail!(
+            "git ecosystem has no lockfile parser — git deps are observed at fetch time, \
+             not parsed from a lockfile"
+        ),
     }
 }
 
