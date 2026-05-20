@@ -23,6 +23,7 @@ pub mod rewrite_vscode;
 pub mod sigstore_verify;
 pub mod strip_cache;
 pub mod typosquat;
+pub mod vsix_inspect;
 
 pub use decision::{AgeOracle, Decider, Decision, RegistryOracle};
 pub use parser::{

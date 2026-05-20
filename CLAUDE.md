@@ -1049,21 +1049,30 @@ and lights up the most existing detection for free.
     to internal extension mirrors and forbid the public hosts.
 
 21. **`.vsix` / `.crx` lifecycle gate.**
-    Parallel to the npm tarball strip (#15). `.vsix` is a zip
-    with `extension/package.json`; inspect at proxy time:
-    - **audit/block**: flag `activationEvents: ["*"]` and
-      `onStartupFinished` (run-on-editor-start — the highest-
-      blast-radius primitive).
-    - **block-only signals**: `main` references to `child_process`
-      / `node:vm` / `eval` via cheap string grep on the bundled
-      JS, presence of obfuscated payloads (high-entropy string
-      blobs).
-    - **strip mode**: rewrite `activationEvents` from `["*"]` to
-      `[]` (force lazy activation) and zero out
-      `onStartupFinished`. Re-emit the zip + recompute the
-      Marketplace integrity hash the same way npm strip does.
-    `.crx` is signed end-to-end so strip is impossible — audit/
-    block only.
+    ✅ inspector library landed as `sakimori-proxy::vsix_inspect`.
+    `inspect_vsix(body)` opens the OPC zip, pulls
+    `extension/package.json`, and returns
+    `VsixInspection { name, publisher, version, activation_events,
+    main, fires_on_startup }`. The `fires_on_startup` bool flags
+    the two startup-autorun shapes (`"*"` wildcard and
+    `onStartupFinished`) — the highest-blast-radius VSCode
+    activation primitives, and the ones recent supply-chain
+    droppers favour. Hard ceilings (`MAX_VSIX_BYTES = 100 MiB`,
+    `MAX_PACKAGE_JSON_BYTES = 1 MiB`) keep a malicious zip from
+    stalling the proxy. Fail-open shape mirrors the npm
+    inspector: corrupt zip / missing manifest / unparseable JSON
+    return the default Inspection, defence does not fabricate
+    denials on malformed-but-legitimate artefacts.
+
+    Still pending: proxy integration (recognise the
+    `.../vsextensions/<pub>/<ext>/<ver>/vspackage` URL shape in
+    `classify_response`, dispatch `LifecyclePolicy::{Audit,Block}`
+    on the inspected result), strip mode (rewrite
+    `activationEvents` + recompute the Marketplace integrity
+    hash), and `.crx` audit. `main` JS body scanning belongs
+    naturally in `iocs::ContentNeedle` rather than here. `.crx`
+    is signed end-to-end so strip is impossible by design;
+    audit/block only.
 
 22. **Extension installs in the `InstallEvent` inventory.**
     Extend the `Ecosystem` enum (Roadmap #6) with

@@ -42,6 +42,12 @@ sha1 = "0.10"
 sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
+# .vsix lifecycle inspection — VSIX files are zip-packaged with an
+# `extension/package.json` root manifest. `zip` is the standard
+# Rust crate for the format. `default-features = false` drops the
+# bzip2 / lzma / zstd / aes features we don't need; the deflate
+# default is enabled via the `_deflate-flate2` feature.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 toml = { workspace = true }
 
 # Custom upstream TLS client for `extra_upstream_roots`. Versions
