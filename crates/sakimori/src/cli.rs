@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -181,6 +181,16 @@ pub enum Command {
         #[command(subcommand)]
         cmd: DaemonCommand,
     },
+    /// Editor-extension tamper detection — the same workspace-
+    /// snapshot model applied to `~/.vscode/extensions/`,
+    /// `~/.cursor/extensions/`, and friends. Auto-detects which
+    /// extension roots exist on the host so a user without Cursor
+    /// doesn't see an empty `cursor-extensions/` namespace polluting
+    /// the diff.
+    Extensions {
+        #[command(subcommand)]
+        cmd: ExtensionsCommand,
+    },
     /// Retroactive CVE notification: read the proxy's install log and
     /// query OSV.dev for advisories that affect installs you've
     /// already done. Local-first — only `(ecosystem, name, version)`
@@ -319,6 +329,64 @@ pub struct DaemonStopArgs {
     /// report is worse than an obvious timeout.
     #[arg(long, default_value_t = 30, value_name = "SECS")]
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExtensionsCommand {
+    /// Walk every editor-extension root that exists on the host and
+    /// emit a merged JSON snapshot. Each file's relative path is
+    /// prefixed with the root's label
+    /// (`vscode-extensions/foo.bar-1.0.0/package.json`) so the same
+    /// extension id under two editors doesn't collide.
+    Snapshot(ExtensionsSnapshotArgs),
+    /// Compare a previously-taken extensions snapshot against the
+    /// current state of the host's editor extension roots. Exits
+    /// non-zero on any drift (suppress with `--allow-drift`). The
+    /// known-IOC scanner runs against every added / modified path
+    /// just like `workspace diff` so sideloaded extensions that
+    /// match catalog rules surface alongside the structural diff.
+    Diff(ExtensionsDiffArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct ExtensionsSnapshotArgs {
+    /// Output file. `-` (default) writes to stdout.
+    #[arg(long, short = 'o', default_value = "-")]
+    pub output: PathBuf,
+    /// Override `$HOME`. Mostly for tests / CI; production callers
+    /// can leave this and let the OS resolve it.
+    #[arg(long, value_name = "DIR")]
+    pub home: Option<PathBuf>,
+    /// Files larger than this many bytes get a size-only entry
+    /// (no hash). Defaults to the same 64 MiB cap `workspace
+    /// snapshot` uses — large per-extension blobs (binary
+    /// addons, asset packs) don't drown out diff signal.
+    #[arg(long, default_value_t = sakimori_core::tamper::DEFAULT_MAX_FILE_BYTES)]
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug, Parser)]
+pub struct ExtensionsDiffArgs {
+    /// Baseline snapshot JSON, as produced by
+    /// `sakimori extensions snapshot`.
+    pub baseline: PathBuf,
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: WorkspaceDiffFormat,
+    /// Override `$HOME`. Must match what was passed at snapshot
+    /// time, otherwise added / removed entries fire spuriously.
+    #[arg(long, value_name = "DIR")]
+    pub home: Option<PathBuf>,
+    #[arg(long, default_value_t = sakimori_core::tamper::DEFAULT_MAX_FILE_BYTES)]
+    pub max_file_bytes: u64,
+    /// Don't exit non-zero when drift is found. Useful for
+    /// audit-only invocations.
+    #[arg(long)]
+    pub allow_drift: bool,
+    /// Disable the known-IOC scan that runs against added /
+    /// modified extension files. On by default; the flag is for
+    /// regression-test reproducibility.
+    #[arg(long)]
+    pub no_check_iocs: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1309,7 +1377,157 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Advisories {
             cmd: AdvisoriesCommand::Scan(args),
         } => run_advisories_scan(args),
+        Command::Extensions {
+            cmd: ExtensionsCommand::Snapshot(args),
+        } => run_extensions_snapshot(args),
+        Command::Extensions {
+            cmd: ExtensionsCommand::Diff(args),
+        } => run_extensions_diff(args),
     }
+}
+
+fn resolve_home(override_: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = override_ {
+        return Ok(p.to_path_buf());
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME environment variable is not set; pass --home"))
+}
+
+fn run_extensions_snapshot(args: ExtensionsSnapshotArgs) -> Result<()> {
+    let home = resolve_home(args.home.as_deref())?;
+    let roots = sakimori_core::editor_extensions::default_roots(&home);
+    if roots.is_empty() {
+        eprintln!(
+            "sakimori: no editor-extension roots found under {} \
+             (looked for ~/.vscode, ~/.cursor, ~/.windsurf, …) — \
+             snapshot will be empty.",
+            home.display(),
+        );
+    }
+    let opts = tamper_options(Vec::new(), args.max_file_bytes);
+    let snap = sakimori_core::editor_extensions::snapshot_roots(&roots, &opts)?;
+    let json = snap.to_json_pretty()?;
+    if args.output.as_os_str() == "-" {
+        println!("{json}");
+    } else {
+        std::fs::write(&args.output, json)
+            .with_context(|| format!("writing {}", args.output.display()))?;
+        eprintln!(
+            "sakimori: wrote extension snapshot ({} files across {} root(s)) to {}",
+            snap.files.len(),
+            roots.len(),
+            args.output.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_extensions_diff(args: ExtensionsDiffArgs) -> Result<()> {
+    let baseline_json = std::fs::read_to_string(&args.baseline)
+        .with_context(|| format!("reading baseline {}", args.baseline.display()))?;
+    let baseline = sakimori_core::tamper::Snapshot::from_json(&baseline_json)?;
+    let home = resolve_home(args.home.as_deref())?;
+    let roots = sakimori_core::editor_extensions::default_roots(&home);
+    let opts = tamper_options(Vec::new(), args.max_file_bytes);
+    let current = sakimori_core::editor_extensions::snapshot_roots(&roots, &opts)?;
+    let dif = sakimori_core::tamper::diff(&baseline, &current);
+
+    // IOC scan runs per-root: the snapshot keys are label-prefixed
+    // virtual paths, but the catalog rules need the actual filesystem
+    // root. Resolve each label back to its root path; paths whose
+    // prefix doesn't correspond to a currently-known root are dropped
+    // — fail-open, since an extension dir that disappeared between
+    // baseline and diff is a legitimate state, not a hidden positive.
+    let ioc_findings = if args.no_check_iocs {
+        Vec::new()
+    } else {
+        let mut hits = Vec::new();
+        for root in &roots {
+            let prefix = std::path::PathBuf::from(&root.label);
+            let scoped: Vec<std::path::PathBuf> = dif
+                .added
+                .iter()
+                .chain(dif.modified.iter().map(|m| &m.path))
+                .filter_map(|p| p.strip_prefix(&prefix).ok().map(|r| r.to_path_buf()))
+                .collect();
+            let mut root_hits = sakimori_core::iocs::scan_paths_in_root(
+                &root.path,
+                scoped.iter().map(std::path::PathBuf::as_path),
+            );
+            // Re-prefix the finding paths back into the merged
+            // namespace so the diff output reads consistently.
+            for h in &mut root_hits {
+                h.path = prefix.join(&h.path);
+            }
+            hits.extend(root_hits);
+        }
+        hits
+    };
+    let ioc_report = sakimori_core::iocs::Report::new(ioc_findings);
+
+    match args.format {
+        WorkspaceDiffFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Combined<'a> {
+                #[serde(flatten)]
+                diff: &'a sakimori_core::tamper::Diff,
+                iocs: &'a sakimori_core::iocs::Report,
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Combined {
+                    diff: &dif,
+                    iocs: &ioc_report,
+                })?
+            );
+        }
+        WorkspaceDiffFormat::Text => {
+            if dif.is_clean() {
+                eprintln!("sakimori: editor extensions clean — no drift");
+            } else {
+                eprintln!(
+                    "sakimori: {} change(s) ({} added, {} modified, {} removed)\n",
+                    dif.total(),
+                    dif.added.len(),
+                    dif.modified.len(),
+                    dif.removed.len(),
+                );
+                for p in &dif.added {
+                    println!("+  {}", p.display());
+                }
+                for m in &dif.modified {
+                    println!("~  {}", m.path.display());
+                }
+                for p in &dif.removed {
+                    println!("-  {}", p.display());
+                }
+            }
+            if !ioc_report.findings.is_empty() {
+                eprintln!(
+                    "\nsakimori: {} known-IOC hit(s) (catalog {})",
+                    ioc_report.findings.len(),
+                    ioc_report.catalog_version,
+                );
+                for f in &ioc_report.findings {
+                    println!("!  [{:?}] {} — {}", f.severity, f.rule_id, f.path.display(),);
+                }
+            }
+        }
+    }
+
+    let high_ioc = ioc_report
+        .findings
+        .iter()
+        .any(|f| matches!(f.severity, sakimori_core::iocs::Severity::High));
+    if high_ioc {
+        std::process::exit(1);
+    }
+    if !dif.is_clean() && !args.allow_drift {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_advisories_scan(args: AdvisoriesScanArgs) -> Result<()> {

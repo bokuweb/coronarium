@@ -1118,14 +1118,24 @@ and lights up the most existing detection for free.
     consumers — `workspace diff`, the JSON log, the HTML report,
     the IOC scanner — work unchanged on the merged snapshot.
 
-    Still pending: CLI wiring (`sakimori workspace snapshot
-    --include-editor-extensions` / a dedicated
-    `sakimori extensions snapshot` subcommand) and integration
-    into `sakimori run` / `daemon` so the snapshot is taken
-    automatically. Pairs naturally with `file.deny` on the same
-    paths once exposed via policy presets — the eBPF tripwire
-    fires on the write itself while the post-run diff catches
-    sideloads that bypass the Marketplace fetch.
+    ✅ CLI wired as `sakimori extensions snapshot` /
+    `sakimori extensions diff`. Snapshot emits a merged JSON to
+    stdout (or `--output FILE`); diff reads a baseline, walks the
+    discovered roots, and reports added/modified/removed entries
+    plus a per-root IOC scan that re-uses the v2026.05.21 catalog
+    (so `vscode.tasks-folderopen-autorun` fires on a poisoned
+    sideload's `tasks.json`, and the existing Shai-Hulud / exfil
+    needles fire on any extension code that ships them). High-
+    severity IOC hits force exit 1 unconditionally; structural
+    drift exits 1 unless `--allow-drift`. `--home <DIR>` is the
+    test/CI escape hatch.
+
+    Still pending: integration into `sakimori run` / `daemon` so
+    the snapshot is taken automatically around supervised steps.
+    Pairs naturally with `file.deny` on the same paths once
+    exposed via policy presets — the eBPF tripwire fires on the
+    write itself while the post-run diff catches sideloads that
+    bypass the Marketplace fetch.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
