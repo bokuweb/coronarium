@@ -1097,15 +1097,35 @@ and lights up the most existing detection for free.
     private extensions all the time, can't ship as a hard rule).
 
 24. **Editor extension directory tamper detection.**
-    `sakimori workspace snapshot --include-editor-extensions`
-    extends the snapshot walker to also hash
-    `~/.vscode/extensions/`, `~/.cursor/extensions/`, and
-    `~/Library/Application Support/Code/User/globalStorage/`
-    (Linux/Windows equivalents wired similarly). Diff at run
-    end the same way workspace drift does today. Catches
-    sideloaded extensions that bypass the Marketplace fetch.
-    Pairs naturally with `file.deny` on those paths so the eBPF
-    tripwire fires on the write itself.
+    ✅ library surface implemented as
+    `sakimori-core::editor_extensions`:
+    `default_roots($HOME)` auto-detects `~/.vscode/extensions/`,
+    `~/.vscode-insiders/extensions/`, `~/.cursor/extensions/`,
+    `~/.windsurf/extensions/`, and the platform-appropriate
+    VS Code `User/globalStorage/` (Linux:
+    `$XDG_CONFIG_HOME/Code/User/globalStorage`, macOS:
+    `~/Library/Application Support/Code/User/globalStorage`,
+    Windows: `%APPDATA%\Code\User\globalStorage`). Only roots that
+    exist on disk at call time are returned, so a user without
+    Cursor doesn't see an empty namespace polluting their diff.
+    `snapshot_roots(&roots, &opts)` walks each root with the
+    existing `tamper::Snapshot` machinery and merges into one
+    diffable artefact, prefixing every path with the root's label
+    (`vscode-extensions/foo.bar-1.0.0/package.json`) so the same
+    extension id under two editors doesn't collide.
+
+    Reuses the existing `tamper::diff` so all downstream
+    consumers — `workspace diff`, the JSON log, the HTML report,
+    the IOC scanner — work unchanged on the merged snapshot.
+
+    Still pending: CLI wiring (`sakimori workspace snapshot
+    --include-editor-extensions` / a dedicated
+    `sakimori extensions snapshot` subcommand) and integration
+    into `sakimori run` / `daemon` so the snapshot is taken
+    automatically. Pairs naturally with `file.deny` on the same
+    paths once exposed via policy presets — the eBPF tripwire
+    fires on the write itself while the post-run diff catches
+    sideloads that bypass the Marketplace fetch.
 
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
