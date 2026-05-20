@@ -39,6 +39,13 @@ pub fn parse(eco: Ecosystem, path: &Path) -> Result<Vec<Package>> {
             "git ecosystem has no lockfile parser — git deps are observed at fetch time, \
              not parsed from a lockfile"
         ),
+        // VS Code / OpenVSX extensions are observed at fetch time
+        // through the proxy, the same way `Git` is — no lockfile
+        // shape exists today.
+        Ecosystem::VscodeExtension => anyhow::bail!(
+            "vscode-extension ecosystem has no lockfile parser — editor extensions are \
+             observed at fetch time, not parsed from a lockfile"
+        ),
     }
 }
 

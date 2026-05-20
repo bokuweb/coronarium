@@ -43,6 +43,16 @@ pub enum Ecosystem {
     /// logger so post-hoc auditing knows what was fetched. Skipped by
     /// `deps check`, OSV scan, and typosquat lookups.
     Git,
+    /// VS Code / OpenVSX editor extension (`.vsix`) install. Name is
+    /// the canonical `publisher.extension` identifier. Has no
+    /// publish-time semantics here (publish dates come from the
+    /// Marketplace `lastUpdated` field which the `extensionquery`
+    /// rewriter handles separately) — only used by the proxy's
+    /// install logger so post-hoc auditing knows which extensions
+    /// landed on the runner / developer laptop. Skipped by
+    /// `deps check`, OSV scan, and typosquat lookups for the same
+    /// reason `Git` is — no clean version-graph to query.
+    VscodeExtension,
 }
 
 impl Ecosystem {
@@ -53,6 +63,7 @@ impl Ecosystem {
             Ecosystem::Pypi => "pypi",
             Ecosystem::Nuget => "nuget",
             Ecosystem::Git => "git",
+            Ecosystem::VscodeExtension => "vscode-extension",
         }
     }
 }
@@ -220,6 +231,13 @@ fn fetch_published(
         // hand-built a Git Package — return None ("don't know") rather
         // than crash so deps check can carry on with the rest.
         Ecosystem::Git => None,
+        // VSCode/OpenVSX extensions: the Marketplace's `lastUpdated`
+        // field is the source of truth, served via `extensionquery`.
+        // `deps check` doesn't ingest those today (no lockfile shape
+        // for editor extensions), so reaching this arm means a caller
+        // hand-built a VscodeExtension Package — return None for the
+        // same fail-soft reason as Git.
+        Ecosystem::VscodeExtension => None,
     };
     if let (Some(dt), Some(c)) = (result, cache) {
         c.put(eco, name, version, dt);

@@ -346,6 +346,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         last_path: None,
         last_npm_tarball: None,
         last_pypi_sdist: None,
+        last_vsix: None,
         require_provenance: cfg.require_provenance,
         nuget_flat: NugetFlatContainerClient::new(cfg.user_agent.clone()),
         pypi_simple: PypiSimpleClient::new(cfg.user_agent.clone()),
@@ -598,6 +599,13 @@ struct SakimoriHandler {
     /// `.zip` ending). Wheels (`.whl`) are not tagged — they carry
     /// no install-time hook surface to inspect.
     last_pypi_sdist: Option<(String, String)>,
+    /// `Some((publisher, name, version))` when the in-flight request
+    /// was a pinned VS Code Marketplace / OpenVSX `.vsix` download.
+    /// `handle_response` runs the `.vsix` lifecycle gate against the
+    /// extension's `activationEvents` field when this is populated.
+    /// The allow-list key for an extension is the canonical
+    /// `publisher.name` identifier.
+    last_vsix: Option<(String, String, String)>,
     /// Forwarded from [`ProxyConfig::lifecycle_policy`]. `None`
     /// disables the gate entirely (no tarball buffering, no inspect).
     lifecycle_policy: Option<crate::lifecycle::LifecyclePolicy>,
@@ -945,6 +953,153 @@ impl SakimoriHandler {
             }
         }
     }
+
+    /// `.vsix` counterpart to [`Self::lifecycle_inspect_npm_tarball`].
+    ///
+    /// Block decision keys off `activationEvents` containing the
+    /// startup-autorun primitives (`"*"` or `onStartupFinished`) — the
+    /// highest-blast-radius VS Code extension shape and the one recent
+    /// supply-chain droppers favour because it removes the need to
+    /// convince a victim to invoke any specific command. Lazy
+    /// activation (`onCommand:…`, `onLanguage:…`, `workspaceContains:…`,
+    /// no `activationEvents` at all) is passed through.
+    ///
+    /// Strip mode falls back to Block: rewriting `activationEvents`
+    /// would require recomputing the Marketplace integrity hash the
+    /// editor later verifies, and the editor's signed-package flow on
+    /// Microsoft's gallery includes a separate Marketplace signature
+    /// that we can't forge. Documented in CLAUDE.md roadmap #21.
+    async fn lifecycle_inspect_vsix(
+        &self,
+        res: Response<Body>,
+        policy: crate::lifecycle::LifecyclePolicy,
+        publisher: &str,
+        name: &str,
+        version: &str,
+    ) -> Response<Body> {
+        use http_body_util::BodyExt;
+        let extension_id = format!("{publisher}.{name}");
+        let (mut parts, body) = res.into_parts();
+        let collected = match body.collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                log::warn!(
+                    "lifecycle(vsix): failed to buffer body for {extension_id}@{version}: {e}"
+                );
+                return Response::from_parts(parts, Body::empty());
+            }
+        };
+        let pass_through = || -> Response<Body> {
+            let mut parts2 = parts.clone();
+            parts2.headers.remove(http::header::CONTENT_LENGTH);
+            Response::from_parts(
+                parts2,
+                Body::from(http_body_util::Full::new(collected.clone())),
+            )
+        };
+        let inspection = match crate::vsix_inspect::inspect_vsix(&collected) {
+            Ok(i) => i,
+            Err(e) => {
+                log::warn!(
+                    "lifecycle(vsix): fail-open on {extension_id}@{version} — could not inspect: {e}"
+                );
+                return pass_through();
+            }
+        };
+        if !inspection.has_startup_autorun() {
+            log::debug!(
+                "lifecycle(vsix): {extension_id}@{version} — lazy activation only ({} event(s))",
+                inspection.activation_events.len()
+            );
+            return pass_through();
+        }
+        let events = inspection.activation_events.join(", ");
+        match policy {
+            crate::lifecycle::LifecyclePolicy::Audit => {
+                log::warn!(
+                    "lifecycle(vsix,audit): {extension_id}@{version} fires on editor startup: \
+                     activationEvents=[{events}]; main={main:?}",
+                    main = inspection.main,
+                );
+                pass_through()
+            }
+            crate::lifecycle::LifecyclePolicy::Block | crate::lifecycle::LifecyclePolicy::Strip => {
+                let mode_label = match policy {
+                    crate::lifecycle::LifecyclePolicy::Strip => "strip→block",
+                    _ => "block",
+                };
+                let reason = format!(
+                    "lifecycle(vsix,{mode_label}): blocking {extension_id}@{version} — \
+                     extension declares startup autorun (activationEvents=[{events}]). \
+                     Strip mode does not rewrite .vsix archives (the Marketplace integrity \
+                     hash the editor verifies would not match). Add `{extension_id}` to the \
+                     lifecycle allow-list if this install is expected, or relax to \
+                     `--lifecycle-policy audit` to log without blocking."
+                );
+                log::warn!("{reason}");
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("x-sakimori-deny", "lifecycle-vsix")
+                    .body(Body::from(format!("{reason}\n")))
+                    .expect("static lifecycle deny response")
+            }
+        }
+    }
+}
+
+/// Recognise a pinned `.vsix` download by URL shape.
+///
+/// Returns `Some((publisher, extension_name, version))` for both
+/// canonical Marketplace and OpenVSX URL shapes:
+///
+/// - Microsoft VS Code Marketplace:
+///   `/_apis/public/gallery/publishers/{publisher}/vsextensions/{ext}/{version}/vspackage`
+/// - OpenVSX REST API:
+///   `/api/{namespace}/{ext}/{version}/file/{namespace}.{ext}-{version}.vsix`
+///
+/// Returns `None` for any other path on a marketplace host (the
+/// `extensionquery` JSON, web app HTML, etc.).
+fn parse_vsix_download_path(path: &str) -> Option<(String, String, String)> {
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.split('#').next().unwrap_or(path);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Microsoft Marketplace shape: 7 segments,
+    // ["_apis", "public", "gallery", "publishers", <pub>,
+    //  "vsextensions", <ext>, <ver>, "vspackage"]
+    if segs.len() == 9
+        && segs[0].eq_ignore_ascii_case("_apis")
+        && segs[1].eq_ignore_ascii_case("public")
+        && segs[2].eq_ignore_ascii_case("gallery")
+        && segs[3].eq_ignore_ascii_case("publishers")
+        && segs[5].eq_ignore_ascii_case("vsextensions")
+        && segs[8].eq_ignore_ascii_case("vspackage")
+    {
+        let publisher = segs[4].to_string();
+        let name = segs[6].to_string();
+        let version = segs[7].to_string();
+        if !publisher.is_empty() && !name.is_empty() && !version.is_empty() {
+            return Some((publisher, name, version));
+        }
+    }
+
+    // OpenVSX REST shape: ["api", <ns>, <ext>, <ver>, "file", <filename.vsix>]
+    if segs.len() == 6
+        && segs[0].eq_ignore_ascii_case("api")
+        && segs[4].eq_ignore_ascii_case("file")
+        && segs[5].to_ascii_lowercase().ends_with(".vsix")
+    {
+        let publisher = segs[1].to_string();
+        let name = segs[2].to_string();
+        let version = segs[3].to_string();
+        if !publisher.is_empty() && !name.is_empty() && !version.is_empty() {
+            return Some((publisher, name, version));
+        }
+    }
+
+    None
 }
 
 /// Recognise PyPI source distribution URLs by file extension. We
@@ -1013,12 +1168,14 @@ impl HttpHandler for SakimoriHandler {
             self.last_path = None;
             self.last_npm_tarball = None;
             self.last_pypi_sdist = None;
+            self.last_vsix = None;
             return RequestOrResponse::Request(req);
         }
         self.last_host = Some(host.clone());
         // Reset per-request; the `Pinned` branch below may set it back.
         self.last_npm_tarball = None;
         self.last_pypi_sdist = None;
+        self.last_vsix = None;
         let path: String = req
             .uri()
             .path_and_query()
@@ -1042,6 +1199,51 @@ impl HttpHandler for SakimoriHandler {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // `.vsix` install logging + lifecycle gate. VS Code
+        // Marketplace / OpenVSX tarballs don't fit
+        // `ParseResult::Pinned` (publisher segment, no `.tgz`), so
+        // we recognise the URL shape directly on configured
+        // marketplace hosts. The install is logged with
+        // `Ecosystem::VscodeExtension` and name = canonical
+        // `publisher.extension` identifier (same form VS Code uses
+        // internally and that the lifecycle allow-list matches
+        // against). Logging happens regardless of `--lifecycle-policy`
+        // so a no-policy proxy still produces an editor-extension
+        // inventory. Lifecycle tagging is gated on policy + allow-list
+        // and feeds `handle_response`.
+        if host_in(&self.registries.vscode_marketplace, &host)
+            && let Some((publisher, ext_name, version)) = parse_vsix_download_path(&path)
+        {
+            let ext_id = format!("{publisher}.{ext_name}");
+            if self.install_logger.is_some() || self.otlp_exporter.is_some() {
+                let mode = classify_execution_mode(&user_agent);
+                let mut ev = InstallEvent::new(
+                    sakimori_core::deps::Ecosystem::VscodeExtension,
+                    ext_id.clone(),
+                    version.clone(),
+                )
+                .with_mode(mode);
+                if !user_agent.is_empty() {
+                    ev = ev.with_user_agent(&user_agent);
+                }
+                if let Some(logger) = self.install_logger.as_ref()
+                    && let Err(e) = logger.record(&ev)
+                {
+                    log::warn!("install log write failed (vsix): {e:#}");
+                }
+                if let Some(exporter) = self.otlp_exporter.as_ref() {
+                    exporter.dispatch(&ev);
+                }
+            }
+            if self.lifecycle_policy.is_some()
+                && !self
+                    .lifecycle_allow
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&ext_id))
+            {
+                self.last_vsix = Some((publisher, ext_name, version));
+            }
+        }
         match parse_for_host(&self.parsers, &host, &path) {
             ParseResult::Pinned {
                 ecosystem,
@@ -1123,6 +1325,14 @@ impl HttpHandler for SakimoriHandler {
         {
             return self
                 .lifecycle_inspect_pypi_sdist(res, policy, &name, &version)
+                .await;
+        }
+        if let Some(policy) = self.lifecycle_policy
+            && let Some((publisher, name, version)) = self.last_vsix.take()
+            && res.status().is_success()
+        {
+            return self
+                .lifecycle_inspect_vsix(res, policy, &publisher, &name, &version)
                 .await;
         }
 
@@ -1858,6 +2068,60 @@ fn deny_response(reason: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_vsix_marketplace_canonical_path() {
+        let r = parse_vsix_download_path(
+            "/_apis/public/gallery/publishers/ms-python/vsextensions/python/2024.0.0/vspackage",
+        );
+        assert_eq!(
+            r,
+            Some(("ms-python".into(), "python".into(), "2024.0.0".into()))
+        );
+    }
+
+    #[test]
+    fn parse_vsix_marketplace_strips_query() {
+        let r = parse_vsix_download_path(
+            "/_apis/public/gallery/publishers/foo/vsextensions/bar/1.2.3/vspackage?targetPlatform=linux-x64",
+        );
+        assert_eq!(r, Some(("foo".into(), "bar".into(), "1.2.3".into())));
+    }
+
+    #[test]
+    fn parse_vsix_openvsx_rest_path() {
+        let r = parse_vsix_download_path(
+            "/api/rust-lang/rust-analyzer/0.4.0/file/rust-lang.rust-analyzer-0.4.0.vsix",
+        );
+        assert_eq!(
+            r,
+            Some(("rust-lang".into(), "rust-analyzer".into(), "0.4.0".into()))
+        );
+    }
+
+    #[test]
+    fn parse_vsix_rejects_extensionquery_endpoint() {
+        // `extensionquery` is the JSON metadata endpoint, not a
+        // `.vsix` download — the rewriter handles it separately and
+        // the lifecycle gate must not tag it.
+        assert!(parse_vsix_download_path("/_apis/public/gallery/extensionquery").is_none());
+        assert!(parse_vsix_download_path("/vscode/gallery/extensionquery").is_none());
+    }
+
+    #[test]
+    fn parse_vsix_rejects_unrelated_paths() {
+        assert!(parse_vsix_download_path("/").is_none());
+        assert!(parse_vsix_download_path("/items?itemName=ms-python.python").is_none());
+        // Wrong segment count for Marketplace shape
+        assert!(
+            parse_vsix_download_path(
+                "/_apis/public/gallery/publishers/foo/vsextensions/bar/vspackage"
+            )
+            .is_none()
+        );
+        // Missing .vsix suffix on OpenVSX shape
+        assert!(parse_vsix_download_path("/api/foo/bar/1.0.0/file/readme.md").is_none());
+    }
 
     #[test]
     fn classify_execution_mode_recognises_one_shot_runners() {

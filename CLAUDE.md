@@ -1117,27 +1117,62 @@ and lights up the most existing detection for free.
     return the default Inspection, defence does not fabricate
     denials on malformed-but-legitimate artefacts.
 
-    Still pending: proxy integration (recognise the
-    `.../vsextensions/<pub>/<ext>/<ver>/vspackage` URL shape in
-    `classify_response`, dispatch `LifecyclePolicy::{Audit,Block}`
-    on the inspected result), strip mode (rewrite
-    `activationEvents` + recompute the Marketplace integrity
-    hash), and `.crx` audit. `main` JS body scanning belongs
-    naturally in `iocs::ContentNeedle` rather than here. `.crx`
-    is signed end-to-end so strip is impossible by design;
-    audit/block only.
+    Proxy integration landed in this slice: `parse_vsix_download_path`
+    recognises both the canonical Marketplace shape
+    (`/_apis/public/gallery/publishers/<pub>/vsextensions/<ext>/<ver>/vspackage`)
+    and OpenVSX's REST shape (`/api/<ns>/<ext>/<ver>/file/<…>.vsix`).
+    When `--lifecycle-policy` is on and the response is for a
+    matching URL on a configured `vscode_marketplace` host, the proxy
+    buffers the `.vsix` bytes, runs `vsix_inspect::inspect_vsix`, and
+    in **Audit** mode logs the manifest (publisher, name, version,
+    `activationEvents`, `main`) for any extension that fires on
+    startup; in **Block** mode returns 403 with
+    `x-sakimori-deny: lifecycle-vsix` when `fires_on_startup` is true
+    (the wildcard `"*"` and `onStartupFinished` activation
+    primitives). Lazy activation (`onCommand:…`, `onLanguage:…`,
+    `workspaceContains:…`, no `activationEvents` at all) passes
+    through. Allow-list keys are canonical `publisher.name`
+    identifiers, case-insensitive — same shape VS Code itself uses.
+    `Strip` policy on `.vsix` falls back to `Block` semantics: the
+    Marketplace integrity hash the editor verifies covers the
+    archive bytes, so an in-place rewrite would be rejected.
+
+    Still pending: strip mode is effectively out of scope (the
+    Marketplace integrity hash + Microsoft signed-package flow
+    cover the archive bytes, so an in-place rewrite would be
+    rejected). `.crx` (Chrome extensions) audit is still pending;
+    `.crx` is signed end-to-end so strip is impossible by design,
+    audit/block only. `main` JS body scanning belongs naturally in
+    `iocs::ContentNeedle` rather than here.
 
 22. **Extension installs in the `InstallEvent` inventory.**
-    Extend the `Ecosystem` enum (Roadmap #6) with
-    `VscodeExtension` / `ChromeExtension`. The proxy logger
-    already runs on every allowed install path; once #20 lands,
-    the Marketplace fetch matches an ecosystem and gets appended
-    to `~/.sakimori/installs.jsonl` and (if configured) dispatched
-    via `/ingest` and OTLP. `sakimori advisories scan` then
-    queries OSV/GHSA for advisories against extension IDs and
-    surfaces past installs — the same retroactive-CVE story
-    Dependabot/Snyk fundamentally can't tell because they're
-    repo-lockfile-bound.
+    ✅ VS Code half implemented. `Ecosystem::VscodeExtension`
+    (label `"vscode-extension"`) is now a sibling of `Git` in
+    `sakimori-core::deps`. The proxy recognises pinned `.vsix`
+    download URLs on configured `vscode_marketplace` hosts (the
+    canonical Marketplace `/_apis/.../vspackage` shape and OpenVSX
+    `/api/<ns>/<ext>/<ver>/file/<…>.vsix`) and emits an
+    `InstallEvent` with name = `publisher.extension` for every
+    fetch, regardless of `--lifecycle-policy`. The same event
+    flows through `install_logger` (`~/.sakimori/installs.jsonl`)
+    and the OTLP exporter when configured. `Decider` /
+    `KnownBadOracle` / typosquat / OSV exhaustive matches all
+    return None — the variant carries no publish-time, OSV
+    ecosystem, or top-N typosquat list, the same way `Git` does.
+
+    `sakimori advisories scan` already iterates every
+    `InstallEvent` in the log and queries OSV. Because
+    `eco_to_osv(VscodeExtension)` returns `None`, those entries
+    are silently skipped today — once OSV.dev publishes a
+    `vscode-marketplace` ecosystem (or we mirror GitHub Advisory
+    Database's VSCode advisories), the JOIN will light up with
+    zero further proxy changes.
+
+    `ChromeExtension` is still pending and gated on roadmap #20's
+    Chrome Web Store half (no inline publish-time means the
+    update endpoint needs an out-of-band lookup we haven't built).
+    Once that lands the same `InstallEvent` pattern extends
+    naturally.
 
 23. **Workspace `.vscode/` / `.cursor/` as known-IOC surface.**
     ✅ first rule landed in catalog v2026.05.21:
