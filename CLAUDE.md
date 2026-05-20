@@ -1078,17 +1078,23 @@ and lights up the most existing detection for free.
     repo-lockfile-bound.
 
 23. **Workspace `.vscode/` / `.cursor/` as known-IOC surface.**
-    Extend the IOC catalog (#18) with three rules:
-    - `Basename(".vscode/tasks.json")` content-needle for
-      `"runOn": "folderOpen"` — folder-open auto-execution.
-    - `Basename(".vscode/settings.json")` content-needle for
-      `terminal.integrated.profiles.*.args` containing
-      shell-redirected commands.
-    - `Basename(".vscode/extensions.json")` content-needle for
-      unpinned publisher.extension recommendations from
-      non-canonical publishers (heuristic).
-    Same severity weighting as the existing `.claude/setup.mjs`
-    High rule — workspace-scoped autorun primitives.
+    ✅ first rule landed in catalog v2026.05.21:
+    `vscode.tasks-folderopen-autorun` is a `ContentNeedle`
+    constrained to basename `tasks.json` matching the literal
+    `"runOn": "folderOpen"` key/value. That's the canonical VSCode
+    primitive for "execute on workspace open" — a clean repo
+    essentially never ships it, and the value-string is specific
+    enough that the basename filter alone keeps false positives
+    near zero. Severity High, family `editor-extension`. Cursor's
+    `.cursor/tasks.json` rides the same rule (basename match is
+    parent-directory-agnostic).
+
+    Still pending: settings.json `terminal.integrated.profiles.*.args`
+    needing shell-redirected commands (substring matching alone
+    yields too many false positives; needs structural parsing —
+    follow-up), and `extensions.json` recommendations from
+    non-canonical publishers (heuristic; legitimate teams pin
+    private extensions all the time, can't ship as a hard rule).
 
 24. **Editor extension directory tamper detection.**
     `sakimori workspace snapshot --include-editor-extensions`
