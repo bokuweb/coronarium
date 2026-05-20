@@ -192,6 +192,12 @@ fn eco_to_osv(eco: Ecosystem) -> Option<&'static str> {
         // ecosystems that happen to host their canonical source there
         // — we'd be guessing). Return None and let the caller skip.
         Ecosystem::Git => None,
+        // VS Code extensions: OSV.dev does not currently advertise a
+        // dedicated ecosystem string for Marketplace / OpenVSX
+        // extensions (the closest is `GitHub Actions` for an
+        // unrelated surface). Return None and let the caller skip
+        // until OSV adds editor-extension coverage.
+        Ecosystem::VscodeExtension => None,
     }
 }
 

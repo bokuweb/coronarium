@@ -196,6 +196,12 @@ fn top_list_for(eco: Ecosystem) -> &'static [&'static str] {
         // `github.com/owner/repo` is not part of any package
         // registry's top-N download ranking.
         Ecosystem::Git => &[],
+        // VS Code Marketplace `publisher.name` identifiers have
+        // their own popularity ranking but we don't mirror it yet —
+        // and the typosquat detector targets the install path of
+        // package managers (npm / cargo / pypi / nuget), not the
+        // editor extension surface, so silence is correct here.
+        Ecosystem::VscodeExtension => &[],
     }
 }
 
@@ -240,6 +246,9 @@ impl MirrorLists {
             // Git deps aren't part of the mirrored top-N — see
             // `top_list_for`.
             Ecosystem::Git => &[],
+            // VS Code extensions aren't part of the mirrored top-N
+            // for the same reason — see `top_list_for`.
+            Ecosystem::VscodeExtension => &[],
         }
     }
 

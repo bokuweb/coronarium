@@ -1146,16 +1146,33 @@ and lights up the most existing detection for free.
     `iocs::ContentNeedle` rather than here.
 
 22. **Extension installs in the `InstallEvent` inventory.**
-    Extend the `Ecosystem` enum (Roadmap #6) with
-    `VscodeExtension` / `ChromeExtension`. The proxy logger
-    already runs on every allowed install path; once #20 lands,
-    the Marketplace fetch matches an ecosystem and gets appended
-    to `~/.sakimori/installs.jsonl` and (if configured) dispatched
-    via `/ingest` and OTLP. `sakimori advisories scan` then
-    queries OSV/GHSA for advisories against extension IDs and
-    surfaces past installs — the same retroactive-CVE story
-    Dependabot/Snyk fundamentally can't tell because they're
-    repo-lockfile-bound.
+    ✅ VS Code half implemented. `Ecosystem::VscodeExtension`
+    (label `"vscode-extension"`) is now a sibling of `Git` in
+    `sakimori-core::deps`. The proxy recognises pinned `.vsix`
+    download URLs on configured `vscode_marketplace` hosts (the
+    canonical Marketplace `/_apis/.../vspackage` shape and OpenVSX
+    `/api/<ns>/<ext>/<ver>/file/<…>.vsix`) and emits an
+    `InstallEvent` with name = `publisher.extension` for every
+    fetch, regardless of `--lifecycle-policy`. The same event
+    flows through `install_logger` (`~/.sakimori/installs.jsonl`)
+    and the OTLP exporter when configured. `Decider` /
+    `KnownBadOracle` / typosquat / OSV exhaustive matches all
+    return None — the variant carries no publish-time, OSV
+    ecosystem, or top-N typosquat list, the same way `Git` does.
+
+    `sakimori advisories scan` already iterates every
+    `InstallEvent` in the log and queries OSV. Because
+    `eco_to_osv(VscodeExtension)` returns `None`, those entries
+    are silently skipped today — once OSV.dev publishes a
+    `vscode-marketplace` ecosystem (or we mirror GitHub Advisory
+    Database's VSCode advisories), the JOIN will light up with
+    zero further proxy changes.
+
+    `ChromeExtension` is still pending and gated on roadmap #20's
+    Chrome Web Store half (no inline publish-time means the
+    update endpoint needs an out-of-band lookup we haven't built).
+    Once that lands the same `InstallEvent` pattern extends
+    naturally.
 
 23. **Workspace `.vscode/` / `.cursor/` as known-IOC surface.**
     ✅ first rule landed in catalog v2026.05.21:

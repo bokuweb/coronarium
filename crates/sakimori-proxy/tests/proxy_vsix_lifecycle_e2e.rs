@@ -227,6 +227,59 @@ async fn vsix_with_lazy_activation_passes_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vsix_install_is_logged_with_publisher_dot_name_identity() {
+    // Roadmap #22: every `.vsix` fetched through the proxy lands in
+    // `installs.jsonl` with `ecosystem: vscode-extension` and name =
+    // canonical `publisher.extension`. This holds regardless of
+    // lifecycle policy — the inventory needs to be complete so a
+    // post-hoc CVE scan covers what was actually installed.
+    let vsix = build_vsix(
+        r#"{
+            "name": "ok-ext",
+            "publisher": "trusted",
+            "version": "2.5.0",
+            "activationEvents": ["onCommand:foo.bar"]
+        }"#,
+    );
+    let upstream = spawn_mock_upstream(vsix, "application/octet-stream").await;
+
+    let log_dir = tmp_config_dir("installog");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let log_path = log_dir.join("installs.jsonl");
+    let log_path_for_cfg = log_path.clone();
+    let proxy = spawn_proxy(move |cfg| {
+        cfg.lifecycle_policy = None;
+        cfg.install_log_enabled = true;
+        cfg.install_log_path = Some(log_path_for_cfg);
+    })
+    .await;
+
+    let url = format!(
+        "http://{upstream}/_apis/public/gallery/publishers/trusted/vsextensions/ok-ext/2.5.0/vspackage"
+    );
+    let (status, _body, _deny) =
+        tokio::task::spawn_blocking(move || http_get_through_proxy(proxy, &url))
+            .await
+            .unwrap();
+    assert_eq!(status, 200);
+
+    // Give the proxy a beat to flush; the logger writes synchronously
+    // but the response runs on another task.
+    for _ in 0..50 {
+        if log_path.exists() && std::fs::metadata(&log_path).unwrap().len() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let raw = std::fs::read_to_string(&log_path).expect("install log was written");
+    let line = raw.lines().next().expect("at least one log line");
+    let ev: serde_json::Value = serde_json::from_str(line).expect("log line is valid JSON");
+    assert_eq!(ev["ecosystem"], "vscode-extension");
+    assert_eq!(ev["name"], "trusted.ok-ext");
+    assert_eq!(ev["version"], "2.5.0");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vsix_on_lifecycle_allow_list_bypasses_block() {
     // Same wildcard manifest as the block test, but the
     // `publisher.name` is on the allow-list, so the gate must not

@@ -249,6 +249,12 @@ impl AgeOracle for RegistryOracle {
             // classify github.com traffic as Pinned), but the match
             // must stay exhaustive.
             Ecosystem::Git => Ok(None),
+            // VS Code extensions don't reach the decider either —
+            // the `.vsix` install logger bypasses the Pinned decision
+            // path (see `parse_vsix_download_path`) since the
+            // Marketplace `lastUpdated` field is on the metadata
+            // endpoint, not the tarball URL.
+            Ecosystem::VscodeExtension => Ok(None),
         }
     }
 }

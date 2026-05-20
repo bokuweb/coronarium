@@ -1199,22 +1199,47 @@ impl HttpHandler for SakimoriHandler {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("")
             .to_string();
-        // `.vsix` lifecycle gate — VS Code Marketplace / OpenVSX
-        // tarballs aren't in `ParseResult::Pinned` because
-        // `Ecosystem` doesn't carry an editor-extension variant yet
-        // (roadmap #22). Recognise the URL shape directly on
-        // configured marketplace hosts and tag the response for
-        // inspection. Allow-list keys are canonical `publisher.name`
-        // identifiers, case-insensitive.
-        if self.lifecycle_policy.is_some()
-            && host_in(&self.registries.vscode_marketplace, &host)
+        // `.vsix` install logging + lifecycle gate. VS Code
+        // Marketplace / OpenVSX tarballs don't fit
+        // `ParseResult::Pinned` (publisher segment, no `.tgz`), so
+        // we recognise the URL shape directly on configured
+        // marketplace hosts. The install is logged with
+        // `Ecosystem::VscodeExtension` and name = canonical
+        // `publisher.extension` identifier (same form VS Code uses
+        // internally and that the lifecycle allow-list matches
+        // against). Logging happens regardless of `--lifecycle-policy`
+        // so a no-policy proxy still produces an editor-extension
+        // inventory. Lifecycle tagging is gated on policy + allow-list
+        // and feeds `handle_response`.
+        if host_in(&self.registries.vscode_marketplace, &host)
             && let Some((publisher, ext_name, version)) = parse_vsix_download_path(&path)
         {
             let ext_id = format!("{publisher}.{ext_name}");
-            if !self
-                .lifecycle_allow
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(&ext_id))
+            if self.install_logger.is_some() || self.otlp_exporter.is_some() {
+                let mode = classify_execution_mode(&user_agent);
+                let mut ev = InstallEvent::new(
+                    sakimori_core::deps::Ecosystem::VscodeExtension,
+                    ext_id.clone(),
+                    version.clone(),
+                )
+                .with_mode(mode);
+                if !user_agent.is_empty() {
+                    ev = ev.with_user_agent(&user_agent);
+                }
+                if let Some(logger) = self.install_logger.as_ref()
+                    && let Err(e) = logger.record(&ev)
+                {
+                    log::warn!("install log write failed (vsix): {e:#}");
+                }
+                if let Some(exporter) = self.otlp_exporter.as_ref() {
+                    exporter.dispatch(&ev);
+                }
+            }
+            if self.lifecycle_policy.is_some()
+                && !self
+                    .lifecycle_allow
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&ext_id))
             {
                 self.last_vsix = Some((publisher, ext_name, version));
             }
