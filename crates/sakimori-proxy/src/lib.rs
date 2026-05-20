@@ -19,6 +19,7 @@ pub mod rewrite;
 pub mod rewrite_npm;
 pub mod rewrite_nuget;
 pub mod rewrite_pypi;
+pub mod rewrite_vscode;
 pub mod sigstore_verify;
 pub mod strip_cache;
 pub mod typosquat;
@@ -40,3 +41,4 @@ pub use rewrite_pypi::{
     PypiRewriteStats, extract_publish_times_from_pypi_json, rewrite_pypi_json_api,
     rewrite_pypi_simple_html, rewrite_pypi_simple_json,
 };
+pub use rewrite_vscode::{VscodeRewriteStats, rewrite_extensionquery_json};

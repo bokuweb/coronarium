@@ -1018,16 +1018,32 @@ and lights up the most existing detection for free.
     Treat `marketplace.visualstudio.com`, `open-vsx.org`, and the
     Chrome Web Store update endpoint (`clients2.google.com/
     service/update2/crx`) as new ecosystems in `RegistryHosts`.
-    - VSCode Marketplace `extensionquery` returns JSON with
-      `versions[].lastUpdated` per entry — apply the same
-      min-release-age filter the npm packument rewriter uses.
-    - OpenVSX has the identical shape (it's an API-compatible
-      mirror).
+    - **VSCode Marketplace + OpenVSX**: ✅ first slice implemented
+      as `crate::rewrite_vscode::rewrite_extensionquery_json`.
+      `RegistryHosts` gains a `vscode_marketplace` list defaulting
+      to both canonical hosts; the proxy recognises the
+      `POST /_apis/public/gallery/extensionquery` (MS) and
+      `POST /vscode/gallery/extensionquery` (OpenVSX compat shim)
+      endpoints in `classify_response` and routes the JSON
+      response to the rewriter. Filtering walks every
+      `results[].extensions[].versions[]` array and drops entries
+      whose `lastUpdated` is younger than `--min-age` — same
+      silent-fallback model the npm packument rewriter uses. If
+      every version of an extension is dropped, the rewriter
+      leaves the `extensions[]` entry in place with an empty
+      `versions: []` so the editor surfaces a clean "no
+      installable version" error instead of silently dropping the
+      extension (which would mask legitimate missing-on-mirror
+      cases). Missing / unparseable `lastUpdated` fails open per
+      `serde_json` policy; the tarball-pin lifecycle gate (#21) is
+      the backstop. `--vscode-marketplace-registry <HOST>`
+      (repeatable) teaches the proxy about corp-internal galleries
+      that speak the same envelope.
     - Chrome Web Store update XML carries no publish timestamp
       inline; needs an out-of-band lookup to the web-store detail
       page or the unofficial JSON endpoint, cached per-extension
       like the NuGet flat-container resolver. Fail-open with a
-      warn log if the lookup fails.
+      warn log if the lookup fails. **Not yet implemented.**
 
     Pairs with the SNI allow-list (#8) so corp installs can lock
     to internal extension mirrors and forbid the public hosts.

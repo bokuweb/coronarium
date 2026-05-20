@@ -741,6 +741,7 @@ mod tests {
             crates: vec![],
             crates_sparse: vec![],
             nuget: vec![],
+            vscode_marketplace: vec![],
         };
         let ps = parsers_from_hosts(&h);
         for host in [

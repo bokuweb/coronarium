@@ -1216,6 +1216,22 @@ impl HttpHandler for SakimoriHandler {
                 }
                 out
             }
+            RewriteTarget::VscodeExtensionQuery => {
+                let (out, stats) = crate::rewrite_vscode::rewrite_extensionquery_json(
+                    &collected,
+                    self.decider.min_age,
+                    now,
+                );
+                if stats.dropped > 0 {
+                    log::info!(
+                        "vscode-rewrite: dropped {} version(s), kept {}, emptied {} extension(s)",
+                        stats.dropped,
+                        stats.kept,
+                        stats.emptied_extensions,
+                    );
+                }
+                out
+            }
             RewriteTarget::NugetFlatContainerIndex(id) => {
                 // Look up publish times from the registration endpoint.
                 // Cached per package; a failed lookup yields an empty
@@ -1608,6 +1624,12 @@ enum RewriteTarget {
     /// handler can feed it to the out-of-band registration fetcher
     /// without re-parsing the path.
     NugetFlatContainerIndex(String),
+    /// VS Code Marketplace / OpenVSX `extensionquery` POST response.
+    /// JSON envelope with `results[].extensions[].versions[]` — the
+    /// rewriter filters each `versions[]` by `lastUpdated` against
+    /// `--min-age` so the editor's installer naturally falls back to
+    /// the newest surviving version (pnpm-style silent fallback).
+    VscodeExtensionQuery,
 }
 
 /// Match the in-flight `(host, path)` to a rewriter. Returning `None`
@@ -1651,7 +1673,22 @@ fn classify_response(
             return Some(RewriteTarget::NugetFlatContainerIndex(id));
         }
     }
+    if host_in(&registries.vscode_marketplace, host) && is_extensionquery_path(path) {
+        return Some(RewriteTarget::VscodeExtensionQuery);
+    }
     None
+}
+
+/// Recognise the VS Code Marketplace / OpenVSX `extensionquery`
+/// endpoint. Microsoft's gallery serves it at
+/// `/_apis/public/gallery/extensionquery`; OpenVSX exposes a
+/// compatibility shim at `/vscode/gallery/extensionquery`. Both
+/// return the same JSON envelope.
+fn is_extensionquery_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    path.eq_ignore_ascii_case("/_apis/public/gallery/extensionquery")
+        || path.eq_ignore_ascii_case("/vscode/gallery/extensionquery")
 }
 
 fn host_in(set: &[String], host: &str) -> bool {
@@ -1987,6 +2024,34 @@ mod tests {
             classify_response(
                 Some("api.nuget.org"),
                 Some("/v3-flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg"),
+                &r,
+            ),
+            None
+        );
+        // VS Code Marketplace + OpenVSX extensionquery — both
+        // canonical hosts share the same RewriteTarget; Microsoft's
+        // path and OpenVSX's compat-shim path both match.
+        assert_eq!(
+            classify_response(
+                Some("marketplace.visualstudio.com"),
+                Some("/_apis/public/gallery/extensionquery"),
+                &r,
+            ),
+            Some(RewriteTarget::VscodeExtensionQuery)
+        );
+        assert_eq!(
+            classify_response(
+                Some("open-vsx.org"),
+                Some("/vscode/gallery/extensionquery"),
+                &r,
+            ),
+            Some(RewriteTarget::VscodeExtensionQuery)
+        );
+        // Unknown path on a marketplace host falls through.
+        assert_eq!(
+            classify_response(
+                Some("marketplace.visualstudio.com"),
+                Some("/api/something/else"),
                 &r,
             ),
             None

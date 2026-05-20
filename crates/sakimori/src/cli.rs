@@ -51,6 +51,10 @@ fn build_registries(args: &ProxyStartArgs) -> Result<sakimori_proxy::RegistryHos
         crates: normalize_hosts("--cargo-registry-host", &args.cargo_registry_host)?,
         crates_sparse: normalize_hosts("--cargo-sparse-host", &args.cargo_sparse_host)?,
         nuget: normalize_hosts("--nuget-registry", &args.nuget_registry)?,
+        vscode_marketplace: normalize_hosts(
+            "--vscode-marketplace-registry",
+            &args.vscode_marketplace_registry,
+        )?,
     };
     Ok(sakimori_proxy::RegistryHosts::merge(file, cli))
 }
@@ -834,6 +838,13 @@ pub struct ProxyStartArgs {
     /// `api.nuget.org` is always watched.
     #[arg(long = "nuget-registry", value_name = "HOST")]
     pub nuget_registry: Vec<String>,
+    /// Additional VS Code Marketplace / OpenVSX host to watch
+    /// (repeatable). The canonical `marketplace.visualstudio.com`
+    /// and `open-vsx.org` are always watched; this flag covers
+    /// corp-internal extension galleries that speak the same
+    /// `extensionquery` JSON envelope.
+    #[arg(long = "vscode-marketplace-registry", value_name = "HOST")]
+    pub vscode_marketplace_registry: Vec<String>,
     /// TOML file describing the same per-ecosystem host lists.
     /// Layered after the built-in defaults and before the `--*-
     /// registry` CLI flags; all three sources are appended + deduped
