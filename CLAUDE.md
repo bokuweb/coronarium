@@ -1117,15 +1117,33 @@ and lights up the most existing detection for free.
     return the default Inspection, defence does not fabricate
     denials on malformed-but-legitimate artefacts.
 
-    Still pending: proxy integration (recognise the
-    `.../vsextensions/<pub>/<ext>/<ver>/vspackage` URL shape in
-    `classify_response`, dispatch `LifecyclePolicy::{Audit,Block}`
-    on the inspected result), strip mode (rewrite
-    `activationEvents` + recompute the Marketplace integrity
-    hash), and `.crx` audit. `main` JS body scanning belongs
-    naturally in `iocs::ContentNeedle` rather than here. `.crx`
-    is signed end-to-end so strip is impossible by design;
-    audit/block only.
+    Proxy integration landed in this slice: `parse_vsix_download_path`
+    recognises both the canonical Marketplace shape
+    (`/_apis/public/gallery/publishers/<pub>/vsextensions/<ext>/<ver>/vspackage`)
+    and OpenVSX's REST shape (`/api/<ns>/<ext>/<ver>/file/<…>.vsix`).
+    When `--lifecycle-policy` is on and the response is for a
+    matching URL on a configured `vscode_marketplace` host, the proxy
+    buffers the `.vsix` bytes, runs `vsix_inspect::inspect_vsix`, and
+    in **Audit** mode logs the manifest (publisher, name, version,
+    `activationEvents`, `main`) for any extension that fires on
+    startup; in **Block** mode returns 403 with
+    `x-sakimori-deny: lifecycle-vsix` when `fires_on_startup` is true
+    (the wildcard `"*"` and `onStartupFinished` activation
+    primitives). Lazy activation (`onCommand:…`, `onLanguage:…`,
+    `workspaceContains:…`, no `activationEvents` at all) passes
+    through. Allow-list keys are canonical `publisher.name`
+    identifiers, case-insensitive — same shape VS Code itself uses.
+    `Strip` policy on `.vsix` falls back to `Block` semantics: the
+    Marketplace integrity hash the editor verifies covers the
+    archive bytes, so an in-place rewrite would be rejected.
+
+    Still pending: strip mode is effectively out of scope (the
+    Marketplace integrity hash + Microsoft signed-package flow
+    cover the archive bytes, so an in-place rewrite would be
+    rejected). `.crx` (Chrome extensions) audit is still pending;
+    `.crx` is signed end-to-end so strip is impossible by design,
+    audit/block only. `main` JS body scanning belongs naturally in
+    `iocs::ContentNeedle` rather than here.
 
 22. **Extension installs in the `InstallEvent` inventory.**
     Extend the `Ecosystem` enum (Roadmap #6) with
