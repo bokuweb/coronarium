@@ -250,6 +250,42 @@ the canonical public hosts, list the internal hosts under
    reassures users that the existing SIGKILL tripwire is still
    in effect). The kprobe BPF program + attach path is the
    next slice.
+4b. **Lift the `FILE_DENY_MAX_ENTRIES = 8` cap.** The 8-entry
+    ceiling is not an algorithmic limit — it's the verifier-budget
+    fallout of fully unrolling `file_deny_matches` in
+    [crates/sakimori-ebpf/src/main.rs:203](crates/sakimori-ebpf/src/main.rs)
+    (8 entries × `FILE_DENY_PREFIX_LEN` bytes of inner compare,
+    all inlined). Today this forces every `policy preset` to
+    triage which 8 prefixes matter (e.g. `persistence` covers
+    `.ssh` but cannot add `~/.aws/credentials`, `~/.kube/config`,
+    `~/.config/op/` in the same pack). Three viable lifts, listed
+    in increasing payoff:
+    - **Bounded loop (kernel ≥ 5.3)** — drop the unroll, let the
+      verifier handle a real loop. Cheapest diff, but still O(N)
+      per open and verifier budget regrows with N — buys maybe
+      32–64 entries, not 1000s.
+    - **`BPF_MAP_TYPE_LPM_TRIE`** — replace the linear-scan Array
+      with an LPM trie keyed on the path prefix. Lookup becomes
+      O(path_len) regardless of rule count, so the cap effectively
+      disappears (map `max_entries` becomes the only limit, and
+      that's a userspace tunable). Side benefit: trie keys are
+      already prefix-shaped, so `*.example`-style suffix matching
+      falls out naturally if we reverse the byte order on insert.
+      Recommended path.
+    - **Shrink `FILE_DENY_PREFIX_LEN`** — orthogonal stop-gap; only
+      helps if the current prefix length is much larger than the
+      median deny rule. Doesn't change asymptotic shape.
+
+    Pairs with the `persistence` preset (Roadmap #16) — once the
+    cap is gone, that preset can grow to cover the full cloud-
+    credential file set (`~/.aws/credentials`,
+    `~/.aws/config`, `~/.kube/config`, `~/.config/op/`,
+    `~/.docker/config.json`, `~/.netrc`, `~/.config/gh/hosts.yml`,
+    `~/.npmrc`) without dropping `.ssh`/LaunchAgents. The macOS
+    Endpoint Security path (#5b) has no equivalent limit — policy
+    list length is the only bound — so this lift only unblocks
+    Linux parity, but Linux is where most CI runs anyway.
+
 5. **macOS live block** — either a Network Extension (heavy, needs
    signing) or an HTTPS proxy (see #2).
 5b. **macOS supervised mode (exec + file attribution via Endpoint
