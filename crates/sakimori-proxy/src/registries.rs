@@ -40,6 +40,11 @@ pub struct RegistryHosts {
     /// NuGet v3 host(s) (registration + flat-container endpoints).
     /// Default: `api.nuget.org`.
     pub nuget: Vec<String>,
+    /// VS Code Marketplace / OpenVSX host(s) — the gallery API
+    /// serving `extensionquery` JSON. Default:
+    /// `marketplace.visualstudio.com`, `open-vsx.org`. Both speak the
+    /// same response envelope so the rewriter handles them uniformly.
+    pub vscode_marketplace: Vec<String>,
 }
 
 impl Default for RegistryHosts {
@@ -51,6 +56,7 @@ impl Default for RegistryHosts {
             crates: vec!["crates.io".into()],
             crates_sparse: vec!["index.crates.io".into()],
             nuget: vec!["api.nuget.org".into()],
+            vscode_marketplace: vec!["marketplace.visualstudio.com".into(), "open-vsx.org".into()],
         }
     }
 }
@@ -98,6 +104,7 @@ impl RegistryHosts {
         extend(&mut self.crates, &other.crates);
         extend(&mut self.crates_sparse, &other.crates_sparse);
         extend(&mut self.nuget, &other.nuget);
+        extend(&mut self.vscode_marketplace, &other.vscode_marketplace);
     }
 
     /// Convenience: start from `Default::default()`, then layer in

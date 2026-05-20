@@ -984,6 +984,168 @@ of value-per-implementation-cost.
     (dropper-signature bytes, base64-encoded private-key headers)
     as reproducible samples surface.
 
+### Editor-extension coverage (VSCode / Cursor / Chrome)
+
+The 2026-05 GitHub-internal-repo compromise (poisoned VS Code
+extension on an employee device) made it explicit: editor and
+browser extensions are a parallel distribution channel sakimori
+doesn't currently cover. The fetch path is HTTPS, the install
+artefact has a structured manifest, and the runtime parent is a
+known editor binary — all three properties the existing proxy +
+attribution + IOC catalog were designed for. Roadmap entries
+below are listed in implementation order; #19 is the cheapest
+and lights up the most existing detection for free.
+
+19. **Attribution: recognise editor binaries as a tool root.**
+    The v0.23 attribution layer walks PPid up from each event
+    until it finds a known `argv[0]` (npm, cargo, pip, …) and
+    stamps `source: <pm>` on the event. Add `code`,
+    `code-server`, `cursor`, `windsurf`, `code-helper`
+    (electron renderer/plugin host basename on macOS) to the
+    recognised set. The moment those are in,
+    `cloud_secrets::scan` (#17), the persistence-write rule pack
+    (#16), and the IOC scanner (#18) all attribute extension-
+    spawned syscalls back to the editor — i.e. "VSCode extension
+    just opened `~/.ssh/id_ed25519`" surfaces in the existing
+    JSON log + step summary + HTML report with no further
+    changes. Smallest possible diff, largest immediate value.
+    Naming caveat: the enum is currently `PackageManager`; an
+    editor isn't strictly that, but the field is semantically
+    "attribution root". Future rename optional, not required for
+    this slice.
+
+20. **Marketplace as a proxy ecosystem (release-age + IOC pin).**
+    Treat `marketplace.visualstudio.com`, `open-vsx.org`, and the
+    Chrome Web Store update endpoint (`clients2.google.com/
+    service/update2/crx`) as new ecosystems in `RegistryHosts`.
+    - **VSCode Marketplace + OpenVSX**: ✅ first slice implemented
+      as `crate::rewrite_vscode::rewrite_extensionquery_json`.
+      `RegistryHosts` gains a `vscode_marketplace` list defaulting
+      to both canonical hosts; the proxy recognises the
+      `POST /_apis/public/gallery/extensionquery` (MS) and
+      `POST /vscode/gallery/extensionquery` (OpenVSX compat shim)
+      endpoints in `classify_response` and routes the JSON
+      response to the rewriter. Filtering walks every
+      `results[].extensions[].versions[]` array and drops entries
+      whose `lastUpdated` is younger than `--min-age` — same
+      silent-fallback model the npm packument rewriter uses. If
+      every version of an extension is dropped, the rewriter
+      leaves the `extensions[]` entry in place with an empty
+      `versions: []` so the editor surfaces a clean "no
+      installable version" error instead of silently dropping the
+      extension (which would mask legitimate missing-on-mirror
+      cases). Missing / unparseable `lastUpdated` fails open per
+      `serde_json` policy; the tarball-pin lifecycle gate (#21) is
+      the backstop. `--vscode-marketplace-registry <HOST>`
+      (repeatable) teaches the proxy about corp-internal galleries
+      that speak the same envelope.
+    - Chrome Web Store update XML carries no publish timestamp
+      inline; needs an out-of-band lookup to the web-store detail
+      page or the unofficial JSON endpoint, cached per-extension
+      like the NuGet flat-container resolver. Fail-open with a
+      warn log if the lookup fails. **Not yet implemented.**
+
+    Pairs with the SNI allow-list (#8) so corp installs can lock
+    to internal extension mirrors and forbid the public hosts.
+
+21. **`.vsix` / `.crx` lifecycle gate.**
+    ✅ inspector library landed as `sakimori-proxy::vsix_inspect`.
+    `inspect_vsix(body)` opens the OPC zip, pulls
+    `extension/package.json`, and returns
+    `VsixInspection { name, publisher, version, activation_events,
+    main, fires_on_startup }`. The `fires_on_startup` bool flags
+    the two startup-autorun shapes (`"*"` wildcard and
+    `onStartupFinished`) — the highest-blast-radius VSCode
+    activation primitives, and the ones recent supply-chain
+    droppers favour. Hard ceilings (`MAX_VSIX_BYTES = 100 MiB`,
+    `MAX_PACKAGE_JSON_BYTES = 1 MiB`) keep a malicious zip from
+    stalling the proxy. Fail-open shape mirrors the npm
+    inspector: corrupt zip / missing manifest / unparseable JSON
+    return the default Inspection, defence does not fabricate
+    denials on malformed-but-legitimate artefacts.
+
+    Still pending: proxy integration (recognise the
+    `.../vsextensions/<pub>/<ext>/<ver>/vspackage` URL shape in
+    `classify_response`, dispatch `LifecyclePolicy::{Audit,Block}`
+    on the inspected result), strip mode (rewrite
+    `activationEvents` + recompute the Marketplace integrity
+    hash), and `.crx` audit. `main` JS body scanning belongs
+    naturally in `iocs::ContentNeedle` rather than here. `.crx`
+    is signed end-to-end so strip is impossible by design;
+    audit/block only.
+
+22. **Extension installs in the `InstallEvent` inventory.**
+    Extend the `Ecosystem` enum (Roadmap #6) with
+    `VscodeExtension` / `ChromeExtension`. The proxy logger
+    already runs on every allowed install path; once #20 lands,
+    the Marketplace fetch matches an ecosystem and gets appended
+    to `~/.sakimori/installs.jsonl` and (if configured) dispatched
+    via `/ingest` and OTLP. `sakimori advisories scan` then
+    queries OSV/GHSA for advisories against extension IDs and
+    surfaces past installs — the same retroactive-CVE story
+    Dependabot/Snyk fundamentally can't tell because they're
+    repo-lockfile-bound.
+
+23. **Workspace `.vscode/` / `.cursor/` as known-IOC surface.**
+    ✅ first rule landed in catalog v2026.05.21:
+    `vscode.tasks-folderopen-autorun` is a `ContentNeedle`
+    constrained to basename `tasks.json` matching the literal
+    `"runOn": "folderOpen"` key/value. That's the canonical VSCode
+    primitive for "execute on workspace open" — a clean repo
+    essentially never ships it, and the value-string is specific
+    enough that the basename filter alone keeps false positives
+    near zero. Severity High, family `editor-extension`. Cursor's
+    `.cursor/tasks.json` rides the same rule (basename match is
+    parent-directory-agnostic).
+
+    Still pending: settings.json `terminal.integrated.profiles.*.args`
+    needing shell-redirected commands (substring matching alone
+    yields too many false positives; needs structural parsing —
+    follow-up), and `extensions.json` recommendations from
+    non-canonical publishers (heuristic; legitimate teams pin
+    private extensions all the time, can't ship as a hard rule).
+
+24. **Editor extension directory tamper detection.**
+    ✅ library surface implemented as
+    `sakimori-core::editor_extensions`:
+    `default_roots($HOME)` auto-detects `~/.vscode/extensions/`,
+    `~/.vscode-insiders/extensions/`, `~/.cursor/extensions/`,
+    `~/.windsurf/extensions/`, and the platform-appropriate
+    VS Code `User/globalStorage/` (Linux:
+    `$XDG_CONFIG_HOME/Code/User/globalStorage`, macOS:
+    `~/Library/Application Support/Code/User/globalStorage`,
+    Windows: `%APPDATA%\Code\User\globalStorage`). Only roots that
+    exist on disk at call time are returned, so a user without
+    Cursor doesn't see an empty namespace polluting their diff.
+    `snapshot_roots(&roots, &opts)` walks each root with the
+    existing `tamper::Snapshot` machinery and merges into one
+    diffable artefact, prefixing every path with the root's label
+    (`vscode-extensions/foo.bar-1.0.0/package.json`) so the same
+    extension id under two editors doesn't collide.
+
+    Reuses the existing `tamper::diff` so all downstream
+    consumers — `workspace diff`, the JSON log, the HTML report,
+    the IOC scanner — work unchanged on the merged snapshot.
+
+    ✅ CLI wired as `sakimori extensions snapshot` /
+    `sakimori extensions diff`. Snapshot emits a merged JSON to
+    stdout (or `--output FILE`); diff reads a baseline, walks the
+    discovered roots, and reports added/modified/removed entries
+    plus a per-root IOC scan that re-uses the v2026.05.21 catalog
+    (so `vscode.tasks-folderopen-autorun` fires on a poisoned
+    sideload's `tasks.json`, and the existing Shai-Hulud / exfil
+    needles fire on any extension code that ships them). High-
+    severity IOC hits force exit 1 unconditionally; structural
+    drift exits 1 unless `--allow-drift`. `--home <DIR>` is the
+    test/CI escape hatch.
+
+    Still pending: integration into `sakimori run` / `daemon` so
+    the snapshot is taken automatically around supervised steps.
+    Pairs naturally with `file.deny` on the same paths once
+    exposed via policy presets — the eBPF tripwire fires on the
+    write itself while the post-run diff catches sideloads that
+    bypass the Marketplace fetch.
+
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
 

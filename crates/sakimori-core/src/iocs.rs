@@ -31,7 +31,7 @@ use serde::Serialize;
 
 /// Version of the bundled catalog. Bump whenever the rule set changes
 /// so JSON consumers can tell which fingerprints were active.
-pub const CATALOG_VERSION: &str = "2026.05.20";
+pub const CATALOG_VERSION: &str = "2026.05.21";
 
 /// How many bytes of any single file the content scanner will read.
 /// 64 KiB easily covers `.npmrc`, `pyproject.toml`, lockfile metadata,
@@ -263,6 +263,31 @@ pub fn catalog() -> &'static [Rule] {
                           OAST/webhook capture service that has replaced \
                           `requestbin` in several recent supply-chain \
                           worm samples.",
+        },
+        Rule {
+            id: "vscode.tasks-folderopen-autorun",
+            family: "editor-extension",
+            severity: Severity::High,
+            kind: RuleKind::ContentNeedle {
+                // `runOn: "folderOpen"` is the VSCode primitive that
+                // executes a task the moment a workspace is opened —
+                // no command-palette interaction required. The string
+                // appears almost exclusively in this exact context;
+                // false positives in normal repos are vanishingly
+                // rare. Constrained to `tasks.json` (`launch.json`
+                // and `settings.json` don't accept the same key) to
+                // keep the surface tight.
+                needle: "\"runOn\": \"folderOpen\"",
+                basename_filter: Some("tasks.json"),
+            },
+            pattern: "\"runOn\": \"folderOpen\"",
+            description: "VSCode `.vscode/tasks.json` configured to \
+                          auto-run a task on `folderOpen`. Editor \
+                          opens the workspace → task runs with the \
+                          user's privileges, no prompt. The canonical \
+                          dropper primitive for workspace-poisoning \
+                          attacks; a clean repo essentially never \
+                          ships this.",
         },
         Rule {
             id: "exfil.pipedream-webhook",
@@ -798,6 +823,38 @@ mod tests {
                 .iter()
                 .any(|r| r.id == "exfil.pipedream-webhook"),
             "bare apex must not trip rule (FP mitigation)"
+        );
+    }
+
+    #[test]
+    fn vscode_tasks_folder_open_autorun_trips_rule_in_tasks_json() {
+        // The exact key the VSCode tasks.json schema documents for
+        // "run when the folder is opened" — the workspace-poison
+        // primitive a poisoned `.vscode/` ships.
+        let dirty =
+            br#"{ "version": "2.0.0", "tasks": [{ "label": "x", "command": "evil.sh", "runOptions": { "runOn": "folderOpen" } }] }"#;
+        let hits = matches_content("tasks.json", dirty);
+        assert!(
+            hits.iter()
+                .any(|r| r.id == "vscode.tasks-folderopen-autorun"),
+            "got: {:?}",
+            hits.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vscode_tasks_rule_is_basename_scoped_to_tasks_json() {
+        // Same string in a file that isn't `tasks.json` should not
+        // trip — keeps the surface tight against accidental mentions
+        // in unrelated docs / configs.
+        let dirty = br#"someConfig = "\"runOn\": \"folderOpen\"""#;
+        let hits = matches_content("README.md", dirty);
+        assert!(
+            !hits
+                .iter()
+                .any(|r| r.id == "vscode.tasks-folderopen-autorun"),
+            "rule must be basename-scoped: {:?}",
+            hits.iter().map(|r| r.id).collect::<Vec<_>>()
         );
     }
 

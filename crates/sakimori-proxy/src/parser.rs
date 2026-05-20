@@ -359,6 +359,34 @@ impl RegistryParser for NugetParser {
     }
 }
 
+/// Parser for the VS Code Marketplace / OpenVSX gallery hosts.
+///
+/// The marketplace's only response-rewrite surface today is the
+/// `extensionquery` JSON endpoint — there are no pinned `.vsix`
+/// downloads to age-check until the lifecycle gate (#21) ships.
+/// So this parser exists purely to teach `should_intercept` /
+/// `parse_for_host` about marketplace hostnames; it returns
+/// `Metadata` for every path, which is the "intercept but don't
+/// hard-deny anything" signal the rewrite layer keys off.
+pub struct VscodeMarketplaceParser {
+    hosts: Vec<String>,
+}
+
+impl VscodeMarketplaceParser {
+    pub fn new(hosts: Vec<String>) -> Self {
+        Self { hosts }
+    }
+}
+
+impl RegistryParser for VscodeMarketplaceParser {
+    fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+    fn parse(&self, _path: &str) -> ParseResult {
+        ParseResult::Metadata
+    }
+}
+
 /// Build the canonical default parser set (single canonical public
 /// host per ecosystem). Kept for callers that don't need custom
 /// registries — equivalent to `parsers_from_hosts(&RegistryHosts::default())`.
@@ -378,6 +406,7 @@ pub fn parsers_from_hosts(h: &RegistryHosts) -> Vec<Box<dyn RegistryParser>> {
         Box::new(PypiParser::new(h.pypi_files.clone())),
         Box::new(PypiOrgParser::new(h.pypi_index.clone())),
         Box::new(NugetParser::new(h.nuget.clone())),
+        Box::new(VscodeMarketplaceParser::new(h.vscode_marketplace.clone())),
     ]
 }
 
@@ -741,6 +770,7 @@ mod tests {
             crates: vec![],
             crates_sparse: vec![],
             nuget: vec![],
+            vscode_marketplace: vec![],
         };
         let ps = parsers_from_hosts(&h);
         for host in [

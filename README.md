@@ -90,8 +90,9 @@ from then on, every HTTPS request your package managers make through
 | **npm** | ✅ packument rewrite (drops versions + retargets `dist-tags.latest`) | ✅ `403` on `.tgz` download |
 | **pypi** | ✅ Warehouse JSON API (`/pypi/<pkg>/json`) + PEP 691 Simple JSON + PEP 503 Simple HTML via JSON-API lookup | ✅ `403` on `files.pythonhosted.org` tarball download |
 | **nuget** | ✅ registration-page rewrite (`/v3/registration*/...`) + flat-container index via registration lookup | ✅ `403` on `.nupkg` download |
+| **vscode-marketplace** | ✅ `extensionquery` JSON rewrite (drops `versions[].lastUpdated` younger than `--min-age`) on `marketplace.visualstudio.com` + `open-vsx.org` | ⏳ `.vsix` lifecycle gate planned ([roadmap #21](CLAUDE.md)) |
 
-All four ecosystems' metadata paths now rewrite silently — pnpm-style
+All five ecosystems' metadata paths now rewrite silently — pnpm-style
 `minimumReleaseAge` across the board, no fail-hard in the common case.
 
 ### OS support matrix
@@ -129,6 +130,98 @@ exercises proxy start → pinned-tarball fetch → `installs.jsonl` →
 `advisories scan` → `install-gate shellenv` end-to-end on every PR
 that touches the relevant crates, so the cells marked ✅ for macOS
 above don't silently regress.
+
+### Editor-extension coverage (VSCode / Cursor / Windsurf / OpenVSX)
+
+The 2026-05 GitHub-internal-repo compromise (poisoned VS Code
+extension on an employee device) made it concrete: editor and
+browser extensions are a parallel distribution channel that almost
+nothing on the supply-chain market actually catches end-to-end.
+sakimori covers it across four layers, each addressing a failure
+mode the others can't:
+
+| layer | what catches | where in sakimori |
+|---|---|---|
+| **Fetch (proxy)** | Marketplace install of a young / freshly-published extension | `extensionquery` JSON rewriter on `marketplace.visualstudio.com` + `open-vsx.org` — silent `minimumReleaseAge`-style fallback per ecosystem #20 |
+| **Runtime attribution** | Extension subtree opens `~/.ssh/id_ed25519` / hits IMDS / executes a downloaded payload | PPid walker recognises `code` / `cursor` / `windsurf` / `code-server` / `Code Helper (Plugin)` and stamps `source: vscode` on every Connect / Open / Exec event the extension subtree produces — persistence-write, cloud-secret-egress, IOC scanner all fire #19 |
+| **Workspace poisoning** | A repo with `.vscode/tasks.json` auto-running on `folderOpen` | IOC catalog v2026.05.21+ ships `vscode.tasks-folderopen-autorun` as a basename-scoped content needle (High severity, family `editor-extension`) #23 |
+| **Sideload tamper** | An extension installed bypassing the Marketplace fetch (e.g. dragged-in `.vsix`, manual `git clone` into `~/.vscode/extensions/`) | `sakimori extensions snapshot` / `extensions diff` auto-discovers `~/.vscode`, `~/.vscode-insiders`, `~/.cursor`, `~/.windsurf`, plus the platform `globalStorage` tree; the diff runs the IOC catalog against every added / modified path #24 |
+
+#### Why this is different from "be a marketplace mirror"
+
+A few existing tools in this space try to be a **registry mirror**
+for the VS Code Marketplace — they stand up a server, scrape
+Microsoft's gallery, and ask users to repoint VS Code at the
+mirror via `product.json` edits or `extensions.gallery.serviceUrl`
+overrides. That approach has real friction:
+
+1. **VS Code has no first-class "alternate registry" config.** The
+   marketplace URL is hardcoded in `product.json`; switching it
+   requires modifying Microsoft's binary, which the EULA forbids
+   redistributing. (VSCodium, Cursor, Code-OSS, Windsurf — forks —
+   *do* expose a configurable gallery setting; the EULA issue is
+   specific to upstream VS Code.)
+2. **Marketplace ToS treats redistribution carefully.** §3 of the
+   VS Code Marketplace terms allows access to the gallery for
+   downloading extensions; standing up an independent mirror that
+   *re-serves* the gallery to other users sits in genuinely murky
+   territory. Several mirror-style projects have hit takedown notices
+   or quietly become enterprise-only because of this.
+
+**sakimori takes a different shape — an endpoint MITM proxy, not a
+mirror.** That sidesteps both problems:
+
+- **No editor binary modification.** The user sets
+  `HTTPS_PROXY=http://127.0.0.1:8080` (via `sakimori install-gate
+  install`, the same one-liner `npm install` already uses) and
+  trusts sakimori's local CA. The marketplace request the editor
+  makes is unchanged; only the *response* the editor receives is
+  filtered to drop too-young versions. `product.json` stays
+  byte-for-byte identical to whatever Microsoft shipped.
+- **No re-serving.** sakimori never stands up an authoritative
+  gallery. It MITMs the user's *own* request to Microsoft (or
+  Eclipse for OpenVSX), filters the JSON in transit, and hands
+  it back. The bytes leave sakimori the moment the editor reads
+  them; no per-tenant caching or republication. Architecturally
+  this is the same posture Bitdefender, Kaspersky, Cisco
+  Umbrella, and corporate SSL-inspection appliances have run for
+  a decade — well-understood, both legally and operationally.
+- **Same proxy, every editor.** One running instance covers VS
+  Code, Cursor, VSCodium, Code-OSS, code-server, and any other
+  editor that speaks the Marketplace / OpenVSX `extensionquery`
+  API. No per-editor configuration knob.
+
+#### Defence in depth, not just the proxy
+
+The proxy alone doesn't solve the problem — a determined attacker
+ships an extension *with* a deliberate publication delay so it
+clears `--min-age`, or sideloads via `.vsix` to bypass the proxy
+entirely. That's why the four-layer table above matters:
+
+- A sideloaded extension never hits the proxy → `extensions diff`
+  still catches it (new files under `~/.vscode/extensions/`).
+- An aged-into-marketplace extension passes the rewriter →
+  attribution + persistence-write rule pack catches the actual
+  malicious behaviour (writing to `~/.ssh/`, hitting IMDS, etc.)
+  at runtime.
+- A workspace `.vscode/tasks.json` autorun never touches the
+  marketplace at all → the IOC catalog catches the dropper
+  primitive directly.
+
+Registry-firewall tools (Sonatype Nexus Firewall, JFrog Xray) sit
+at the right layer for #1 but only for the proxy path. EDR /
+SCA tools cover none of the four directly. sakimori is the only
+endpoint agent we're aware of that covers all four with a
+shared attribution + IOC backbone.
+
+#### Roadmap items pending in this area
+
+`.vsix` / `.crx` lifecycle gate (block on `activationEvents:
+["*"]`-style autorun primitives at fetch time), `Ecosystem::
+VscodeExtension` propagation into the install log and OSV-JOIN
+advisory scan, and Chrome Web Store coverage are all tracked in
+[CLAUDE.md](CLAUDE.md) roadmap entries #20–#24. Pull requests
+welcome.
 
 ---
 
@@ -683,6 +776,46 @@ different contents will read as unchanged — bump
 
 `--format json` for machine-readable output. `--allow-drift`
 suppresses the non-zero exit when you only want the report.
+
+### `extensions snapshot` / `extensions diff`
+
+The editor-extension counterpart of `workspace snapshot`. Auto-
+discovers every editor extension root that exists on the host —
+`~/.vscode/extensions/`, `~/.vscode-insiders/extensions/`,
+`~/.cursor/extensions/`, `~/.windsurf/extensions/`, plus the
+platform-appropriate VS Code `User/globalStorage/` — and produces
+one merged snapshot. Each file's relative path is prefixed with
+the root's label (`vscode-extensions/foo.bar-1.0.0/package.json`)
+so the same extension id installed under two editors doesn't
+collide.
+
+```bash
+# Take a baseline (run when you trust the current state)
+sakimori extensions snapshot -o ~/.sakimori/extensions-baseline.json
+
+# Some time later — perhaps after `git pull`, perhaps daily via cron
+sakimori extensions diff ~/.sakimori/extensions-baseline.json
+```
+
+The diff reports added / modified / removed entries and runs the
+known-IOC catalog against every implicated path: a sideloaded
+`.vsix` whose `package.json` references `discord.com/api/
+webhooks/`, or a workspace's `.vscode/tasks.json` configured to
+auto-run on `folderOpen`, surfaces as both a structural drift
+entry and a High-severity IOC hit. High-severity IOC hits force
+exit 1 unconditionally; structural drift exits 1 unless
+`--allow-drift`.
+
+A user without Cursor installed sees no `cursor-extensions/`
+entries — the walker filters to roots that actually exist at
+call time. `--home <DIR>` overrides `$HOME` for tests / CI.
+
+This is the **sideload backstop**: even if an attacker bypasses
+the marketplace fetch entirely (drag-and-drop `.vsix`, `git
+clone` directly into the extensions dir, vendored install), the
+diff catches the new files. Pair with the proxy's
+`extensionquery` rewriter for the fetch path and you cover both
+the marketplace-bound and out-of-band install routes.
 
 ### `actions audit`
 

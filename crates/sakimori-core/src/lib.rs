@@ -17,6 +17,7 @@ pub mod attribution;
 pub mod cloud_secrets;
 pub mod codeowners;
 pub mod deps;
+pub mod editor_extensions;
 pub mod events;
 pub mod html;
 pub mod installs;
