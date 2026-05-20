@@ -94,7 +94,9 @@ impl OsvClient {
     }
 
     fn fetch(&self, eco: Ecosystem, name: &str, version: &str) -> Result<Vec<String>> {
-        let eco_str = eco_to_osv(eco);
+        let Some(eco_str) = eco_to_osv(eco) else {
+            return Ok(Vec::new());
+        };
         let body = serde_json::json!({
             "package": { "name": name, "ecosystem": eco_str },
             "version": version,
@@ -177,14 +179,19 @@ fn is_malicious(v: &OsvVuln) -> bool {
     summary.contains("malicious") || details.contains("malicious")
 }
 
-fn eco_to_osv(eco: Ecosystem) -> &'static str {
+fn eco_to_osv(eco: Ecosystem) -> Option<&'static str> {
     // OSV's ecosystem strings:
     //   https://ossf.github.io/osv-schema/#affectedpackage-field
     match eco {
-        Ecosystem::Crates => "crates.io",
-        Ecosystem::Npm => "npm",
-        Ecosystem::Pypi => "PyPI",
-        Ecosystem::Nuget => "NuGet",
+        Ecosystem::Crates => Some("crates.io"),
+        Ecosystem::Npm => Some("npm"),
+        Ecosystem::Pypi => Some("PyPI"),
+        Ecosystem::Nuget => Some("NuGet"),
+        // Git deps have no OSV ecosystem mapping (a github.com/o/r
+        // path could be Go, but it could also be any of a dozen
+        // ecosystems that happen to host their canonical source there
+        // — we'd be guessing). Return None and let the caller skip.
+        Ecosystem::Git => None,
     }
 }
 
@@ -250,10 +257,11 @@ mod tests {
 
     #[test]
     fn ecosystem_mapping_matches_osv_schema() {
-        assert_eq!(eco_to_osv(Ecosystem::Crates), "crates.io");
-        assert_eq!(eco_to_osv(Ecosystem::Npm), "npm");
-        assert_eq!(eco_to_osv(Ecosystem::Pypi), "PyPI");
-        assert_eq!(eco_to_osv(Ecosystem::Nuget), "NuGet");
+        assert_eq!(eco_to_osv(Ecosystem::Crates), Some("crates.io"));
+        assert_eq!(eco_to_osv(Ecosystem::Npm), Some("npm"));
+        assert_eq!(eco_to_osv(Ecosystem::Pypi), Some("PyPI"));
+        assert_eq!(eco_to_osv(Ecosystem::Nuget), Some("NuGet"));
+        assert_eq!(eco_to_osv(Ecosystem::Git), None);
     }
 
     #[test]

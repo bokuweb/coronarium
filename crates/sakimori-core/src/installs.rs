@@ -40,6 +40,36 @@ pub enum ExecutionMode {
     Unknown,
 }
 
+/// Extra provenance for `Ecosystem::Git` events — packages fetched
+/// directly from a git host (github.com / codeload / api.github.com)
+/// rather than a package registry. None of this is meaningful for
+/// registry installs and the field stays `None` for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitProvenance {
+    /// Full URL the proxy saw, with the query string stripped (path
+    /// alone carries enough info to reconstruct the fetch and the
+    /// query may include short-lived auth tokens).
+    pub url: String,
+    /// Requested ref as it appeared in the URL — a 40-hex SHA, a tag
+    /// (`v1.2.3`), a branch (`main`), or `HEAD` for clone-protocol
+    /// discovery. `None` when the host endpoint defaults to the
+    /// repository's default branch (e.g. `/repos/o/r/tarball` with no
+    /// trailing ref).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_ref: Option<String>,
+    /// 40-hex commit SHA when extractable. Populated today only when
+    /// `requested_ref` is itself a 40-hex SHA; future iterations can
+    /// extract it from codeload's `ETag` header or git-upload-pack
+    /// pkt-line responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_commit: Option<String>,
+    /// Where `resolved_commit` came from — `"url"` today, `"etag"` /
+    /// `"upload-pack"` reserved for follow-ups. `None` when
+    /// `resolved_commit` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_source: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallEvent {
     pub ecosystem: String,
@@ -55,6 +85,9 @@ pub struct InstallEvent {
     /// chain reconstructable after the fact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// Git-fetch provenance. `Some` exactly when `ecosystem == "git"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitProvenance>,
 }
 
 impl InstallEvent {
@@ -67,7 +100,13 @@ impl InstallEvent {
             execution_mode: ExecutionMode::Unknown,
             project_path: None,
             user_agent: None,
+            git: None,
         }
+    }
+
+    pub fn with_git(mut self, git: GitProvenance) -> Self {
+        self.git = Some(git);
+        self
     }
 
     pub fn with_mode(mut self, mode: ExecutionMode) -> Self {

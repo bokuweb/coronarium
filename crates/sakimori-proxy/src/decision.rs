@@ -245,6 +245,10 @@ impl AgeOracle for RegistryOracle {
             Ecosystem::Npm => registry::npm::published(name, version, &self.user_agent),
             Ecosystem::Pypi => registry::pypi::published(name, version, &self.user_agent),
             Ecosystem::Nuget => registry::nuget::published(name, version, &self.user_agent),
+            // Git deps never reach the decider (the parsers don't
+            // classify github.com traffic as Pinned), but the match
+            // must stay exhaustive.
+            Ecosystem::Git => Ok(None),
         }
     }
 }

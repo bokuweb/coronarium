@@ -192,6 +192,10 @@ fn top_list_for(eco: Ecosystem) -> &'static [&'static str] {
         Ecosystem::Npm => NPM_TOP,
         Ecosystem::Pypi => PYPI_TOP,
         Ecosystem::Nuget => NUGET_TOP,
+        // No typosquat list for git deps — a repo name like
+        // `github.com/owner/repo` is not part of any package
+        // registry's top-N download ranking.
+        Ecosystem::Git => &[],
     }
 }
 
@@ -233,6 +237,9 @@ impl MirrorLists {
             Ecosystem::Npm => &self.npm,
             Ecosystem::Pypi => &self.pypi,
             Ecosystem::Nuget => &self.nuget,
+            // Git deps aren't part of the mirrored top-N — see
+            // `top_list_for`.
+            Ecosystem::Git => &[],
         }
     }
 

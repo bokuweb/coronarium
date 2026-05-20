@@ -295,8 +295,25 @@ the canonical public hosts, list the internal hosts under
    half landed: the proxy's pinned-install path now appends every
    resolved fetch to `~/.sakimori/installs.jsonl`
    (`InstallEvent { ecosystem, name, version, resolved_at,
-   execution_mode, user_agent }` — `project_path` and richer
-   attribution come next), and `sakimori advisories scan` reads
+   execution_mode, user_agent, git? }` — `project_path` and richer
+   attribution come next; the optional `git: GitProvenance { url,
+   requested_ref, resolved_commit, commit_source }` block carries
+   git-fetch traceability when `ecosystem == "git"`, populated by
+   the github.com / codeload.github.com / api.github.com URL
+   classifier in `sakimori_proxy::git_fetch`. Covers `npm install
+   github:owner/repo` (codeload tarballs), `cargo`'s `git = "..."`
+   and `pip install git+https://...` (clone-protocol discovery at
+   `<repo>.git/info/refs?service=git-upload-pack`), and REST
+   tarball/zipball fetches. When the URL ref is a 40-hex SHA the
+   classifier records it as `resolved_commit` with
+   `commit_source: "url"`; tag/branch refs leave
+   `resolved_commit` unset and the follow-up via codeload's
+   `ETag` header / git-upload-pack pkt-line parsing is the
+   tracked next slice). Git events are skipped by `deps check`
+   (no publish-time semantics), OSV scan (no clean ecosystem
+   mapping for arbitrary repo URLs), and typosquat lookups — the
+   value is post-hoc auditing of "what was actually fetched", not
+   age-gating. `sakimori advisories scan` reads
    that log, dedupes by `(eco, name, version)`, and batch-queries
    [OSV.dev](https://osv.dev)'s `POST /v1/querybatch` for matching
    advisories. Hits exit non-zero so it slots into cron / CI.

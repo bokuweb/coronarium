@@ -37,6 +37,12 @@ pub enum Ecosystem {
     Crates,
     Pypi,
     Nuget,
+    /// Direct git-source dependency (e.g. `npm install github:o/r`,
+    /// `cargo` `git = "..."`, `pip install git+https://...`). Has no
+    /// publish-time semantics — only used by the proxy's install
+    /// logger so post-hoc auditing knows what was fetched. Skipped by
+    /// `deps check`, OSV scan, and typosquat lookups.
+    Git,
 }
 
 impl Ecosystem {
@@ -46,6 +52,7 @@ impl Ecosystem {
             Ecosystem::Crates => "crates",
             Ecosystem::Pypi => "pypi",
             Ecosystem::Nuget => "nuget",
+            Ecosystem::Git => "git",
         }
     }
 }
@@ -208,6 +215,11 @@ fn fetch_published(
         Ecosystem::Crates => registry::crates::published(name, version, user_agent)?,
         Ecosystem::Pypi => registry::pypi::published(name, version, user_agent)?,
         Ecosystem::Nuget => registry::nuget::published(name, version, user_agent)?,
+        // Git deps have no registry publish-time. Lockfile parsers
+        // already skip them, so reaching this arm means a caller
+        // hand-built a Git Package — return None ("don't know") rather
+        // than crash so deps check can carry on with the rest.
+        Ecosystem::Git => None,
     };
     if let (Some(dt), Some(c)) = (result, cache) {
         c.put(eco, name, version, dt);
