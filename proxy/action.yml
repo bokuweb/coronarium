@@ -64,8 +64,10 @@ inputs:
       Always paired with `ingest-url`; setting one without the
       other is a no-op and logs a warning.
 
-      Treat as a secret. Pass via `${{ secrets.SAKIMORI_TOKEN }}`
-      — never inline the token in a workflow file. The action
+      Treat as a secret. Pass via a workflow expression that
+      reads `secrets.SAKIMORI_TOKEN` (see README for the exact
+      YAML) — never inline the token in a workflow file. The
+      action
       registers it with `::add-mask::` before exporting so the
       bytes never appear in subsequent logs, but a token typed
       into the workflow YAML stays in git history regardless.
