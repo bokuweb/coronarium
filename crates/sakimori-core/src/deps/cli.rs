@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
+use super::exotic::{self, ExoticReport};
 use super::{CheckArgs, CheckReport, check};
 
 pub struct CliArgs {
@@ -189,6 +190,85 @@ pub fn run(args: CliArgs) -> Result<i32> {
 
     print_report(&report, args.format)?;
     Ok(if report.violations > 0 { 1 } else { 0 })
+}
+
+pub struct ExoticCliArgs {
+    pub lockfiles: Vec<PathBuf>,
+    /// Also fail on direct (root-declared) exotic deps. By default the
+    /// lint mirrors pnpm's `blockExoticSubdeps` and only fails on
+    /// transitives — direct git pins are a legitimate "fork while we
+    /// wait for upstream merge" pattern.
+    pub include_direct: bool,
+    pub format: Format,
+}
+
+pub fn run_exotic(args: ExoticCliArgs) -> Result<i32> {
+    let mut merged = ExoticReport::default();
+    for lf in &args.lockfiles {
+        let r = exotic::scan(lf).with_context(|| format!("scanning {}", lf.display()))?;
+        merged.scanned += r.scanned;
+        merged.findings.extend(r.findings);
+    }
+
+    let fail_count = merged
+        .findings
+        .iter()
+        .filter(|f| args.include_direct || !f.direct)
+        .count();
+
+    match args.format {
+        Format::Json => {
+            let out = serde_json::to_string_pretty(&merged)?;
+            writeln!(std::io::stdout(), "{out}")?;
+        }
+        Format::Text => {
+            let stdout = std::io::stdout();
+            let mut w = stdout.lock();
+            writeln!(
+                w,
+                "sakimori deps exotic — scanned {} resolved package(s) across {} lockfile(s)",
+                merged.scanned,
+                args.lockfiles.len(),
+            )?;
+            if merged.findings.is_empty() {
+                writeln!(w, "✓ no exotic (git / tarball / file) sources detected")?;
+            } else {
+                let transitive = merged.transitive_count();
+                writeln!(
+                    w,
+                    "{} exotic source(s) found ({} transitive, {} direct)",
+                    merged.findings.len(),
+                    transitive,
+                    merged.findings.len() - transitive,
+                )?;
+                for f in &merged.findings {
+                    let marker = if f.direct { "direct" } else { "transitive" };
+                    let icon = if !f.direct || args.include_direct {
+                        "✗"
+                    } else {
+                        "·"
+                    };
+                    writeln!(
+                        w,
+                        "  {icon} [{marker}] {}/{} @{}  [{}] {}",
+                        f.ecosystem,
+                        f.name,
+                        f.version,
+                        f.source.label(),
+                        f.raw,
+                    )?;
+                }
+                if !args.include_direct && transitive == 0 {
+                    writeln!(
+                        w,
+                        "(all exotic sources are direct deps; pass --include-direct to fail on those too)",
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(if fail_count > 0 { 1 } else { 0 })
 }
 
 fn print_report(report: &CheckReport, format: Format) -> Result<()> {

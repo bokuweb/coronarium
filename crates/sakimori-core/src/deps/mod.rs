@@ -17,6 +17,7 @@
 
 pub mod cache;
 pub mod cli;
+pub mod exotic;
 pub mod lockfile;
 pub mod registry;
 pub mod verify_cache;
