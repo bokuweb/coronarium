@@ -1227,8 +1227,29 @@ and lights up the most existing detection for free.
     drift exits 1 unless `--allow-drift`. `--home <DIR>` is the
     test/CI escape hatch.
 
-    Still pending: integration into `sakimori run` / `daemon` so
-    the snapshot is taken automatically around supervised steps.
+    ✅ Wired into `sakimori run --snapshot-extensions` and
+    `sakimori daemon start --snapshot-extensions`. Both surfaces
+    take a baseline + a full pre-run IOC sweep (the "host was
+    already poisoned before sakimori attached" signal) before the
+    supervised step starts, then re-discover roots at shutdown
+    (catches roots created mid-run) and diff against the baseline.
+    Three sibling top-level JSON keys land in the report:
+    `extension_drift` (structural diff, same shape as
+    `workspace_drift`), `extension_iocs` (catalog hits on
+    added/modified paths during the run), and
+    `extension_iocs_baseline` (catalog hits on the pre-run
+    snapshot). The step summary and HTML report grow three matching
+    sections. High-severity IOC hits in **either** bucket fail the
+    run unconditionally in any mode — these are known supply-chain
+    worm fingerprints, not policy calls. Structural drift alone
+    fails the run only in block mode, mirroring `workspace_drift`.
+    `$HOME` is canonicalised + sanity-checked (refuses `/`, empty
+    string) before any walk, so a misconfigured runner can't
+    accidentally scan the entire filesystem under the flag. Test
+    matrix lives in [crates/sakimori-core/tests/extension_report_matrix.rs](crates/sakimori-core/tests/extension_report_matrix.rs)
+    covering the four meaningful corners (clean, pre-existing
+    High, drift-time High, benign drift only).
+
     Pairs naturally with `file.deny` on the same paths once
     exposed via policy presets — the eBPF tripwire fires on the
     write itself while the post-run diff catches sideloads that

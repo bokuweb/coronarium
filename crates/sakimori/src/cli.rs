@@ -315,6 +315,15 @@ pub struct DaemonStartArgs {
     /// otherwise added/removed entries will fire spuriously.
     #[arg(long = "workspace-skip", value_name = "NAME")]
     pub workspace_skip: Vec<String>,
+
+    /// Snapshot every editor-extension directory under `$HOME` at
+    /// start AND at shutdown. Surfaces three new sections in the
+    /// JSON log: `extension_drift`, `extension_iocs`, and
+    /// `extension_iocs_baseline` — see `sakimori run --snapshot-
+    /// extensions` for details. A High-severity IOC in either bucket
+    /// fails the job in any mode. Off by default.
+    #[arg(long)]
+    pub snapshot_extensions: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1199,6 +1208,21 @@ pub struct RunArgs {
     #[arg(long = "snapshot-skip", value_name = "NAME")]
     pub snapshot_skip: Vec<String>,
 
+    /// Snapshot every editor-extension directory under `$HOME` before
+    /// and after the supervised command. Surfaces three new sections
+    /// in the JSON log: `extension_drift` (structural diff),
+    /// `extension_iocs` (catalog hits on added/modified paths during
+    /// the run), and `extension_iocs_baseline` (catalog hits on the
+    /// pre-run snapshot — "the host was already poisoned"). A High-
+    /// severity IOC in either bucket fails the run unconditionally,
+    /// even in audit mode — these are known supply-chain worm
+    /// fingerprints, not policy calls. Structural drift only fails
+    /// the run in block mode, matching `--snapshot-workspace`. Off
+    /// by default — opt-in because the pre-run scan walks every
+    /// installed extension on disk.
+    #[arg(long)]
+    pub snapshot_extensions: bool,
+
     /// Command + args to execute under supervision.
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
@@ -1666,6 +1690,7 @@ async fn run_daemon_start(args: DaemonStartArgs) -> Result<()> {
         workspace_baseline: args.workspace_baseline,
         workspace_dir: args.workspace_dir,
         workspace_skip: args.workspace_skip,
+        snapshot_extensions: args.snapshot_extensions,
     })
     .await
 }
@@ -2565,6 +2590,48 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         None => None,
     };
 
+    // Editor-extension snapshot: baseline + pre-existing IOC sweep
+    // happen BEFORE we start the supervisor, same shape as the
+    // workspace baseline. Hard-error on safety-guard violations
+    // (HOME unresolvable, refusing `/`), soft-fail on walk errors
+    // (warn + drop the section) so a transient permission issue
+    // doesn't take down the run.
+    let (ext_baseline_snap, ext_iocs_baseline) = if args.snapshot_extensions {
+        match resolve_safe_home() {
+            Ok(home) => {
+                let baseline = match sakimori_core::editor_extensions::baseline_extensions(&home) {
+                    Ok((s, roots)) => {
+                        log::info!(
+                            "editor-extension baseline: {} files across {} root(s) under {}",
+                            s.files.len(),
+                            roots.len(),
+                            home.display(),
+                        );
+                        Some(s)
+                    }
+                    Err(e) => {
+                        log::warn!("editor-extension baseline snapshot failed: {e:#}");
+                        None
+                    }
+                };
+                let iocs_baseline =
+                    match sakimori_core::editor_extensions::scan_existing_extensions(&home) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            log::warn!("editor-extension baseline IOC scan failed: {e:#}");
+                            None
+                        }
+                    };
+                (baseline, iocs_baseline)
+            }
+            Err(e) => {
+                return Err(e.context("--snapshot-extensions requires a safe $HOME"));
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let supervised = loader::Supervisor::start(
         policy.clone(),
         mode,
@@ -2602,6 +2669,26 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
     // CI step on flaky DNS.
     crate::resolve_hostnames::resolve(&mut stats).await;
 
+    // Editor-extension drift + drift-time IOCs. Same fail-soft
+    // policy as workspace drift — log + summary still go out
+    // without `extension_drift` if anything errors mid-way.
+    let ext_drift = if args.snapshot_extensions {
+        match (resolve_safe_home(), ext_baseline_snap.as_ref()) {
+            (Ok(home), Some(b)) => {
+                match sakimori_core::editor_extensions::drift_extensions(&home, b) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        log::warn!("editor-extension drift snapshot failed: {e:#}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let ioc_report = drift.as_ref().map(|d| {
         let paths: Vec<&std::path::Path> = d
             .added
@@ -2622,6 +2709,25 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
     });
 
     let command_str = args.command.join(" ");
+    let ext_section = ext_drift
+        .as_ref()
+        .map(|d| &d.diff)
+        .filter(|d| !d.is_clean());
+    let ext_iocs_drift = ext_drift
+        .as_ref()
+        .map(|d| &d.iocs)
+        .filter(|r| !r.is_clean());
+    let ext_iocs_baseline_ref = ext_iocs_baseline.as_ref().filter(|r| !r.is_clean());
+    let extension = if args.snapshot_extensions {
+        Some(sakimori_core::report::ExtensionSection {
+            drift: ext_section,
+            iocs_drift: ext_iocs_drift,
+            iocs_baseline: ext_iocs_baseline_ref,
+        })
+    } else {
+        None
+    };
+
     let report_args = ReportArgs {
         log: &args.log,
         summary: args.summary.as_deref(),
@@ -2631,11 +2737,27 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         policy: &policy,
         workspace_drift: drift.as_ref().filter(|d| !d.is_clean()),
         workspace_iocs: ioc_report.as_ref().filter(|r| !r.is_clean()),
+        extension,
     };
     sakimori_core::report::write(&report_args, &stats)?;
 
     let drift_violation = drift.as_ref().map(|d| !d.is_clean()).unwrap_or(false);
     let ioc_high = ioc_report.as_ref().map(|r| r.has_high()).unwrap_or(false);
+    // High-severity in either editor-extension bucket fails the
+    // run unconditionally — same contract as workspace IOC. Drift
+    // alone follows the workspace pattern (block-mode only).
+    let ext_drift_violation = ext_drift
+        .as_ref()
+        .map(|d| !d.diff.is_clean())
+        .unwrap_or(false);
+    let ext_ioc_high = ext_drift
+        .as_ref()
+        .map(|d| d.iocs.has_high())
+        .unwrap_or(false)
+        || ext_iocs_baseline
+            .as_ref()
+            .map(|r| r.has_high())
+            .unwrap_or(false);
 
     if stats.denied > 0 && matches!(mode, policy::Mode::Block) {
         // GitHub Actions error annotation — renders as a red banner on the
@@ -2662,7 +2784,56 @@ async fn run_supervised(args: RunArgs) -> Result<()> {
         );
         std::process::exit(1);
     }
+    if ext_drift_violation && matches!(mode, policy::Mode::Block) {
+        let n = ext_drift.as_ref().map(|d| d.diff.total()).unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::editor-extension drift detected: {n} extension files added/modified/removed during the supervised step"
+        );
+        std::process::exit(1);
+    }
+    if ext_ioc_high {
+        let drift_hits = ext_drift
+            .as_ref()
+            .map(|d| d.iocs.findings.len())
+            .unwrap_or(0);
+        let baseline_hits = ext_iocs_baseline
+            .as_ref()
+            .map(|r| r.findings.len())
+            .unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::editor-extension IOC hit: {} pre-existing + {} drift-time path(s) match a known supply-chain campaign fingerprint",
+            baseline_hits, drift_hits,
+        );
+        std::process::exit(1);
+    }
     std::process::exit(exit);
+}
+
+/// Resolve `$HOME` (or `%USERPROFILE%` on Windows) and refuse degenerate
+/// values that would cause `--snapshot-extensions` to walk the entire
+/// filesystem. Canonicalises so symlinked HOMEs resolve to their real
+/// path. Hard-fails the run if the env var is missing or points at
+/// `/` — a defence feature shouldn't silently scan everything.
+fn resolve_safe_home() -> Result<PathBuf> {
+    let raw = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow::anyhow!("$HOME / %USERPROFILE% is unset"))?;
+    let raw_path = PathBuf::from(&raw);
+    if raw_path.as_os_str().is_empty() {
+        anyhow::bail!("$HOME resolved to empty string");
+    }
+    // Canonicalise when possible; if the path doesn't exist on disk
+    // yet (rare but legitimate for tests against ephemeral tmp dirs)
+    // fall back to the raw value rather than failing — the snapshot
+    // walk handles non-existent roots gracefully.
+    let canon = raw_path.canonicalize().unwrap_or_else(|_| raw_path.clone());
+    if canon == Path::new("/") || canon.as_os_str().is_empty() {
+        anyhow::bail!(
+            "$HOME canonicalised to '/' — refusing to walk the entire \
+             filesystem under --snapshot-extensions"
+        );
+    }
+    Ok(canon)
 }
 
 fn run_install_daemon(args: ProxyDaemonArgs) -> Result<()> {

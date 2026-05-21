@@ -916,6 +916,7 @@ Flags:
 | `--html` | — | — | self-contained HTML report (dark-mode aware, filterable) |
 | `--snapshot-workspace` | — | — | dir to hash before/after the run; drift goes into the JSON log + step summary, and (in block mode) makes the run fail |
 | `--snapshot-skip` | — | — | extra dir basenames to skip during the snapshot (repeatable) |
+| `--snapshot-extensions` | — | — | snapshot every editor-extension dir under `$HOME` before + after the run; drift + pre-existing IOC + drift-time IOC sections land in the JSON log under `extension_drift` / `extension_iocs` / `extension_iocs_baseline`. High-severity IOC fails the run unconditionally; structural drift fails the run only in block mode |
 
 Exit code: child's exit code, unless `mode=block` and **either**:
 - at least one event was denied, **or**

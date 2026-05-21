@@ -48,6 +48,34 @@ pub struct ReportArgs<'a> {
     /// because a High-severity IOC must fail the supervised step
     /// even when the user passed `--allow-drift` for generic noise.
     pub workspace_iocs: Option<&'a iocs::Report>,
+    /// Editor-extension snapshot results — drift + drift-time IOC
+    /// hits + pre-existing IOC hits, parallel to the workspace
+    /// triple. Surfaces in the JSON log under three sibling top-
+    /// level keys (`extension_drift`, `extension_iocs`,
+    /// `extension_iocs_baseline`) and as three additional sections
+    /// in the step summary / HTML report. Set only when the user
+    /// passed `--snapshot-extensions` on `sakimori run` or
+    /// `sakimori daemon start`.
+    pub extension: Option<ExtensionSection<'a>>,
+}
+
+/// Bundle of the three editor-extension report surfaces. Kept in one
+/// struct so the renderer / supervisor signature change is one
+/// optional field instead of three.
+#[derive(Default, Clone, Copy)]
+pub struct ExtensionSection<'a> {
+    /// Structural diff of the discovered roots between baseline and
+    /// post-run. Same shape as `workspace_drift` so JSON consumers
+    /// reuse the existing tamper::Diff parser.
+    pub drift: Option<&'a Diff>,
+    /// IOC findings on the drift's added + modified paths only —
+    /// "something just dropped here during the run".
+    pub iocs_drift: Option<&'a iocs::Report>,
+    /// IOC findings against the full pre-run snapshot — "the host
+    /// was already poisoned before sakimori attached". High-severity
+    /// hits in this bucket fail the run unconditionally, same as
+    /// drift-time hits.
+    pub iocs_baseline: Option<&'a iocs::Report>,
 }
 
 pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
@@ -70,6 +98,23 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
         && !iocs.is_clean()
     {
         payload["workspace_iocs"] = serde_json::to_value(iocs)?;
+    }
+    if let Some(ext) = args.extension.as_ref() {
+        if let Some(d) = ext.drift
+            && !d.is_clean()
+        {
+            payload["extension_drift"] = serde_json::to_value(d)?;
+        }
+        if let Some(r) = ext.iocs_drift
+            && !r.is_clean()
+        {
+            payload["extension_iocs"] = serde_json::to_value(r)?;
+        }
+        if let Some(r) = ext.iocs_baseline
+            && !r.is_clean()
+        {
+            payload["extension_iocs_baseline"] = serde_json::to_value(r)?;
+        }
     }
     // Cloud-secret egress tripwire: derived purely from the sampled
     // events, no extra config required. Emits only when at least one
@@ -110,6 +155,7 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
             args.workspace_drift,
             args.workspace_iocs,
             &cloud_secret_hits,
+            args.extension.as_ref(),
         );
         writeln!(f, "{body}")?;
     }
@@ -127,6 +173,7 @@ pub fn write(args: &ReportArgs<'_>, stats: &Stats) -> Result<()> {
             meta,
             args.workspace_drift,
             args.workspace_iocs,
+            args.extension.as_ref(),
         );
         std::fs::write(path, rendered)?;
     }
@@ -149,6 +196,7 @@ pub fn render_step_summary(
     drift: Option<&Diff>,
     ioc_report: Option<&iocs::Report>,
     cloud_secret_hits: &[cloud_secrets::Hit],
+    extension: Option<&ExtensionSection<'_>>,
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## sakimori\n");
@@ -206,7 +254,103 @@ pub fn render_step_summary(
     if !cloud_secret_hits.is_empty() {
         push_cloud_secret_section(&mut out, cloud_secret_hits);
     }
+    if let Some(ext) = extension {
+        push_extension_sections(&mut out, ext);
+    }
     out
+}
+
+fn push_extension_sections(out: &mut String, ext: &ExtensionSection<'_>) {
+    if let Some(r) = ext.iocs_baseline
+        && !r.is_clean()
+    {
+        let _ = writeln!(
+            out,
+            "\n### ❌ Editor extensions — pre-existing IOC hits (host already poisoned)\n",
+        );
+        let _ = writeln!(out, "_Catalog version: `{}`._\n", r.catalog_version);
+        let _ = writeln!(out, "| severity | path | rule | description |");
+        let _ = writeln!(out, "|:-:|---|---|---|");
+        for f in &r.findings {
+            let sev = match f.severity {
+                iocs::Severity::High => "🛑 HIGH",
+                iocs::Severity::Medium => "⚠️ MED",
+            };
+            let _ = writeln!(
+                out,
+                "| {sev} | `{}` | `{}` | {} |",
+                escape_pipe(&f.path.display().to_string()),
+                f.rule_id,
+                escape_pipe(f.description),
+            );
+        }
+    }
+    if let Some(d) = ext.drift
+        && !d.is_clean()
+    {
+        let _ = writeln!(
+            out,
+            "\n### Editor extensions — drift during the supervised step\n",
+        );
+        let _ = writeln!(out, "| | | path | note |\n|:-:|---|---|---|");
+        for p in d.added.iter().take(DRIFT_TOP_N) {
+            let _ = writeln!(
+                out,
+                "| ➕ | added    | `{}` |  |",
+                escape_pipe(&p.display().to_string())
+            );
+        }
+        for m in d.modified.iter().take(DRIFT_TOP_N) {
+            let _ = writeln!(
+                out,
+                "| 🔧 | modified | `{}` | {} |",
+                escape_pipe(&m.path.display().to_string()),
+                modification_note(m),
+            );
+        }
+        for p in d.removed.iter().take(DRIFT_TOP_N) {
+            let _ = writeln!(
+                out,
+                "| ➖ | removed  | `{}` |  |",
+                escape_pipe(&p.display().to_string())
+            );
+        }
+        let total = d.total();
+        let shown = d.added.len().min(DRIFT_TOP_N)
+            + d.modified.len().min(DRIFT_TOP_N)
+            + d.removed.len().min(DRIFT_TOP_N);
+        if total > shown {
+            let _ = writeln!(
+                out,
+                "\n_… {} more rows omitted; full diff is in `extension_drift` of the JSON log._",
+                total - shown,
+            );
+        }
+    }
+    if let Some(r) = ext.iocs_drift
+        && !r.is_clean()
+    {
+        let _ = writeln!(
+            out,
+            "\n### ❌ Editor extensions — IOC hits during drift (sideload signal)\n",
+        );
+        let _ = writeln!(out, "_Catalog version: `{}`._\n", r.catalog_version);
+        let _ = writeln!(out, "| severity | path | rule | description |");
+        let _ = writeln!(out, "|:-:|---|---|---|");
+        for f in &r.findings {
+            let sev = match f.severity {
+                iocs::Severity::High => "🛑 HIGH",
+                iocs::Severity::Medium => "⚠️ MED",
+            };
+            let _ = writeln!(
+                out,
+                "| {sev} | `{}` | `{}` | {} |",
+                escape_pipe(&f.path.display().to_string()),
+                f.rule_id,
+                escape_pipe(f.description),
+            );
+        }
+    }
 }
 
 fn push_cloud_secret_section(out: &mut String, hits: &[cloud_secrets::Hit]) {
@@ -539,7 +683,7 @@ mod tests {
         stats.ingest(ev_open("/etc/hosts", false));
         stats.ingest(ev_exec("/bin/sh", false));
 
-        let s = render_step_summary("npm install", &stats, None, None, &[]);
+        let s = render_step_summary("npm install", &stats, None, None, &[], None);
         // Header + command line.
         assert!(s.contains("## sakimori"));
         assert!(s.contains("`npm install`"));
@@ -565,7 +709,7 @@ mod tests {
         }
         stats.ingest(ev_connect(Some("evil.example"), "9.9.9.9", 443, true));
 
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         let evil_pos = s.find("evil.example").expect("evil row present");
         let good_pos = s.find("good.example").expect("good row present");
         assert!(
@@ -582,7 +726,7 @@ mod tests {
         // headers in the summary).
         let mut stats = Stats::default();
         stats.ingest(ev_open("/x", false));
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         assert!(s.contains("### Files"));
         assert!(!s.contains("### Network"));
         assert!(!s.contains("### Processes"));
@@ -591,7 +735,7 @@ mod tests {
     #[test]
     fn pipe_in_command_is_escaped_so_table_doesnt_break() {
         let stats = Stats::default();
-        let s = render_step_summary("bash -c 'foo | bar'", &stats, None, None, &[]);
+        let s = render_step_summary("bash -c 'foo | bar'", &stats, None, None, &[], None);
         assert!(s.contains(r"bash -c 'foo \| bar'"));
     }
 
@@ -601,7 +745,7 @@ mod tests {
         for i in 0..(SUMMARY_TOP_N + 5) {
             stats.ingest(ev_open(&format!("/tmp/file-{i}"), false));
         }
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         assert!(s.contains("more rows omitted"));
     }
 
@@ -612,7 +756,7 @@ mod tests {
             ..Stats::default()
         };
         stats.ingest(ev_open("/x", false));
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         assert!(s.contains("⚠️"));
         assert!(s.contains("7 events were dropped"));
     }
@@ -624,7 +768,7 @@ mod tests {
         // No source attribution anywhere → table suppressed.
         let mut stats = Stats::default();
         stats.ingest(ev_connect(Some("a.example"), "1.1.1.1", 443, false));
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         assert!(
             !s.contains("### Sources"),
             "with zero attribution the section must be hidden, got:\n{s}"
@@ -658,7 +802,7 @@ mod tests {
         stats.ingest(e2);
         stats.ingest(e3);
 
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         assert!(s.contains("### Sources"), "section header missing");
         assert!(s.contains("`npm`"));
         assert!(s.contains("`pip`"));
@@ -686,7 +830,7 @@ mod tests {
             removed: vec![PathBuf::from("src/old.rs")],
         };
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, Some(&drift), None, &[]);
+        let s = render_step_summary("cmd", &stats, Some(&drift), None, &[], None);
 
         assert!(s.contains("| drift    | **3** |"), "drift count missing");
         assert!(s.contains("### Workspace drift"), "drift section missing");
@@ -701,7 +845,7 @@ mod tests {
     fn drift_section_suppressed_when_clean() {
         use crate::tamper::Diff;
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, Some(&Diff::default()), None, &[]);
+        let s = render_step_summary("cmd", &stats, Some(&Diff::default()), None, &[], None);
         assert!(!s.contains("### Workspace drift"));
         // Clean diff still gets a "drift | 0" row so the user knows
         // the snapshot ran.
@@ -721,7 +865,7 @@ mod tests {
             removed: vec![],
         };
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, Some(&drift), None, &[]);
+        let s = render_step_summary("cmd", &stats, Some(&drift), None, &[], None);
         assert!(s.contains("more rows omitted"), "{s}");
     }
 
@@ -737,7 +881,7 @@ mod tests {
             description: "Shai-Hulud dropper",
         }]);
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, Some(&report), &[]);
+        let s = render_step_summary("cmd", &stats, None, Some(&report), &[], None);
         assert!(s.contains("Known-IOC hits"), "{s}");
         assert!(s.contains("🛑 HIGH"), "{s}");
         assert!(s.contains(".claude/setup.mjs"), "{s}");
@@ -749,7 +893,7 @@ mod tests {
         use crate::iocs::Report;
         let report = Report::new(vec![]);
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, Some(&report), &[]);
+        let s = render_step_summary("cmd", &stats, None, Some(&report), &[], None);
         assert!(!s.contains("Known-IOC hits"), "{s}");
     }
 
@@ -764,7 +908,7 @@ mod tests {
             package_manager: "npm".into(),
         }];
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, None, &hits);
+        let s = render_step_summary("cmd", &stats, None, None, &hits, None);
         assert!(s.contains("Cloud-secret egress"), "{s}");
         assert!(s.contains("cloud-metadata-imds"), "{s}");
         assert!(s.contains("169.254.169.254"), "{s}");
@@ -774,7 +918,7 @@ mod tests {
     #[test]
     fn cloud_secret_section_omitted_when_no_hits() {
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, None, &[]);
+        let s = render_step_summary("cmd", &stats, None, None, &[], None);
         assert!(!s.contains("Cloud-secret egress"), "{s}");
     }
 
@@ -793,7 +937,7 @@ mod tests {
             package_manager: "npm".into(),
         }];
         let stats = Stats::default();
-        let s = render_step_summary("cmd", &stats, None, None, &hits);
+        let s = render_step_summary("cmd", &stats, None, None, &hits, None);
         assert!(s.contains("⚠️ ALLOW"), "{s}");
         assert!(!s.contains("❌ DENY"), "{s}");
     }
