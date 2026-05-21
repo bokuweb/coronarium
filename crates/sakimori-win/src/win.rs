@@ -288,6 +288,10 @@ pub fn run() -> Result<()> {
         // `--snapshot-workspace`. Adding it here is a follow-up.
         workspace_drift: None,
         workspace_iocs: None,
+        // Editor-extension snapshot isn't wired into the Windows
+        // ETW supervisor yet — Linux supervisor opted in via
+        // `--snapshot-extensions`. Adding it here is a follow-up.
+        extension: None,
     };
     sakimori_core::report::write(&report_args, &final_stats)?;
 
