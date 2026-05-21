@@ -826,6 +826,39 @@ pub struct ProxyStartArgs {
     /// `--otlp-endpoint` is not set.
     #[arg(long = "otlp-header", value_name = "K=V", value_parser = parse_kv)]
     pub otlp_headers: Vec<(String, String)>,
+    /// Opt-in `sakimori-hub` ingest endpoint. When set together
+    /// with `--hub-ingest-token` (or `SAKIMORI_TOKEN`), every
+    /// allowed install is POSTed to this URL as an
+    /// `InstallEventBatch`. The URL must include the full hub
+    /// route, e.g.
+    /// `https://hub.example/v1/{team}/_team/events` (team token),
+    /// `https://hub.example/v1/{team}/_user/{member_id}/events`
+    /// (user token), or
+    /// `https://hub.example/v1/{team}/{project}/events` (project
+    /// token). Read from the env var `SAKIMORI_INGEST_URL`
+    /// when the flag is absent — that's how the GitHub Action
+    /// wires it through.
+    #[arg(
+        long = "hub-ingest-url",
+        value_name = "URL",
+        env = "SAKIMORI_INGEST_URL"
+    )]
+    pub hub_ingest_url: Option<String>,
+    /// Bearer token for the `sakimori-hub` ingest endpoint. Issued
+    /// by the hub's `POST /api/v1/teams/{slug}/tokens/{user|team}`
+    /// endpoint (or a future project-token issuer). Always paired
+    /// with `--hub-ingest-url`; setting one without the other is
+    /// a no-op and logs a warning at proxy startup. Read from
+    /// `SAKIMORI_TOKEN` when the flag is absent. **Never logged**
+    /// — wrapped in `SakimoriToken` whose `Debug` redacts the
+    /// bytes.
+    #[arg(
+        long = "hub-ingest-token",
+        value_name = "TOKEN",
+        env = "SAKIMORI_TOKEN",
+        hide_env_values = true
+    )]
+    pub hub_ingest_token: Option<String>,
     /// Lifecycle-script gate for npm tarballs (Shai-Hulud-class
     /// defence). `audit` logs every fetched tarball that ships
     /// `install` / `preinstall` / `postinstall` / `prepare` scripts
@@ -1283,6 +1316,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 install_log_enabled: !args.no_install_log,
                 otlp_endpoint: args.otlp_endpoint,
                 otlp_headers: args.otlp_headers,
+                hub_ingest_endpoint: args.hub_ingest_url,
+                hub_ingest_token: args
+                    .hub_ingest_token
+                    .map(sakimori_proxy::hub_ingest::SakimoriToken::new),
                 lifecycle_policy,
                 lifecycle_allow: args.lifecycle_allow,
                 lifecycle_strip_on_failure,

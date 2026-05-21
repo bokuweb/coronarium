@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod decision;
 pub mod git_fetch;
 pub mod host_allow;
+pub mod hub_ingest;
 pub mod install;
 pub mod lifecycle;
 pub mod nuget_flatcontainer_client;

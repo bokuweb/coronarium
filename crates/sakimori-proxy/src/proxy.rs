@@ -101,6 +101,24 @@ pub struct ProxyConfig {
     /// `Authorization: Bearer …` for vendor backends. Ignored when
     /// `otlp_endpoint` is `None`.
     pub otlp_headers: Vec<(String, String)>,
+    /// Optional `sakimori-hub` ingest endpoint. When `Some` AND
+    /// `hub_ingest_token` is also set, every allowed install
+    /// fires a fire-and-forget POST to this URL — in addition to
+    /// any OTLP fan-out or local install log. The URL must
+    /// include the full hub route, e.g.
+    /// `https://hub.example/v1/{team_slug}/_team/events` (team
+    /// token),
+    /// `https://hub.example/v1/{team_slug}/_user/{member_id}/events`
+    /// (user token), or
+    /// `https://hub.example/v1/{team_slug}/{project_slug}/events`
+    /// (project token). Disabling either endpoint or token
+    /// disables the exporter.
+    pub hub_ingest_endpoint: Option<String>,
+    /// Bearer credential for the hub ingest endpoint. Held in a
+    /// dedicated newtype so a stray `{:?}` cannot leak it; see
+    /// [`crate::hub_ingest::SakimoriToken`]. `None` disables the
+    /// exporter.
+    pub hub_ingest_token: Option<crate::hub_ingest::SakimoriToken>,
     /// Lifecycle-script policy for npm tarballs. `None` disables the
     /// gate (current default). `Some(Audit)` logs script bodies for
     /// every fetched tarball that ships an `install` / `preinstall` /
@@ -176,6 +194,8 @@ impl ProxyConfig {
             install_log_enabled: true,
             otlp_endpoint: None,
             otlp_headers: Vec::new(),
+            hub_ingest_endpoint: None,
+            hub_ingest_token: None,
             lifecycle_policy: None,
             lifecycle_allow: Vec::new(),
             lifecycle_strip_on_failure: crate::lifecycle::StripFailurePolicy::Block,
@@ -337,6 +357,66 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
             cfg.user_agent.clone(),
         ))
     });
+    // The hub ingest exporter requires BOTH an endpoint and a
+    // token. Setting just one is almost certainly a config
+    // mistake (e.g. SAKIMORI_INGEST_URL exported but
+    // SAKIMORI_TOKEN missing on a CI runner); surface that loudly
+    // at startup instead of silently dropping every event.
+    let hub_ingest_exporter = match (
+        cfg.hub_ingest_endpoint.as_ref(),
+        cfg.hub_ingest_token.as_ref(),
+    ) {
+        (Some(endpoint), Some(token)) => {
+            // Validate the URL before constructing the exporter
+            // so a garbage env value fails loudly at startup
+            // instead of spraying one log::warn per install.
+            // Rejects schemes other than http/https, embedded
+            // userinfo, and control chars (log-injection guard,
+            // codex round-1 low/medium).
+            match crate::hub_ingest::validate_endpoint(endpoint) {
+                Ok(()) => {
+                    // After validation the URL is known to be
+                    // control-char-free, so logging it verbatim
+                    // is safe.
+                    log::info!("hub ingest → {endpoint}");
+                    Some(Arc::new(crate::hub_ingest::HubIngestExporter::new(
+                        endpoint.clone(),
+                        token.clone(),
+                        cfg.user_agent.clone(),
+                    )))
+                }
+                Err(why) => {
+                    // Diagnostic is a constant `&'static str`;
+                    // never echoes the unvalidated endpoint.
+                    log::warn!("hub ingest disabled: {why}");
+                    None
+                }
+            }
+        }
+        (Some(_endpoint), None) => {
+            // Don't echo the endpoint — control chars in an
+            // unconfigured URL would still let the env value
+            // forge log lines. The actionable message is the
+            // same with or without the URL.
+            log::warn!(
+                "hub ingest endpoint set but token is missing; \
+                 set SAKIMORI_TOKEN to enable the exporter"
+            );
+            None
+        }
+        (None, Some(_)) => {
+            // Token without endpoint: don't log the token (custom
+            // Debug redacts but log::warn! with `{:?}` would still
+            // surface `SakimoriToken(<redacted, N bytes>)`). The
+            // useful signal is "set the URL too".
+            log::warn!(
+                "SAKIMORI_TOKEN is set but hub ingest endpoint is missing; \
+                 set SAKIMORI_INGEST_URL to enable the exporter"
+            );
+            None
+        }
+        (None, None) => None,
+    };
     let registries = Arc::new(cfg.registries.clone());
     let handler = SakimoriHandler {
         parsers: Arc::new(parsers_from_hosts(&cfg.registries)),
@@ -353,6 +433,7 @@ pub async fn run(cfg: ProxyConfig) -> Result<()> {
         network_allow: cfg.network_allow.map(Arc::new),
         install_logger,
         otlp_exporter,
+        hub_ingest_exporter,
         lifecycle_policy: cfg.lifecycle_policy,
         lifecycle_allow: Arc::new(cfg.lifecycle_allow.into_iter().collect()),
         lifecycle_strip_on_failure: cfg.lifecycle_strip_on_failure,
@@ -585,6 +666,11 @@ struct SakimoriHandler {
     /// sakimori-hub push notifications, OTLP is for generic
     /// observability backends).
     otlp_exporter: Option<Arc<crate::otlp::OtlpExporter>>,
+    /// Optional sakimori-hub ingest exporter. `None` disables hub
+    /// fan-out. Coexists with `otlp_exporter` and `install_logger`
+    /// — the proxy fans out to whichever transports the operator
+    /// configured.
+    hub_ingest_exporter: Option<Arc<crate::hub_ingest::HubIngestExporter>>,
     /// Hostname allow-list. `None` (or empty) → unrestricted egress.
     /// `Some(non-empty)` → default-deny: any CONNECT or plain-HTTP
     /// request whose target host doesn't match returns 403 before
@@ -1274,7 +1360,10 @@ impl HttpHandler for SakimoriHandler {
                 let now = Utc::now();
                 match self.decider.decide(ecosystem, &name, &version, now) {
                     Decision::Allow => {
-                        if self.install_logger.is_some() || self.otlp_exporter.is_some() {
+                        if self.install_logger.is_some()
+                            || self.otlp_exporter.is_some()
+                            || self.hub_ingest_exporter.is_some()
+                        {
                             let mode = classify_execution_mode(&user_agent);
                             let mut ev =
                                 InstallEvent::new(ecosystem, &name, &version).with_mode(mode);
@@ -1289,6 +1378,9 @@ impl HttpHandler for SakimoriHandler {
                                 log::warn!("install log write failed: {e:#}");
                             }
                             if let Some(exporter) = self.otlp_exporter.as_ref() {
+                                exporter.dispatch(&ev);
+                            }
+                            if let Some(exporter) = self.hub_ingest_exporter.as_ref() {
                                 exporter.dispatch(&ev);
                             }
                         }
