@@ -34,6 +34,26 @@ function notice(msg) {
   process.stdout.write(`::notice::${msg}\n`);
 }
 
+// Register `value` with the GitHub Actions log scrubber so any
+// subsequent step that echoes the bytes (including stdout from
+// the proxy itself, the supervised command, or a `set -x` trace)
+// renders them as `***` in the workflow log. Only emit when the
+// value is non-empty — `::add-mask::` with an empty payload is
+// a no-op that still produces noise in the log.
+function addMask(value) {
+  if (!value) return;
+  // GH workflow-command payload escaping (mirror @actions/core's
+  // `toCommandValue` + `escapeData`). A bearer with `\r` or `\n`
+  // in it would otherwise terminate the `::add-mask::` line early
+  // and leak the trailing bytes into the workflow log. Tokens
+  // SHOULD be single-line, but treat untrusted input as untrusted.
+  const escaped = String(value)
+    .replace(/%/g, "%25")
+    .replace(/\r/g, "%0D")
+    .replace(/\n/g, "%0A");
+  process.stdout.write(`::add-mask::${escaped}\n`);
+}
+
 function setEnv(name, value) {
   const f = process.env.GITHUB_ENV;
   if (!f) return;
@@ -179,6 +199,31 @@ async function waitForListen(host, port, deadlineMs) {
   const minAge = input("min-age", "7d");
   const failOnMissing = input("fail-on-missing") === "true";
 
+  // Optional sakimori-hub ingest wiring. The proxy reads these
+  // from the environment (see SakimoriToken / SAKIMORI_INGEST_URL
+  // in sakimori-proxy). Mask the token IMMEDIATELY — before any
+  // later code can echo it via `set -x`-style traces or a
+  // spawn-error path that includes the env block.
+  const ingestUrl = input("ingest-url");
+  const ingestToken = input("ingest-token");
+  if (ingestToken) {
+    addMask(ingestToken);
+  }
+  // Endpoint/token presence are dependent: either both or neither.
+  // The proxy logs a warn at startup if only one is set; surface
+  // the same signal at action level so the CI log gives the
+  // operator one clear place to fix it.
+  if (ingestUrl && !ingestToken) {
+    notice(
+      "sakimori-proxy: `ingest-url` is set but `ingest-token` is empty; hub upload disabled",
+    );
+  }
+  if (ingestToken && !ingestUrl) {
+    notice(
+      "sakimori-proxy: `ingest-token` is set but `ingest-url` is empty; hub upload disabled",
+    );
+  }
+
   const runnerTemp = process.env.RUNNER_TEMP || os.tmpdir();
   const tmpDir = path.join(runnerTemp, "sakimori-proxy-action");
   fs.mkdirSync(tmpDir, { recursive: true });
@@ -241,9 +286,33 @@ async function waitForListen(host, port, deadlineMs) {
   console.log(`sakimori-proxy: spawning ${binPath} ${proxyArgs.join(" ")}`);
   // detached + unref + stdio→files lets the process survive Node's
   // exit at end-of-step and keep serving subsequent steps.
+  //
+  // Build the child env explicitly: inherit ours by default, then
+  // overlay the hub-ingest credentials so the child reads them via
+  // clap's `env =` binding (see SAKIMORI_INGEST_URL / SAKIMORI_TOKEN
+  // in crates/sakimori/src/cli.rs). Passing through the env (not
+  // argv) keeps the secret off `ps` output and any spawn-failure
+  // log paths that dump argv.
+  const childEnv = { ...process.env };
+  // Strip the action's own INPUT_* env so the spawned proxy
+  // never sees the token under its INPUT_INGEST_TOKEN alias
+  // (codex round-1: the inherited copy would otherwise live
+  // alongside SAKIMORI_TOKEN and double the leak surface). The
+  // proxy only reads SAKIMORI_* names; nothing downstream needs
+  // INPUT_* at all.
+  for (const key of Object.keys(childEnv)) {
+    if (key.startsWith("INPUT_")) {
+      delete childEnv[key];
+    }
+  }
+  if (ingestUrl && ingestToken) {
+    childEnv.SAKIMORI_INGEST_URL = ingestUrl;
+    childEnv.SAKIMORI_TOKEN = ingestToken;
+  }
   const child = spawn(binPath, proxyArgs, {
     detached: true,
     stdio: ["ignore", stdoutFd, stderrFd],
+    env: childEnv,
     // Windows: don't open a console window for the proxy.
     windowsHide: true,
   });
