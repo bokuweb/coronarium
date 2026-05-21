@@ -1168,6 +1168,23 @@ jobs:
             ${{ runner.temp }}/scan-empty.json
             ${{ runner.temp }}/scan-missing.json
 
+  proxy-action-contract:
+    # Pure-Node contract tests for `proxy/main.js` — pin the surface
+    # the composite-action presents to its callers (input names,
+    # the `::add-mask::` discipline that keeps the hub-ingest token
+    # out of subsequent step logs, and the env-only credential
+    # propagation). Runs on one OS only; node --test is OS-portable
+    # and the assertions are file-content-based, not behavioural.
+    # The proxy-action-smoke matrix below covers the behavioural
+    # side end-to-end.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node --test proxy/test/main.test.mjs
+
   proxy-action-smoke:
     # Verifies that `bokuweb/sakimori/proxy@v0` (the JS-action wrapper
     # that spawns `sakimori proxy start` and exports HTTPS_PROXY via

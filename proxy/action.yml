@@ -41,6 +41,36 @@ inputs:
     description: "GitHub token for `gh release download`."
     required: false
     default: ${{ github.token }}
+  ingest-url:
+    description: |
+      Optional `sakimori-hub` ingest endpoint. When set together
+      with `ingest-token`, every allowed install resolved by the
+      proxy is POSTed to this URL as an `InstallEventBatch` —
+      enabling team-wide visibility into what package versions
+      landed on CI runners. The URL must include the full hub
+      route, e.g.
+      `https://hub.example/v1/{team}/_team/events` (team token),
+      `https://hub.example/v1/{team}/_user/{member_id}/events`
+      (user token), or
+      `https://hub.example/v1/{team}/{project}/events` (project
+      token). Leave empty (default) to disable hub upload — the
+      proxy still filters minimumReleaseAge as usual.
+    required: false
+    default: ""
+  ingest-token:
+    description: |
+      Bearer credential for `ingest-url`. Issued by the hub's
+      `POST /api/v1/teams/{slug}/tokens/{user|team}` endpoint.
+      Always paired with `ingest-url`; setting one without the
+      other is a no-op and logs a warning.
+
+      Treat as a secret. Pass via `${{ secrets.SAKIMORI_TOKEN }}`
+      — never inline the token in a workflow file. The action
+      registers it with `::add-mask::` before exporting so the
+      bytes never appear in subsequent logs, but a token typed
+      into the workflow YAML stays in git history regardless.
+    required: false
+    default: ""
 
 outputs:
   ca-cert:
