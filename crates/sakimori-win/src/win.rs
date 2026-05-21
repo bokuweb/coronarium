@@ -474,6 +474,18 @@ fn run_deps(raw: &[String]) -> Result<()> {
         /// Resident watcher (stdout notifier on Windows — pipe to your
         /// preferred toast / Teams hook).
         Watch(DepsWatchArgs),
+        /// Lint lockfiles for transitive exotic-source deps (pnpm
+        /// `blockExoticSubdeps` parity).
+        Exotic(DepsExoticArgs),
+    }
+    #[derive(Debug, Parser)]
+    struct DepsExoticArgs {
+        #[arg(required = true)]
+        lockfiles: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        include_direct: bool,
+        #[arg(long, value_enum, default_value = "text")]
+        format: DepsFormatArg,
     }
     #[derive(Debug, Parser)]
     struct DepsCheckArgs {
@@ -551,6 +563,19 @@ fn run_deps(raw: &[String]) -> Result<()> {
                 user_agent: None,
             })?;
             Ok(())
+        }
+        DepsCmd::Exotic(args) => {
+            let exit = sakimori_core::deps::cli::run_exotic(
+                sakimori_core::deps::cli::ExoticCliArgs {
+                    lockfiles: args.lockfiles,
+                    include_direct: args.include_direct,
+                    format: match args.format {
+                        DepsFormatArg::Text => sakimori_core::deps::cli::Format::Text,
+                        DepsFormatArg::Json => sakimori_core::deps::cli::Format::Json,
+                    },
+                },
+            )?;
+            std::process::exit(exit);
         }
     }
 }

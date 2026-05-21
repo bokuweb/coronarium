@@ -1003,6 +1003,27 @@ pub enum DepsCommand {
     /// canonical per-OS location; override with `--cache`.
     #[command(name = "verify-cache")]
     VerifyCache(DepsVerifyCacheArgs),
+    /// Lint lockfiles for transitive deps that resolve to exotic
+    /// sources (git URL / tarball URL / `file:` path) — the
+    /// `blockExoticSubdeps` equivalent of pnpm 11. Direct deps from
+    /// exotic sources are reported but pass by default; pass
+    /// `--include-direct` to fail on those too. Supported lockfiles:
+    /// `package-lock.json`, `Cargo.lock`.
+    Exotic(DepsExoticArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct DepsExoticArgs {
+    /// Lockfiles to inspect. Currently: package-lock.json, Cargo.lock.
+    #[arg(required = true)]
+    pub lockfiles: Vec<PathBuf>,
+    /// Also fail on direct (root-declared) exotic deps. Default is
+    /// transitive-only, matching pnpm's `blockExoticSubdeps`.
+    #[arg(long)]
+    pub include_direct: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: DepsFormat,
 }
 
 #[derive(Debug, Parser)]
@@ -1365,6 +1386,20 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Deps {
             cmd: DepsCommand::VerifyCache(args),
         } => run_deps_verify_cache(args),
+        Command::Deps {
+            cmd: DepsCommand::Exotic(args),
+        } => {
+            let exit =
+                sakimori_core::deps::cli::run_exotic(sakimori_core::deps::cli::ExoticCliArgs {
+                    lockfiles: args.lockfiles,
+                    include_direct: args.include_direct,
+                    format: match args.format {
+                        DepsFormat::Text => sakimori_core::deps::cli::Format::Text,
+                        DepsFormat::Json => sakimori_core::deps::cli::Format::Json,
+                    },
+                })?;
+            std::process::exit(exit);
+        }
         Command::InstallGate {
             cmd: InstallGateCommand::Shellenv(args),
         } => {
