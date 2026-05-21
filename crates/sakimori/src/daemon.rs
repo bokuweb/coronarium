@@ -73,6 +73,11 @@ pub struct DaemonStartArgs {
     /// match what was passed to `sakimori workspace snapshot`
     /// when the baseline was taken.
     pub workspace_skip: Vec<String>,
+    /// Take a baseline + post-run snapshot of every editor-extension
+    /// directory under `$HOME`. See `sakimori run --snapshot-
+    /// extensions` for semantics. Off by default; opt-in because
+    /// the pre-run sweep walks every installed extension on disk.
+    pub snapshot_extensions: bool,
 }
 
 /// Parameters for `sakimori daemon stop`.
@@ -117,6 +122,39 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         );
     }
 
+    // Editor-extension baseline + pre-existing IOC sweep run BEFORE
+    // we attach the eBPF programs. Hard-fail on $HOME safety guard,
+    // soft-fail on snapshot errors.
+    let (ext_baseline_snap, ext_iocs_baseline) = if args.snapshot_extensions {
+        let home = resolve_safe_home().context("--snapshot-extensions requires a safe $HOME")?;
+        let baseline = match sakimori_core::editor_extensions::baseline_extensions(&home) {
+            Ok((s, roots)) => {
+                log::info!(
+                    "daemon editor-extension baseline: {} files across {} root(s) under {}",
+                    s.files.len(),
+                    roots.len(),
+                    home.display(),
+                );
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("daemon editor-extension baseline snapshot failed: {e:#}");
+                None
+            }
+        };
+        let iocs_baseline = match sakimori_core::editor_extensions::scan_existing_extensions(&home)
+        {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::warn!("daemon editor-extension baseline IOC scan failed: {e:#}");
+                None
+            }
+        };
+        (baseline, iocs_baseline)
+    } else {
+        (None, None)
+    };
+
     let cgroup = Cgroup::observe_existing(args.observe_cgroup_of, args.allow_root_cgroup)
         .context("attaching to existing cgroup")?;
     log::info!(
@@ -156,6 +194,42 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         .as_ref()
         .map(|d| scan_drift_for_iocs(d, args.workspace_dir.as_deref()));
 
+    // Editor-extension drift at shutdown — mirrors `sakimori run`.
+    let ext_drift = if args.snapshot_extensions {
+        match (resolve_safe_home(), ext_baseline_snap.as_ref()) {
+            (Ok(home), Some(b)) => {
+                match sakimori_core::editor_extensions::drift_extensions(&home, b) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        log::warn!("daemon editor-extension drift snapshot failed: {e:#}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let ext_section = ext_drift
+        .as_ref()
+        .map(|d| &d.diff)
+        .filter(|d| !d.is_clean());
+    let ext_iocs_drift = ext_drift
+        .as_ref()
+        .map(|d| &d.iocs)
+        .filter(|r| !r.is_clean());
+    let ext_iocs_baseline_ref = ext_iocs_baseline.as_ref().filter(|r| !r.is_clean());
+    let extension = if args.snapshot_extensions {
+        Some(sakimori_core::report::ExtensionSection {
+            drift: ext_section,
+            iocs_drift: ext_iocs_drift,
+            iocs_baseline: ext_iocs_baseline_ref,
+        })
+    } else {
+        None
+    };
+
     let report = ReportArgs {
         log: &args.log,
         summary: args.summary.as_deref(),
@@ -165,11 +239,24 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         policy: &policy,
         workspace_drift: drift.as_ref().filter(|d| !d.is_clean()),
         workspace_iocs: ioc_report.as_ref().filter(|r| !r.is_clean()),
+        extension,
     };
     sakimori_core::report::write(&report, &stats)?;
 
     let drift_violation = drift.as_ref().map(|d| !d.is_clean()).unwrap_or(false);
     let ioc_high = ioc_report.as_ref().map(|r| r.has_high()).unwrap_or(false);
+    let ext_drift_violation = ext_drift
+        .as_ref()
+        .map(|d| !d.diff.is_clean())
+        .unwrap_or(false);
+    let ext_ioc_high = ext_drift
+        .as_ref()
+        .map(|d| d.iocs.has_high())
+        .unwrap_or(false)
+        || ext_iocs_baseline
+            .as_ref()
+            .map(|r| r.has_high())
+            .unwrap_or(false);
 
     // Block-mode parity with `sakimori run`: any denied event flips the
     // exit code so the surrounding job fails.
@@ -197,7 +284,51 @@ pub async fn start(args: DaemonStartArgs) -> Result<()> {
         );
         std::process::exit(1);
     }
+    if ext_drift_violation && matches!(mode, Mode::Block) {
+        let n = ext_drift.as_ref().map(|d| d.diff.total()).unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::editor-extension drift detected: {n} extension files added/modified/removed during the supervised job"
+        );
+        std::process::exit(1);
+    }
+    if ext_ioc_high {
+        let drift_hits = ext_drift
+            .as_ref()
+            .map(|d| d.iocs.findings.len())
+            .unwrap_or(0);
+        let baseline_hits = ext_iocs_baseline
+            .as_ref()
+            .map(|r| r.findings.len())
+            .unwrap_or(0);
+        eprintln!(
+            "::error title=sakimori::editor-extension IOC hit: {} pre-existing + {} drift-time path(s) match a known supply-chain campaign fingerprint",
+            baseline_hits, drift_hits,
+        );
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Resolve `$HOME` (or `%USERPROFILE%`), refusing degenerate values
+/// that would cause `--snapshot-extensions` to walk the entire
+/// filesystem. Mirrors [`crate::cli::resolve_safe_home`] — kept
+/// private here to avoid leaking a CLI helper across modules.
+fn resolve_safe_home() -> Result<PathBuf> {
+    let raw = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow::anyhow!("$HOME / %USERPROFILE% is unset"))?;
+    let raw_path = PathBuf::from(&raw);
+    if raw_path.as_os_str().is_empty() {
+        anyhow::bail!("$HOME resolved to empty string");
+    }
+    let canon = raw_path.canonicalize().unwrap_or_else(|_| raw_path.clone());
+    if canon == Path::new("/") || canon.as_os_str().is_empty() {
+        anyhow::bail!(
+            "$HOME canonicalised to '/' — refusing to walk the entire \
+             filesystem under --snapshot-extensions"
+        );
+    }
+    Ok(canon)
 }
 
 /// Run the IOC catalog against `drift.added` + `drift.modified`. Files

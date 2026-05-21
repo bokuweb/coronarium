@@ -6,7 +6,9 @@
 
 use std::fmt::Write;
 
-use crate::{events::Event, iocs, policy::Policy, stats::Stats, tamper::Diff};
+use crate::{
+    events::Event, iocs, policy::Policy, report::ExtensionSection, stats::Stats, tamper::Diff,
+};
 
 /// Render the full report. The result is a complete `<!DOCTYPE html>`
 /// document.
@@ -16,6 +18,7 @@ pub fn render(
     meta: ReportMeta<'_>,
     drift: Option<&Diff>,
     iocs: Option<&iocs::Report>,
+    extension: Option<&ExtensionSection<'_>>,
 ) -> String {
     let mut html = String::with_capacity(16 * 1024);
 
@@ -130,6 +133,41 @@ pub fn render(
         && !r.is_clean()
     {
         render_iocs_section(&mut html, r);
+    }
+
+    if let Some(ext) = extension {
+        if let Some(r) = ext.iocs_baseline
+            && !r.is_clean()
+        {
+            render_extension_iocs_section(
+                &mut html,
+                r,
+                "Editor extensions — pre-existing IOC hits",
+                "Catalog hits in editor-extension directories that existed \
+                 before the supervised step started. High-severity entries \
+                 indicate the host was already poisoned before sakimori \
+                 attached.",
+                "extension_iocs_baseline",
+            );
+        }
+        if let Some(d) = ext.drift
+            && !d.is_clean()
+        {
+            render_extension_drift_section(&mut html, d);
+        }
+        if let Some(r) = ext.iocs_drift
+            && !r.is_clean()
+        {
+            render_extension_iocs_section(
+                &mut html,
+                r,
+                "Editor extensions — IOC hits during drift",
+                "Catalog hits on extension paths added or modified during \
+                 the supervised step. Sideload signal: a poisoned extension \
+                 just dropped onto the host.",
+                "extension_iocs",
+            );
+        }
     }
 
     html.push_str(
@@ -384,10 +422,133 @@ fn render_drift_section(out: &mut String, drift: &Diff) {
     out.push_str("  </section>\n\n");
 }
 
+/// Mirror of [`render_drift_section`] for the editor-extension half.
+/// Separate function so the section title and JSON key in the
+/// truncation footer point at the right place (`extension_drift`
+/// vs `workspace_drift`).
+fn render_extension_drift_section(out: &mut String, drift: &Diff) {
+    let total = drift.total();
+    let _ = write!(
+        out,
+        r#"  <section class="drift">
+    <h2>Editor extensions — drift <span class="badge badge-warn">{total} change{plural}</span></h2>
+    <p class="hint">Files added / modified / removed in
+       <code>~/.vscode/extensions</code> and friends during the supervised
+       step. Compare against the baseline taken at
+       <code>--snapshot-extensions</code>.</p>
+    <table class="events-table">
+      <thead><tr><th>change</th><th>path</th><th>note</th></tr></thead>
+      <tbody>
+"#,
+        total = total,
+        plural = if total == 1 { "" } else { "s" },
+    );
+    for p in drift.added.iter().take(HTML_DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip chip-add">added</span></td><td><code>{}</code></td><td></td></tr>"#,
+            html_escape(&p.display().to_string())
+        );
+    }
+    for m in drift.modified.iter().take(HTML_DRIFT_TOP_N) {
+        let note = drift_modification_note(m);
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip chip-mod">modified</span></td><td><code>{}</code></td><td><span class="muted">{}</span></td></tr>"#,
+            html_escape(&m.path.display().to_string()),
+            html_escape(&note),
+        );
+    }
+    for p in drift.removed.iter().take(HTML_DRIFT_TOP_N) {
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip chip-del">removed</span></td><td><code>{}</code></td><td></td></tr>"#,
+            html_escape(&p.display().to_string())
+        );
+    }
+    let shown = drift.added.len().min(HTML_DRIFT_TOP_N)
+        + drift.modified.len().min(HTML_DRIFT_TOP_N)
+        + drift.removed.len().min(HTML_DRIFT_TOP_N);
+    out.push_str("      </tbody>\n    </table>\n");
+    if total > shown {
+        let _ = writeln!(
+            out,
+            r#"    <p class="hint">… {} more rows omitted; full diff is in <code>extension_drift</code> of the JSON log.</p>"#,
+            total - shown,
+        );
+    }
+    out.push_str("  </section>\n\n");
+}
+
 /// Cap on IOC rows surfaced before truncation. Same shape as the
 /// drift cap — the full list lives in `workspace_iocs` of the JSON
 /// log regardless.
 const HTML_IOCS_TOP_N: usize = 50;
+
+/// Mirror of [`render_iocs_section`] with caller-provided title /
+/// hint text / JSON-key, so the same renderer covers both extension
+/// IOC buckets (pre-existing vs drift-time).
+fn render_extension_iocs_section(
+    out: &mut String,
+    report: &iocs::Report,
+    title: &str,
+    hint: &str,
+    json_key: &str,
+) {
+    let total = report.findings.len();
+    let high = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == iocs::Severity::High)
+        .count();
+    let badge_class = if high > 0 {
+        "badge-danger"
+    } else {
+        "badge-warn"
+    };
+    let _ = write!(
+        out,
+        r#"  <section class="iocs">
+    <h2>{title} <span class="badge {badge_class}">{total} hit{plural}</span></h2>
+    <p class="hint">{hint} (<code>catalog {ver}</code>)</p>
+    <table class="events-table">
+      <thead><tr><th>severity</th><th>path</th><th>rule</th><th>family</th><th>description</th></tr></thead>
+      <tbody>
+"#,
+        title = html_escape(title),
+        badge_class = badge_class,
+        total = total,
+        plural = if total == 1 { "" } else { "s" },
+        hint = html_escape(hint),
+        ver = html_escape(report.catalog_version),
+    );
+    for f in report.findings.iter().take(HTML_IOCS_TOP_N) {
+        let (chip_class, label) = match f.severity {
+            iocs::Severity::High => ("chip-del", "🛑 HIGH"),
+            iocs::Severity::Medium => ("chip-mod", "⚠️ MED"),
+        };
+        let _ = writeln!(
+            out,
+            r#"        <tr><td><span class="chip {chip_class}">{label}</span></td><td><code>{path}</code></td><td><code>{rule}</code></td><td>{family}</td><td>{desc}</td></tr>"#,
+            chip_class = chip_class,
+            label = label,
+            path = html_escape(&f.path.display().to_string()),
+            rule = html_escape(f.rule_id),
+            family = html_escape(f.family),
+            desc = html_escape(f.description),
+        );
+    }
+    out.push_str("      </tbody>\n    </table>\n");
+    if total > HTML_IOCS_TOP_N {
+        let _ = writeln!(
+            out,
+            r#"    <p class="hint">… {} more rows omitted; full list is in <code>{}</code> of the JSON log.</p>"#,
+            total - HTML_IOCS_TOP_N,
+            html_escape(json_key),
+        );
+    }
+    out.push_str("  </section>\n\n");
+}
 
 fn render_iocs_section(out: &mut String, report: &iocs::Report) {
     let total = report.findings.len();
@@ -776,7 +937,7 @@ mod tests {
     fn html_includes_host_column_header() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         assert!(out.contains("<th>host</th>"), "host column header missing");
     }
 
@@ -784,7 +945,7 @@ mod tests {
     fn connect_row_shows_hostname_when_present() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", Some("example.com"));
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         assert!(out.contains("example.com"), "hostname should render");
         // The IP still appears in the detail column.
         assert!(out.contains("1.2.3.4:443"));
@@ -794,7 +955,7 @@ mod tests {
     fn connect_row_shows_dash_when_hostname_missing() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         // Em-dash placeholder in the host cell.
         assert!(out.contains("—"), "dash placeholder expected when no PTR");
     }
@@ -821,7 +982,7 @@ mod tests {
             denied: false,
             source: None,
         });
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         // Both rows should render; the host cell is simply empty for
         // non-connect events.
         assert!(out.contains("/bin/sh"));
@@ -832,7 +993,7 @@ mod tests {
     fn source_column_header_present() {
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         assert!(out.contains("<th>source</th>"), "source column missing");
     }
 
@@ -860,7 +1021,7 @@ mod tests {
                 root_argv: Some("npm install left-pad@1.0.0".into()),
             }),
         });
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         // Chip with the pm label rendered.
         assert!(
             out.contains(">npm<"),
@@ -878,7 +1039,7 @@ mod tests {
         // Event without source → em-dash placeholder.
         let p = Policy::permissive_audit();
         let s = stats_with_one_connect("1.2.3.4", None);
-        let out = render(&p, &s, meta(), None, None);
+        let out = render(&p, &s, meta(), None, None, None);
         // Both the host and source cells use the em-dash placeholder
         // — count >=2 to confirm the source cell got one too.
         assert!(
@@ -896,7 +1057,7 @@ mod tests {
         let s = Stats::default();
 
         // Clean diff → no section.
-        let out = render(&p, &s, meta(), Some(&Diff::default()), None);
+        let out = render(&p, &s, meta(), Some(&Diff::default()), None, None);
         assert!(!out.contains("Workspace drift"));
 
         // Real diff → section appears with chip rows.
@@ -915,7 +1076,7 @@ mod tests {
             }],
             removed: vec![PathBuf::from("src/old.rs")],
         };
-        let out = render(&p, &s, meta(), Some(&drift), None);
+        let out = render(&p, &s, meta(), Some(&drift), None, None);
         assert!(out.contains("Workspace drift"));
         assert!(out.contains("chip-add"));
         assert!(out.contains("chip-mod"));
@@ -933,7 +1094,7 @@ mod tests {
 
         // Clean report → no section header.
         let clean = iocs::Report::new(Vec::new());
-        let out = render(&p, &s, meta(), None, Some(&clean));
+        let out = render(&p, &s, meta(), None, Some(&clean), None);
         assert!(!out.contains("Known-IOC hits"));
 
         // High + Medium findings → section appears with the danger
@@ -955,7 +1116,7 @@ mod tests {
                 description: "auth token risk",
             },
         ]);
-        let out = render(&p, &s, meta(), None, Some(&report));
+        let out = render(&p, &s, meta(), None, Some(&report), None);
         assert!(
             out.contains("Known-IOC hits"),
             "expected IOC section heading"
@@ -990,7 +1151,7 @@ mod tests {
             severity: iocs::Severity::Medium,
             description: "generic typosquat name",
         }]);
-        let out = render(&p, &s, meta(), None, Some(&report));
+        let out = render(&p, &s, meta(), None, Some(&report), None);
         assert!(out.contains("Known-IOC hits"));
         // The block starts with `Known-IOC hits` and the badge that
         // follows should be `badge-warn`, not `badge-danger`.
