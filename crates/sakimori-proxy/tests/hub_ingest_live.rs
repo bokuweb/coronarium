@@ -27,6 +27,10 @@
 //!     is the self-host contract this test exercises).
 //!   - `SAKIMORI_HUB_E2E_TOKEN` — a team-scoped ingest token.
 //!   - `SAKIMORI_HUB_E2E_TEAM`  — team slug (default `acme`).
+//!   - `SAKIMORI_HUB_E2E_REQUIRED` — when set, a missing
+//!     `SAKIMORI_HUB_E2E_URL` is a hard **panic** instead of a
+//!     skip. The workflow sets it so a broken env-wiring change
+//!     can't make the whole e2e falsely green (codex review).
 //!
 //! Read-back uses the hub's `/api/v1/teams/{slug}/events`
 //! inventory API. That route is session-cookie-authed; the
@@ -51,14 +55,26 @@ const POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_exporter_lands_one_event_in_a_real_hub() {
-    let Ok(base) = std::env::var("SAKIMORI_HUB_E2E_URL") else {
-        eprintln!(
-            "hub_ingest_live: SAKIMORI_HUB_E2E_URL unset — skipping \
-             (this is expected outside the hub-ingest-e2e workflow)"
-        );
-        return;
+    // `SAKIMORI_HUB_E2E_REQUIRED` turns a missing URL from a
+    // silent skip into a hard failure — so a broken env-wiring
+    // edit in the workflow surfaces instead of falsely passing
+    // (codex review, High).
+    let required = std::env::var("SAKIMORI_HUB_E2E_REQUIRED").is_ok();
+    let base = match std::env::var("SAKIMORI_HUB_E2E_URL") {
+        Ok(v) => v.trim_end_matches('/').to_string(),
+        Err(_) => {
+            assert!(
+                !required,
+                "SAKIMORI_HUB_E2E_REQUIRED is set but SAKIMORI_HUB_E2E_URL \
+                 is not — the e2e harness env wiring is broken"
+            );
+            eprintln!(
+                "hub_ingest_live: SAKIMORI_HUB_E2E_URL unset — skipping \
+                 (this is expected outside the hub-ingest-e2e workflow)"
+            );
+            return;
+        }
     };
-    let base = base.trim_end_matches('/').to_string();
     let token = std::env::var("SAKIMORI_HUB_E2E_TOKEN")
         .expect("SAKIMORI_HUB_E2E_TOKEN must be set when SAKIMORI_HUB_E2E_URL is");
     let team = std::env::var("SAKIMORI_HUB_E2E_TEAM").unwrap_or_else(|_| "acme".to_string());
@@ -85,13 +101,25 @@ async fn real_exporter_lands_one_event_in_a_real_hub() {
         .with_user_agent("sakimori-proxy/hub-ingest-live-e2e");
     event.resolved_at = Utc::now();
 
+    // The exact JSON the exporter will POST. `dispatch` is
+    // fire-and-forget so the test can't see the POST's HTTP
+    // status directly; capturing the wire payload here means a
+    // timeout panic can show what shape the hub rejected — the
+    // fastest signal for a schema drift (codex review, Medium).
+    let wire_payload = exporter
+        .build_payload(&event)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<exporter dropped the event before POST>".to_string());
+
     // Fire-and-forget; the POST runs on a spawn_blocking worker.
     exporter.dispatch(&event);
 
     // Poll the inventory API until the event lands (or the budget
     // runs out). The hub pipeline is async: ingest 202s
     // immediately, the Queue consumer does the D1 insert a beat
-    // later.
+    // later. `limit=100` is ample — the inventory is newest-first
+    // and our event is the most-recently-ingested row, so it is
+    // always page 1 even with seed data present.
     let inventory_url = format!("{base}/api/v1/teams/{team}/events?limit=100");
     let deadline = Instant::now() + POLL_BUDGET;
     let mut last_diag = String::from("no inventory response observed");
@@ -100,7 +128,10 @@ async fn real_exporter_lands_one_event_in_a_real_hub() {
         if Instant::now() >= deadline {
             panic!(
                 "event {pkg_name}@{pkg_version} did not appear on \
-                 {inventory_url} within {}s — last: {last_diag}",
+                 {inventory_url} within {}s.\n  last inventory probe: {last_diag}\n  \
+                 exporter wire payload (POSTed to the hub): {wire_payload}\n  \
+                 if the hub rejected this payload, check the worker log for a 4xx \
+                 on the ingest route — likely a wire-schema drift.",
                 POLL_BUDGET.as_secs(),
             );
         }
