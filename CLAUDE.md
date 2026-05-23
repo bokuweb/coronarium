@@ -435,6 +435,33 @@ the canonical public hosts, list the internal hosts under
    advisory push notifications, OTLP for general observability,
    both for either.
 
+   **Semantic-convention honesty.** The OTLP **envelope** (the
+   `resourceLogs[].scopeLogs[].logRecords[]` shape, `timeUnixNano`
+   as a decimal string, `severityNumber` in the 1..24 enum range,
+   `AnyValue` variants, `service.name` / `service.version` on the
+   resource) follows OTLP/HTTP JSON exactly — any spec-compliant
+   collector parses it. The **`package.*` attribute keys are
+   sakimori-specific**, not OpenTelemetry semantic conventions:
+   OTel has no registered "package install event" attribute set
+   yet, so we use our own namespace. If/when semconv ships an
+   official equivalent (`software.package.*`?) the exporter will
+   add it alongside (not replace `package.*`, to keep existing
+   dashboards working). Don't claim "semconv compliant" — claim
+   "OTLP-wire compliant, custom attribute namespace".
+
+   The envelope claim is enforced by
+   [crates/sakimori-proxy/tests/otlp_proto_roundtrip.rs](crates/sakimori-proxy/tests/otlp_proto_roundtrip.rs):
+   it round-trips the exporter's output through
+   `opentelemetry-proto`'s generated `ExportLogsServiceRequest`
+   type, which carries the canonical OTLP field set + proto3→JSON
+   name mapping. Any future regression that emits a non-OTLP
+   shape (int64 as JSON number, wrong AnyValue variant key,
+   unknown severity, …) trips that test before reaching CI's
+   slower mock-HTTP `proxy_otlp_e2e.rs`. Running a real
+   `otel/opentelemetry-collector-contrib` in CI is roadmap
+   (Docker cost + signal-to-noise) — the proto round-trip is
+   the lightweight stand-in.
+
    **npx** works for free here (same `registry.npmjs.org` path
    the npm rewriter already handles); **Homebrew** does *not* fit
    minimumReleaseAge (formula updates are PRs to a git repo, not

@@ -391,7 +391,7 @@ sakimori proxy start [OPTIONS]
 | **Lifecycle-script gate** (Shai-Hulud-class defence) | `--lifecycle-policy {audit,block,strip}`, `--lifecycle-allow <PKG>` (repeatable), `--lifecycle-strip-on-failure {block,passthrough}`, `--lifecycle-strip-cache-dir <DIR>`, `--lifecycle-no-strip-cache` | `audit` logs install-time scripts; `block` 403s tarballs that ship them; `strip` rewrites the tarball in place to drop the script keys + recompute the SRI hash + amend the packument so npm's integrity verifier agrees. See CLAUDE.md Roadmap #15 for the threat model. |
 | **Egress allow-list** | `--network-allow <HOST>` (repeatable), `--network-allow-file <PATH>` | Default-deny hostname filter. Patterns: `host.example.com` (exact) or `*.example.com` (any subdomain, excludes apex). Off by default. |
 | **Install log + advisories** | `--no-install-log`, `--install-log <PATH>` | The local-first append-only audit log feeding `sakimori advisories scan`. On by default at `~/.sakimori/installs.jsonl`. |
-| **OTLP fan-out** | `--otlp-endpoint <URL>`, `--otlp-header <K=V>` (repeatable) | Mirror every allowed install as an OTLP/HTTP `LogRecord` to Datadog / Honeycomb / Loki / a self-run otel-collector. |
+| **OTLP fan-out** | `--otlp-endpoint <URL>`, `--otlp-header <K=V>` (repeatable) | Mirror every allowed install as an OTLP/HTTP `LogRecord` to Datadog / Honeycomb / Loki / a self-run otel-collector. The **wire envelope** is spec-compliant OTLP/HTTP JSON (any collector parses it); the **`package.*` attribute keys** are sakimori-specific, not OpenTelemetry semantic conventions — OTel has no "package install" semconv yet. See [OTLP semantic conventions](#otlp-semantic-conventions) below. |
 | **Custom registries** | `--npm-registry`, `--pypi-registry`, `--pypi-files-host`, `--cargo-registry-host`, `--cargo-sparse-host`, `--nuget-registry` (all repeatable), `--registries-config <FILE>`, `--upstream-ca-file <PATH>` (repeatable) | Teach the proxy about internal mirrors / replacement registries so the rewriters + lifecycle gate fire on their traffic too. `--upstream-ca-file` adds a PEM CA to the upstream rustls trust store for mirrors behind a private CA. See the [Custom registries](#custom--internal-registries) subsection below. |
 
 **First-run side effect**: generates a self-signed root CA at the
@@ -500,6 +500,43 @@ sakimori proxy start \
 - **`dist.tarball` URL rewriting.** The npm rewriter preserves the
   upstream's own tarball URL byte-for-byte — mirrors that serve
   their own tarball URLs keep doing so transparently.
+
+#### OTLP semantic conventions
+
+`--otlp-endpoint` emits one OTLP/HTTP **JSON** `LogRecord` per
+allowed install. Two layers, with different compliance stories:
+
+- **Envelope — OTLP-wire compliant.** The
+  `resourceLogs[].scopeLogs[].logRecords[]` shape, the proto3→JSON
+  name mapping (camelCase wire names; `timeUnixNano` as a decimal
+  string for 64-bit ints), the `AnyValue` variant keys
+  (`stringValue`, `intValue`, …), and the resource attributes
+  `service.name` / `service.version` all follow the OTLP spec.
+  Any spec-compliant collector (otel-collector-contrib, Datadog
+  Agent's OTLP receiver, Honeycomb's OTel endpoint, Loki, …)
+  parses the payload. This is enforced by
+  [`crates/sakimori-proxy/tests/otlp_proto_roundtrip.rs`][otlp-rt],
+  which deserializes every emitted payload through
+  `opentelemetry-proto`'s generated `ExportLogsServiceRequest`
+  type — same strict shape gate a real collector applies.
+
+- **Attribute keys — sakimori-specific, NOT semconv.** The
+  per-install fields use a `package.*` namespace
+  (`package.ecosystem`, `package.name`, `package.version`,
+  `package.resolved_at`, `package.execution_mode`,
+  `package.project_path`, `package.user_agent`, `package.git.*`).
+  OpenTelemetry has no registered "package install event"
+  attribute set yet, so we use our own namespace rather than
+  shoehorn the data into `code.*` or `vcs.*`. If/when semconv
+  ships an official equivalent (e.g. `software.package.*`),
+  sakimori will add it alongside the existing keys rather than
+  rename — existing dashboards keep working.
+
+If you grep your collector config for "semconv-compliant
+attributes": **no, these aren't.** If you grep for "OTLP-wire
+compatible": **yes, they are.**
+
+[otlp-rt]: crates/sakimori-proxy/tests/otlp_proto_roundtrip.rs
 
 ### `proxy install-ca` / `uninstall-ca`
 

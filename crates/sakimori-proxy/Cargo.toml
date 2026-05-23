@@ -71,3 +71,11 @@ proptest = { workspace = true }
 # matches hudsucker's internal rustls 0.22 pin (same TLS types
 # both ends of the proxy must speak).
 tokio-rustls = { version = "0.25", default-features = false, features = ["logging", "tls12", "ring"] }
+# Strict OTLP/HTTP JSON shape validation. The proto-generated types
+# carry the canonical OTLP field set + JSON name mapping (camelCase
+# wire names → snake_case Rust fields, int64 → decimal string, etc.).
+# Deserializing our hand-rolled payload through them is the same gate
+# a real otel-collector applies, just without a Go binary in CI.
+# default-features = false drops the heavy `tonic` transport — we
+# only need the message types + serde derives.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
