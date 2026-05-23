@@ -162,6 +162,13 @@ fn post_hub(endpoint: &str, authorization: &str, user_agent: &str, body: &Value)
         .set("authorization", authorization)
         .set("content-type", "application/json")
         .set("user-agent", user_agent)
+        // Per-batch provenance the hub records as columns on
+        // install_events / audit_events (migration 0013). Each
+        // header is loose-validated server-side; a malformed
+        // value drops the column but never 4xx's the batch.
+        .set("x-sakimori-os", HUB_PROVENANCE_OS)
+        .set("x-sakimori-arch", HUB_PROVENANCE_ARCH)
+        .set("x-sakimori-agent-version", HUB_PROVENANCE_AGENT_VERSION)
         .timeout(std::time::Duration::from_millis(3000))
         .send_json(body.clone())
         .with_context(|| format!("POST {endpoint}"))?;
@@ -171,6 +178,38 @@ fn post_hub(endpoint: &str, authorization: &str, user_agent: &str, body: &Value)
     }
     Ok(())
 }
+
+/// OS string the hub accepts (closed allowlist: `linux` / `macos`
+/// / `windows`). Resolved at compile time from `cfg!(target_os)`
+/// so a Linux build always reports `linux`, a Darwin build always
+/// reports `macos`, etc. Unknown targets emit an empty string —
+/// the hub treats that as "no header" and lands the row with
+/// NULL, which is correct (we don't want to lie about the OS).
+#[cfg(target_os = "linux")]
+const HUB_PROVENANCE_OS: &str = "linux";
+#[cfg(target_os = "macos")]
+const HUB_PROVENANCE_OS: &str = "macos";
+#[cfg(target_os = "windows")]
+const HUB_PROVENANCE_OS: &str = "windows";
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+const HUB_PROVENANCE_OS: &str = "";
+
+/// Architecture string the hub accepts (`x86_64` / `aarch64`).
+/// macOS reports `arm64` from rustc — the hub aliases that to
+/// `aarch64`, but we emit the canonical form here.
+#[cfg(target_arch = "x86_64")]
+const HUB_PROVENANCE_ARCH: &str = "x86_64";
+#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+const HUB_PROVENANCE_ARCH: &str = "aarch64";
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "arm64ec"
+)))]
+const HUB_PROVENANCE_ARCH: &str = "";
+
+/// The crate version, set at compile time by Cargo.
+const HUB_PROVENANCE_AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn build_wire_event(event: &InstallEvent, fallback_user_agent: &str) -> Option<Value> {
     let ecosystem = map_ecosystem(&event.ecosystem)?;
