@@ -144,7 +144,6 @@ fn enforce_unix_perms(_path: &PathBuf) -> Result<(), LoadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
     fn parses_complete_hub_section() {
