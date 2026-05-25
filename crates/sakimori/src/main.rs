@@ -6,6 +6,7 @@ mod daemon;
 mod doctor;
 mod enforcer;
 mod events;
+mod hub_credentials;
 mod install_gate;
 mod kprobe_override;
 mod loader;

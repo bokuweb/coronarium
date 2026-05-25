@@ -1342,6 +1342,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             } else {
                 sakimori_proxy::strip_cache::default_persist_dir()
             };
+            // Layer the optional credentials file UNDER the
+            // CLI flags (and their `env =` SAKIMORI_INGEST_URL /
+            // SAKIMORI_TOKEN fallbacks). Precedence:
+            //   flag > env > ~/.config/sakimori/credentials
+            // A read failure (bad TOML, world-readable file)
+            // logs a warning and is treated as absent — never
+            // 4xx's the run command.
+            let (hub_ingest_url, hub_ingest_token) =
+                resolve_hub_creds(args.hub_ingest_url.clone(), args.hub_ingest_token.clone());
             let cfg = sakimori_proxy::ProxyConfig {
                 listen: args.listen,
                 min_age,
@@ -1361,9 +1370,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 install_log_enabled: !args.no_install_log,
                 otlp_endpoint: args.otlp_endpoint,
                 otlp_headers: args.otlp_headers,
-                hub_ingest_endpoint: args.hub_ingest_url,
-                hub_ingest_token: args
-                    .hub_ingest_token
+                hub_ingest_endpoint: hub_ingest_url,
+                hub_ingest_token: hub_ingest_token
                     .map(sakimori_proxy::hub_ingest::SakimoriToken::new),
                 lifecycle_policy,
                 lifecycle_allow: args.lifecycle_allow,
@@ -2946,6 +2954,52 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     let results = crate::doctor::run_checks(&inputs);
     print!("{}", crate::doctor::render_report(&results));
     std::process::exit(crate::doctor::exit_code(&results));
+}
+
+/// Layer `(--hub-ingest-url, --hub-ingest-token)` /
+/// `(SAKIMORI_INGEST_URL, SAKIMORI_TOKEN)` over the optional
+/// `~/.config/sakimori/credentials` file. Precedence:
+///
+///   1. CLI flag (clap's `env` annotation also reads the env var
+///      for us, so by the time `args.hub_ingest_*` is populated,
+///      flag+env have already merged).
+///   2. credentials file `[hub]` table.
+///
+/// A file-read / parse / permission failure logs a warning and is
+/// treated as absent — never blocks the run command on a typo.
+fn resolve_hub_creds(
+    flag_url: Option<String>,
+    flag_token: Option<String>,
+) -> (Option<String>, Option<String>) {
+    // Fast-path: both already supplied via flag/env. We MUST NOT
+    // touch the credentials file in this branch — the file could
+    // be world-readable (logged as a warning) and we don't want
+    // to surface that warning when the operator isn't relying on
+    // it.
+    if flag_url.is_some() && flag_token.is_some() {
+        return (flag_url, flag_token);
+    }
+    let Some(path) = crate::hub_credentials::default_credentials_path() else {
+        return (flag_url, flag_token);
+    };
+    match crate::hub_credentials::load_credentials(&path) {
+        Ok(Some(creds)) => (
+            flag_url.or(creds.hub.ingest_url),
+            flag_token.or(creds.hub.token),
+        ),
+        Ok(None) => (flag_url, flag_token),
+        Err(e) => {
+            // Constant-only diagnostic — the path may be
+            // attacker-influenced (env var). `LoadError`'s
+            // `Display` is already path-free.
+            log::warn!(
+                "ignoring {} ({}); falling back to CLI/env",
+                path.display(),
+                e
+            );
+            (flag_url, flag_token)
+        }
+    }
 }
 
 #[cfg(test)]
