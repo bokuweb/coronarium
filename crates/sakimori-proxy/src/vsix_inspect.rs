@@ -21,7 +21,15 @@
 //! responses; CLI auditors can call it on locally cached `.vsix`
 //! files to vet sideloads.
 //!
-//! Out of scope (for the first slice, per CLAUDE.md roadmap #21):
+//! Roadmap #25 + #26 extend the inspector to also walk the bundled
+//! `node_modules/` tree (package identities → `bundled_dependencies`,
+//! consumed by the proxy as one `InstallEvent` per dep so the existing
+//! OSV / typosquat / install-inventory machinery sees them) and to run
+//! the `sakimori-core::iocs` content-needle catalog over text-shaped
+//! entries inside the zip (`ioc_hits`). Both extensions piggyback on
+//! the single zip decode so cost stays bounded.
+//!
+//! Out of scope (still, per CLAUDE.md roadmap):
 //!
 //! - **`strip` mode** (rewrite `activationEvents: ["*"]` to `[]`
 //!   and re-emit the zip). Substantially larger because we'd have
@@ -29,14 +37,15 @@
 //!   verifies. Audit / block are the load-bearing first slice.
 //! - **`.crx`** (Chrome extensions). Chrome packages are signed
 //!   end-to-end so strip is impossible by design; we'll wire `.crx`
-//!   audit later.
-//! - **`main` JS body scanning**. Catching `eval` / `child_process`
-//!   in the bundled JS is valuable but is a larger surface (often
-//!   minified / obfuscated) and lives more naturally in the
-//!   `iocs::ContentNeedle` catalog than here.
+//!   audit later (roadmap #28).
+//! - **Bundled-bytes byte-identity check**. We audit *which* deps a
+//!   publisher bundled by name + version, not whether the bundled
+//!   tarball matches public-registry bytes — legitimate publishers
+//!   patch deps before vendoring, which isn't a smell.
 
 use std::io::{Cursor, Read};
 
+use sakimori_core::iocs;
 use serde::Deserialize;
 
 /// Hard ceilings on the per-vsix walk so a malicious archive can't
@@ -47,8 +56,29 @@ use serde::Deserialize;
 pub const MAX_VSIX_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
 
+/// Maximum number of bundled `node_modules/**/package.json` entries
+/// we'll parse out of a single `.vsix`. A clean extension's bundled
+/// tree is at most a few hundred packages; 4096 leaves comfortable
+/// headroom while preventing a pathological zip with millions of
+/// fake manifest entries from blocking the proxy thread.
+pub const MAX_BUNDLED_DEP_ENTRIES: usize = 4096;
+
+/// Maximum number of zip entries we'll feed to the IOC content-needle
+/// scanner. Independent of [`MAX_BUNDLED_DEP_ENTRIES`] because the
+/// scanner reads text-shaped files (`*.js`, `*.json`, …) rather than
+/// just `package.json`; a single bundled package can carry many such
+/// files. 2048 is enough to cover any sane extension's first-party JS
+/// without becoming a thread-burn vector.
+pub const MAX_SCANNED_ENTRIES: usize = 2048;
+
 /// What the inspector found in a `.vsix`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` are intentionally absent: `iocs::Finding`
+/// doesn't carry them (it's transport-shaped, with `PathBuf` and
+/// `&'static str` fields whose equality semantics we don't want to
+/// commit to). Tests that need to confirm "empty inspection" use
+/// `is_empty_inspection`.
+#[derive(Debug, Clone, Default)]
 pub struct VsixInspection {
     /// `name` from `extension/package.json`. Empty when the manifest
     /// is missing or malformed.
@@ -65,12 +95,76 @@ pub struct VsixInspection {
     /// or `onStartupFinished` — both fire without any user
     /// interaction. The block-mode decision keys off this.
     pub fires_on_startup: bool,
+    /// `name` + `version` pairs harvested from
+    /// `extension/node_modules/**/package.json`. Per roadmap #25,
+    /// the proxy emits one `InstallEvent { Ecosystem::Npm }` per
+    /// entry so the existing OSV / typosquat / install-inventory
+    /// machinery audits bundled transitive deps the same way it
+    /// audits top-level npm installs. Empty when the `.vsix` has
+    /// no bundled tree or the walk bottomed out at the cap.
+    pub bundled_dependencies: Vec<BundledDep>,
+    /// IOC content-needle hits anywhere inside the `.vsix`. Per
+    /// roadmap #26, paths are prefixed with the extension's archive-
+    /// internal path (e.g. `extension/out/extension.js`) so the
+    /// proxy can render them without ambiguity. High-severity hits
+    /// trip a block in Block mode regardless of `fires_on_startup`.
+    pub ioc_hits: Vec<iocs::Finding>,
+    /// True iff the bundled-dep walk hit [`MAX_BUNDLED_DEP_ENTRIES`]
+    /// and stopped early. Surfaced in logs so an operator seeing
+    /// suspiciously short audits can correlate.
+    pub bundled_dependencies_truncated: bool,
+    /// True iff the IOC scan hit [`MAX_SCANNED_ENTRIES`] and stopped
+    /// early.
+    pub ioc_scan_truncated: bool,
+}
+
+/// One bundled transitive dependency inside a `.vsix`. Identity-
+/// only (no integrity hash) — see the module docstring for why we
+/// deliberately don't byte-compare against the public registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BundledDep {
+    /// `name` from the nested `package.json`. May be a scoped name
+    /// like `@foo/bar`.
+    pub name: String,
+    /// `version` from the nested `package.json`. Empty when the
+    /// manifest omits it (rare but legal — we still emit the entry
+    /// so an operator can see what was shipped).
+    pub version: String,
+    /// Archive-internal path of the manifest, e.g.
+    /// `extension/node_modules/foo/package.json`. Useful when two
+    /// copies of the same package at different versions are
+    /// bundled at different depths.
+    pub manifest_path: String,
 }
 
 impl VsixInspection {
     /// Cheap accessor used by the block decision.
     pub fn has_startup_autorun(&self) -> bool {
         self.fires_on_startup
+    }
+
+    /// True when any IOC hit is High severity. Block-mode treats
+    /// this as a deny independent of startup-autorun.
+    pub fn has_high_severity_ioc(&self) -> bool {
+        self.ioc_hits
+            .iter()
+            .any(|f| f.severity == iocs::Severity::High)
+    }
+
+    /// Test helper: true when this inspection carries no extracted
+    /// information (no manifest fields, no bundled deps, no IOC
+    /// hits). Replaces the previous `PartialEq` against
+    /// `VsixInspection::default()` (impossible now that
+    /// `iocs::Finding` doesn't implement `PartialEq`).
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty()
+            && self.publisher.is_empty()
+            && self.version.is_empty()
+            && self.activation_events.is_empty()
+            && self.main.is_none()
+            && !self.fires_on_startup
+            && self.bundled_dependencies.is_empty()
+            && self.ioc_hits.is_empty()
     }
 }
 
@@ -148,29 +242,165 @@ pub fn inspect_vsix(body: &[u8]) -> Result<VsixInspection, VsixInspectError> {
         Err(e) => return Err(VsixInspectError::NotZip(e.to_string())),
     };
 
-    // `.vsix` ships a single `extension/` root with all the
-    // installable bits. `[Content_Types].xml` etc. live at the
-    // archive root but we don't care about them — only the
-    // manifest decides what runs.
-    let mut entry = match archive.by_name("extension/package.json") {
-        Ok(e) => e,
-        Err(zip::result::ZipError::FileNotFound) => {
-            // Same fail-open shape as the npm inspector: a tarball
-            // without a recognisable manifest yields the default
-            // (empty) inspection. Don't punish weird-but-valid
-            // packages.
-            return Ok(VsixInspection::default());
+    // Single pass over zip entry names — pulling out the top-level
+    // manifest path, every bundled `node_modules/**/package.json`,
+    // and every IOC-eligible text-shaped path. We collect names
+    // (and indices) first because `ZipArchive::by_index` mutably
+    // borrows the archive, which would otherwise conflict with
+    // iterating over `file_names`.
+    let mut top_manifest_idx: Option<usize> = None;
+    let mut bundled_idxs: Vec<usize> = Vec::new();
+    let mut bundled_paths: Vec<String> = Vec::new();
+    let mut ioc_candidate_idxs: Vec<usize> = Vec::new();
+    let mut ioc_candidate_paths: Vec<String> = Vec::new();
+    let mut bundled_truncated = false;
+    let mut ioc_truncated = false;
+
+    for i in 0..archive.len() {
+        let raw_name = match archive.by_index_raw(i) {
+            Ok(f) => f.name().to_string(),
+            Err(_) => continue,
+        };
+        if raw_name == "extension/package.json" {
+            top_manifest_idx = Some(i);
+            continue;
         }
-        Err(e) => return Err(VsixInspectError::NotZip(e.to_string())),
+        if is_bundled_manifest_path(&raw_name) {
+            if bundled_idxs.len() >= MAX_BUNDLED_DEP_ENTRIES {
+                bundled_truncated = true;
+            } else {
+                bundled_idxs.push(i);
+                bundled_paths.push(raw_name.clone());
+            }
+        }
+        if is_ioc_candidate_path(&raw_name) {
+            if ioc_candidate_idxs.len() >= MAX_SCANNED_ENTRIES {
+                ioc_truncated = true;
+            } else {
+                ioc_candidate_idxs.push(i);
+                ioc_candidate_paths.push(raw_name);
+            }
+        }
+    }
+
+    let mut inspection = if let Some(idx) = top_manifest_idx {
+        let mut entry = archive
+            .by_index(idx)
+            .map_err(|e| VsixInspectError::NotZip(e.to_string()))?;
+        if entry.size() > MAX_PACKAGE_JSON_BYTES as u64 {
+            return Err(VsixInspectError::ManifestTooLarge { size: entry.size() });
+        }
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        if let Err(e) = entry.read_to_end(&mut buf) {
+            return Err(VsixInspectError::ManifestRead(e.to_string()));
+        }
+        parse_manifest(&buf)
+    } else {
+        // Same fail-open shape as the npm inspector: a zip without
+        // a recognisable manifest yields a default Inspection.
+        // Don't punish weird-but-valid packages.
+        VsixInspection::default()
     };
-    if entry.size() > MAX_PACKAGE_JSON_BYTES as u64 {
-        return Err(VsixInspectError::ManifestTooLarge { size: entry.size() });
+
+    // Bundled-dep walk (#25). Each entry that parses as a manifest
+    // becomes a `BundledDep`; entries that fail to parse are
+    // silently skipped (fail-open).
+    for (idx, path) in bundled_idxs.iter().zip(bundled_paths.iter()) {
+        let Ok(mut entry) = archive.by_index(*idx) else {
+            continue;
+        };
+        if entry.size() > MAX_PACKAGE_JSON_BYTES as u64 {
+            // A bundled manifest past the cap is almost certainly
+            // garbage / adversarial — skip rather than abort the
+            // whole inspection. The top-level cap stays a hard error
+            // because that file is required for the proxy to
+            // function at all.
+            continue;
+        }
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        if entry.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        if let Some(dep) = parse_bundled_manifest(&buf, path) {
+            inspection.bundled_dependencies.push(dep);
+        }
     }
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    if let Err(e) = entry.read_to_end(&mut buf) {
-        return Err(VsixInspectError::ManifestRead(e.to_string()));
+    inspection.bundled_dependencies_truncated = bundled_truncated;
+
+    // IOC content scan (#26). Read each candidate up to the iocs
+    // module's per-file cap; match against the content-needle
+    // catalog. Path prefixed with the extension's archive-internal
+    // path so the proxy log surfaces "vsix:foo.bar@1.0.0/<path>"
+    // unambiguously (the prefix is added by the proxy, not here —
+    // we keep raw archive paths).
+    for (idx, path) in ioc_candidate_idxs.iter().zip(ioc_candidate_paths.iter()) {
+        let Ok(mut entry) = archive.by_index(*idx) else {
+            continue;
+        };
+        let cap = iocs::MAX_CONTENT_BYTES.min(entry.size() as usize);
+        let mut buf = vec![0u8; 0];
+        buf.reserve(cap);
+        // Read at most MAX_CONTENT_BYTES — same ceiling the path-
+        // rooted scanner uses on disk. Past 64 KiB the threat model
+        // (substring of an exfil URL) doesn't extend usefully.
+        if (&mut entry)
+            .take(iocs::MAX_CONTENT_BYTES as u64)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        let basename = path.rsplit('/').next().unwrap_or(path);
+        for rule in iocs::matches_content(basename, &buf) {
+            inspection.ioc_hits.push(iocs::Finding {
+                path: std::path::PathBuf::from(path),
+                rule_id: rule.id,
+                family: rule.family,
+                severity: rule.severity,
+                description: rule.description,
+            });
+        }
     }
-    Ok(parse_manifest(&buf))
+    inspection.ioc_scan_truncated = ioc_truncated;
+
+    Ok(inspection)
+}
+
+/// True iff `path` is a `package.json` nested inside the
+/// `extension/node_modules/` tree at any depth. Rejects the
+/// extension's own top-level manifest, `.bin` stubs, and anything
+/// outside the `extension/` root (defence against zip-slip-flavoured
+/// `../node_modules/...` paths even though we never extract to disk).
+fn is_bundled_manifest_path(path: &str) -> bool {
+    if !path.starts_with("extension/node_modules/") {
+        return false;
+    }
+    if !path.ends_with("/package.json") {
+        return false;
+    }
+    // Reject any path containing `..` — defence in depth.
+    if path.split('/').any(|c| c == ".." || c.is_empty()) {
+        return false;
+    }
+    true
+}
+
+/// True iff `path` should be fed to the IOC content scanner. Bound
+/// to text-shaped extensions so we don't read multi-MB binary blobs
+/// (icons, sourcemaps, native `.node` addons).
+fn is_ioc_candidate_path(path: &str) -> bool {
+    if !path.starts_with("extension/") {
+        return false;
+    }
+    if path.ends_with('/') {
+        return false; // directory entry
+    }
+    let lower = path.to_ascii_lowercase();
+    const TEXT_EXTS: &[&str] = &[
+        ".js", ".mjs", ".cjs", ".json", ".ts", ".mts", ".cts", ".sh", ".bash", ".zsh", ".ps1",
+        ".bat", ".cmd",
+    ];
+    TEXT_EXTS.iter().any(|ext| lower.ends_with(ext))
 }
 
 fn parse_manifest(body: &[u8]) -> VsixInspection {
@@ -189,7 +419,35 @@ fn parse_manifest(body: &[u8]) -> VsixInspection {
         activation_events,
         main: m.main,
         fires_on_startup,
+        bundled_dependencies: Vec::new(),
+        ioc_hits: Vec::new(),
+        bundled_dependencies_truncated: false,
+        ioc_scan_truncated: false,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BundledManifestSlice {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+fn parse_bundled_manifest(body: &[u8], path: &str) -> Option<BundledDep> {
+    let m: BundledManifestSlice = serde_json::from_slice(body).ok()?;
+    let name = m.name.unwrap_or_default();
+    if name.is_empty() {
+        // A nested `package.json` without a `name` field is almost
+        // certainly malformed; skip rather than emit a placeholder
+        // InstallEvent the OSV scanner can't do anything with.
+        return None;
+    }
+    Some(BundledDep {
+        name,
+        version: m.version.unwrap_or_default(),
+        manifest_path: path.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -301,14 +559,14 @@ mod tests {
             zw.finish().unwrap();
         }
         let i = inspect_vsix(&buf).unwrap();
-        assert_eq!(i, VsixInspection::default());
+        assert!(i.is_empty(), "expected empty inspection, got {i:?}");
     }
 
     #[test]
     fn malformed_manifest_json_yields_default_inspection() {
         let body = build_vsix("{not json");
         let i = inspect_vsix(&body).unwrap();
-        assert_eq!(i, VsixInspection::default());
+        assert!(i.is_empty(), "expected empty inspection, got {i:?}");
     }
 
     #[test]
@@ -329,5 +587,161 @@ mod tests {
             matches!(err, VsixInspectError::TooLarge { .. }),
             "got {err:?}"
         );
+    }
+
+    /// Build a synthetic `.vsix` that ships a top-level manifest plus
+    /// the named files (path → bytes) — exercises the bundled-dep
+    /// walker (#25) and the IOC content scanner (#26) in one shot.
+    fn build_vsix_with_files(manifest_json: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            let mut zw = zip::ZipWriter::new(cursor);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("[Content_Types].xml", opts).unwrap();
+            zw.write_all(b"<types/>").unwrap();
+            zw.start_file("extension/package.json", opts).unwrap();
+            zw.write_all(manifest_json.as_bytes()).unwrap();
+            for (path, bytes) in files {
+                zw.start_file(*path, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn bundled_node_modules_manifests_are_extracted_as_install_events() {
+        // Two bundled packages at different depths: top-level `foo`
+        // and `bar` nested inside `foo`. Both must surface so the
+        // proxy can emit one InstallEvent per dep into the inventory.
+        let body = build_vsix_with_files(
+            r#"{ "name": "ext", "publisher": "pub", "version": "1.0.0" }"#,
+            &[
+                (
+                    "extension/node_modules/foo/package.json",
+                    br#"{ "name": "foo", "version": "1.2.3" }"#,
+                ),
+                (
+                    "extension/node_modules/foo/node_modules/bar/package.json",
+                    br#"{ "name": "bar", "version": "0.0.1" }"#,
+                ),
+                (
+                    "extension/node_modules/@scope/baz/package.json",
+                    br#"{ "name": "@scope/baz", "version": "9.9.9" }"#,
+                ),
+            ],
+        );
+        let i = inspect_vsix(&body).unwrap();
+        assert_eq!(i.bundled_dependencies.len(), 3);
+        let names: Vec<_> = i.bundled_dependencies.iter().map(|d| &d.name).collect();
+        assert!(names.iter().any(|n| n.as_str() == "foo"));
+        assert!(names.iter().any(|n| n.as_str() == "bar"));
+        assert!(names.iter().any(|n| n.as_str() == "@scope/baz"));
+        assert!(!i.bundled_dependencies_truncated);
+    }
+
+    #[test]
+    fn bundled_walk_skips_manifests_without_name_field() {
+        // A nested package.json without `name` is almost certainly
+        // malformed; emitting an InstallEvent with an empty name
+        // would pollute the inventory and the OSV scan can't do
+        // anything with it.
+        let body = build_vsix_with_files(
+            r#"{ "name": "ext", "publisher": "pub", "version": "1.0.0" }"#,
+            &[
+                (
+                    "extension/node_modules/foo/package.json",
+                    br#"{ "version": "1.2.3" }"#,
+                ),
+                (
+                    "extension/node_modules/bar/package.json",
+                    br#"{ "name": "bar", "version": "1.0.0" }"#,
+                ),
+            ],
+        );
+        let i = inspect_vsix(&body).unwrap();
+        assert_eq!(i.bundled_dependencies.len(), 1);
+        assert_eq!(i.bundled_dependencies[0].name, "bar");
+    }
+
+    #[test]
+    fn bundled_walk_ignores_paths_outside_extension_node_modules() {
+        // `package.json` files that aren't under the bundled tree
+        // (the top-level manifest, a `package.json` sample sitting
+        // in `extension/test/`) must not show up as bundled deps.
+        let body = build_vsix_with_files(
+            r#"{ "name": "ext", "publisher": "pub", "version": "1.0.0" }"#,
+            &[(
+                "extension/test/package.json",
+                br#"{ "name": "should-not-appear", "version": "1.0.0" }"#,
+            )],
+        );
+        let i = inspect_vsix(&body).unwrap();
+        assert!(i.bundled_dependencies.is_empty());
+    }
+
+    #[test]
+    fn ioc_content_scan_flags_webhook_site_in_bundled_js() {
+        // The iocs catalog ships a webhook.site needle (High severity).
+        // Stash it inside a bundled JS file and confirm the inspector
+        // surfaces a finding the proxy can act on.
+        let body = build_vsix_with_files(
+            r#"{ "name": "ext", "publisher": "pub", "version": "1.0.0" }"#,
+            &[(
+                "extension/out/extension.js",
+                b"fetch('https://webhook.site/abc-def-123');",
+            )],
+        );
+        let i = inspect_vsix(&body).unwrap();
+        assert!(
+            !i.ioc_hits.is_empty(),
+            "webhook.site content needle should fire on bundled JS"
+        );
+        assert!(i.has_high_severity_ioc());
+        assert_eq!(
+            i.ioc_hits[0].path.to_string_lossy(),
+            "extension/out/extension.js"
+        );
+    }
+
+    #[test]
+    fn ioc_content_scan_skips_binary_extensions() {
+        // Native addons / sourcemaps / icons must not be fed to the
+        // scanner. Even if they happened to contain the needle as a
+        // substring, reading multi-MB binary blobs on the hot path
+        // is a thread-burn vector we explicitly bound.
+        let body = build_vsix_with_files(
+            r#"{ "name": "ext", "publisher": "pub", "version": "1.0.0" }"#,
+            &[(
+                "extension/native/addon.node",
+                b"webhook.site -- but binary, never read",
+            )],
+        );
+        let i = inspect_vsix(&body).unwrap();
+        assert!(
+            i.ioc_hits.is_empty(),
+            "binary entries must not be scanned for content needles"
+        );
+    }
+
+    #[test]
+    fn is_bundled_manifest_path_rejects_traversal_and_non_nm_paths() {
+        assert!(is_bundled_manifest_path(
+            "extension/node_modules/foo/package.json"
+        ));
+        assert!(is_bundled_manifest_path(
+            "extension/node_modules/@scope/foo/package.json"
+        ));
+        assert!(!is_bundled_manifest_path("extension/package.json"));
+        assert!(!is_bundled_manifest_path("node_modules/foo/package.json"));
+        assert!(!is_bundled_manifest_path(
+            "extension/node_modules/../etc/passwd/package.json"
+        ));
+        assert!(!is_bundled_manifest_path(
+            "extension/node_modules/foo/package.json.bak"
+        ));
     }
 }

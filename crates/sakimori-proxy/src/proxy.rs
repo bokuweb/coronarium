@@ -1092,6 +1092,142 @@ impl SakimoriHandler {
                 return pass_through();
             }
         };
+
+        // #25 — surface bundled `node_modules` deps into the install
+        // inventory + OTLP + hub fan-out as `InstallEvent { Npm }`
+        // rows. Execution-mode is `Unknown`: the dep was fetched via
+        // the editor's marketplace path, not via npm, so calling it
+        // `persistent` would over-claim a lockfile relationship that
+        // doesn't exist. Done regardless of policy so even Audit-only
+        // operators get the inventory.
+        if !inspection.bundled_dependencies.is_empty() {
+            log::info!(
+                "lifecycle(vsix): {extension_id}@{version} bundles {} dep(s){}",
+                inspection.bundled_dependencies.len(),
+                if inspection.bundled_dependencies_truncated {
+                    " (truncated at cap)"
+                } else {
+                    ""
+                },
+            );
+            for dep in &inspection.bundled_dependencies {
+                if dep.version.is_empty() {
+                    continue;
+                }
+                let mut ev = InstallEvent::new(
+                    sakimori_core::deps::Ecosystem::Npm,
+                    dep.name.clone(),
+                    dep.version.clone(),
+                )
+                .with_mode(ExecutionMode::Unknown);
+                ev = ev.with_user_agent(format!("sakimori-vsix-bundled/{extension_id}@{version}"));
+                if let Some(logger) = self.install_logger.as_ref()
+                    && let Err(e) = logger.record(&ev)
+                {
+                    log::warn!("install log write failed (vsix bundled): {e:#}");
+                }
+                if let Some(exporter) = self.otlp_exporter.as_ref() {
+                    exporter.dispatch(&ev);
+                }
+                if let Some(exporter) = self.hub_ingest_exporter.as_ref() {
+                    exporter.dispatch(&ev);
+                }
+            }
+        }
+
+        // #25 — known-bad check on each bundled dep. We deliberately
+        // don't run the age oracle (publishers legitimately bundle
+        // whatever version) or the typosquat detector (Marketplace
+        // publishers vendor scoped private forks all the time, false-
+        // positive heavy). Only the known-bad set, which is the high-
+        // confidence "this exact (name, version) is in OSV / GHSA"
+        // signal. A hit denies the whole `.vsix` in Block mode.
+        let known_bad_hit = if !matches!(policy, crate::lifecycle::LifecyclePolicy::Audit) {
+            inspection
+                .bundled_dependencies
+                .iter()
+                .filter(|d| !d.version.is_empty())
+                .find_map(|dep| {
+                    let oracle = self.decider.known_bad.as_ref()?;
+                    let ids = oracle
+                        .lookup(sakimori_core::deps::Ecosystem::Npm, &dep.name, &dep.version)
+                        .ok()
+                        .flatten()?;
+                    if ids.is_empty() {
+                        None
+                    } else {
+                        Some((dep.clone(), ids))
+                    }
+                })
+        } else {
+            None
+        };
+        if let Some((dep, ids)) = known_bad_hit {
+            let head = ids.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+            let more = if ids.len() > 2 {
+                format!(" (+{} more)", ids.len() - 2)
+            } else {
+                String::new()
+            };
+            let reason = format!(
+                "lifecycle(vsix,block): blocking {extension_id}@{version} — bundled \
+                 dependency npm/{}@{} is listed as malicious: {head}{more}. \
+                 Manifest path inside .vsix: {}",
+                dep.name, dep.version, dep.manifest_path,
+            );
+            log::warn!("{reason}");
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("x-sakimori-deny", "lifecycle-vsix-bundled-known-bad")
+                .body(Body::from(format!("{reason}\n")))
+                .expect("static lifecycle deny response");
+        }
+
+        // #26 — IOC content-needle hits. Audit logs them; Block mode
+        // denies on any High-severity hit regardless of startup-
+        // autorun status. The content scanner is bounded inside
+        // `vsix_inspect`, so finding count is naturally capped.
+        if !inspection.ioc_hits.is_empty() {
+            for f in &inspection.ioc_hits {
+                log::warn!(
+                    "lifecycle(vsix,ioc): {extension_id}@{version} {sev:?} {id} at {path}: {desc}",
+                    sev = f.severity,
+                    id = f.rule_id,
+                    path = f.path.to_string_lossy(),
+                    desc = f.description,
+                );
+            }
+        }
+        if !matches!(policy, crate::lifecycle::LifecyclePolicy::Audit)
+            && inspection.has_high_severity_ioc()
+        {
+            let hit = inspection
+                .ioc_hits
+                .iter()
+                .find(|f| f.severity == sakimori_core::iocs::Severity::High)
+                .expect("has_high_severity_ioc implies a High finding exists");
+            let reason = format!(
+                "lifecycle(vsix,block): blocking {extension_id}@{version} — known-IOC content \
+                 hit `{id}` ({family}, High) at `{path}`: {desc}. Add `{extension_id}` to the \
+                 lifecycle allow-list if this install is expected, or relax to \
+                 `--lifecycle-policy audit` to log without blocking.",
+                id = hit.rule_id,
+                family = hit.family,
+                path = hit.path.to_string_lossy(),
+                desc = hit.description,
+            );
+            log::warn!("{reason}");
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("x-sakimori-deny", "lifecycle-vsix-ioc")
+                .body(Body::from(format!("{reason}\n")))
+                .expect("static lifecycle deny response");
+        }
+
         if !inspection.has_startup_autorun() {
             log::debug!(
                 "lifecycle(vsix): {extension_id}@{version} — lazy activation only ({} event(s))",
