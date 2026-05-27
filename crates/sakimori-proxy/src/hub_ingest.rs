@@ -21,11 +21,13 @@
 //!
 //! Schema mapping is opinionated:
 //! - `crates` ecosystem (the sakimori-core label) is rewritten to
-//!   `cargo` (the hub schema label). Other ecosystems pass
-//!   through.
-//! - `git` / `vscode-extension` are NOT supported by the hub
-//!   schema today; events for those ecosystems are dropped before
-//!   POST rather than producing a 400 the operator has to debug.
+//!   `cargo` (the hub schema label).
+//! - `vscode-extension` (sakimori-core label) is rewritten to
+//!   `vscode` (the hub schema label, as of sakimori-hub PR #87).
+//!   Other ecosystems pass through unchanged.
+//! - `git` is NOT supported by the hub schema today; events for
+//!   that ecosystem are dropped before POST rather than producing
+//!   a 400 the operator has to debug.
 //! - `user_agent` is required by the hub schema but optional on
 //!   the local `InstallEvent`; when absent we substitute the proxy
 //!   user-agent so the wire payload is always valid.
@@ -121,7 +123,8 @@ impl HubIngestExporter {
 
     /// Build the `InstallEventBatch` JSON for a single event, or
     /// `None` if the event's ecosystem is unsupported by the hub
-    /// (`git`, `vscode-extension`).
+    /// (`git`). `crates` and `vscode-extension` are rewritten to
+    /// the hub-spelled `cargo` / `vscode` labels.
     ///
     /// Public so unit tests can pin the wire shape without
     /// spinning up the proxy.
@@ -287,9 +290,14 @@ fn map_ecosystem(local_label: &str) -> Option<&'static str> {
         "crates" => Some("cargo"),
         "pypi" => Some("pypi"),
         "nuget" => Some("nuget"),
-        // git / vscode-extension are deliberately dropped — hub
-        // schema only accepts the four package-registry
-        // ecosystems above.
+        // Same shape as the `crates`→`cargo` rewrite: sakimori-core
+        // emits the longer `vscode-extension`, hub PR #87 accepts
+        // the shorter `vscode`. Keep the rename pinned here so a
+        // future enum label change can't silently desync.
+        "vscode-extension" => Some("vscode"),
+        // `git` has no hub-schema equivalent and is deliberately
+        // dropped. Returning None lets dispatch skip the event
+        // silently instead of producing a 400.
         _ => None,
     }
 }
@@ -346,12 +354,33 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_ecosystems_are_dropped() {
-        // `git` and `vscode-extension` are not in the hub schema.
-        // Returning None here lets dispatch drop them silently
-        // instead of producing a 400 the operator has to debug.
+    fn vscode_extension_ecosystem_is_rewritten_to_vscode() {
+        // Hub schema (sakimori-hub PR #87) accepts the shorter
+        // `vscode` label; sakimori-core's
+        // `Ecosystem::VscodeExtension.label()` is the longer
+        // `vscode-extension`. The rewriter is the only place
+        // that knows the mapping — pin it so the wire stays
+        // round-trippable with the hub's valibot picklist.
         let exp = HubIngestExporter::new("http://x".into(), SakimoriToken::new("t"), "ua".into());
-        for label in ["git", "vscode-extension", "rubygems"] {
+        let mut ev = sample_event();
+        ev.ecosystem = Ecosystem::VscodeExtension.label().to_string();
+        ev.name = "ms-python.python".into();
+        ev.version = "2026.4.0".into();
+        let p = exp
+            .build_payload(&ev)
+            .expect("vscode-extension event accepted");
+        assert_eq!(p[0]["ecosystem"], "vscode");
+        assert_eq!(p[0]["name"], "ms-python.python");
+    }
+
+    #[test]
+    fn unsupported_ecosystems_are_dropped() {
+        // `git` has no hub-schema equivalent and is deliberately
+        // dropped. Returning None here lets dispatch drop the
+        // event silently instead of producing a 400 the operator
+        // has to debug.
+        let exp = HubIngestExporter::new("http://x".into(), SakimoriToken::new("t"), "ua".into());
+        for label in ["git", "rubygems"] {
             let mut ev = sample_event();
             ev.ecosystem = label.to_string();
             assert!(
