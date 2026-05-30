@@ -1507,6 +1507,92 @@ the cheapest and the prerequisite for the rest.
     slice: full SLSA build-L3 hermeticity claims (we observe, we
     don't isolate the builder).
 
+### Container coverage (agentless, fetch-layer — the moat)
+
+Containers are today an explicit blind spot: roadmap #12 calls
+`jobs.<id>.container:` out of scope and `pre.js` only `::warning::`s
+on `/.dockerenv`; #5b notes macOS ES "sees only the host". But the
+limitation is narrower than it reads — it's the GitHub-Actions
+`container:` *indirection* (the runner re-execs the step inside
+docker, so the PPid-walk attribution breaks across the docker-exec
+boundary), **not** a fundamental eBPF reach problem. A Linux
+container is just a cgroup, and a cgroup-v2 `connect4`/`connect6`
+program attached to an ancestor scope applies to descendant
+container processes for free. Generic container security (image CVE
+scan = Trivy/Grype, Dockerfile lint = Hadolint, raw runtime syscall
+detection = Falco/Tetragon) is **out of scope** — commoditised and
+no moat. The entries below instead extend sakimori's existing
+fetch-layer + package-identity-attribution machinery to containers,
+where it produces signal those tools structurally can't. #33 is the
+cornerstone (reuses the #12 daemon almost verbatim) and #34/#35
+build on it.
+
+33. **Host-eBPF attach to a container cgroup** *(priority: high —
+    cornerstone, smallest diff)* — `sakimori daemon start
+    --observe-container <name|id>` resolves a running container's
+    cgroup-v2 scope (Docker: `…/docker-<id>.scope` or
+    `…/system.slice/docker-<id>.scope`; containerd/k8s: the pod /
+    container slice under `kubepods`) and attaches the same
+    connect4/connect6 + raw-syscall-tracepoint programs the v0.35
+    `--observe-cgroup-of <pid>` path already uses — pointed at the
+    container scope instead of the runner's. Net effect:
+    **agentless** exec / file / network audit + package-manager
+    attribution for processes *inside* the container, with nothing
+    baked into the image and no sidecar. The advantage over
+    in-container agents (need image modification) and over Falco
+    (sees `node`+argv, not "this `connect` came from `npm install
+    foo@1.2.3`") is exactly sakimori's existing attribution layer
+    (#11) reused unchanged. Honest scope: PPid-walk attribution
+    works because the container's pid namespace is still visible
+    from the host `/proc` with translated pids — the daemon must
+    resolve host-pid ↔ container-pid (read `/proc/<hostpid>/status`
+    `NSpid:` line) so `comm`/argv attribution stays correct;
+    rootless / userns-remapped containers and VM-isolated runtimes
+    (Kata, Firecracker, gVisor's own sandbox) are out of the first
+    slice (the host doesn't see their cgroup the same way).
+    Resolves the `jobs.<id>.container:` gap from #12 for the common
+    runc/crun case.
+
+34. **Build-time fetch capture for `docker build`** *(priority:
+    high)* — inject the proxy's `HTTPS_PROXY` + CA bundle into an
+    image build (BuildKit `--build-arg HTTPS_PROXY=…` +
+    secret-mounted CA, or a `sakimori build -- docker build …`
+    wrapper that wires `install-gate`-style env into the build
+    context) so every package fetch in **every build stage** flows
+    through the proxy. This captures what Trivy/Grype
+    **structurally cannot**: ephemeral build-stage tooling and
+    anything pulled in an intermediate layer that a later
+    `RUN rm` / multi-stage `COPY` drops from the final image —
+    those leave no trace in the scanned artefact, but they ran with
+    network + filesystem access during the build. All existing
+    proxy defences (release-age fallback, lifecycle gate #15,
+    install inventory, OTLP/hub export) apply to image builds with
+    no new logic — the InstallEvents are just tagged with the
+    image ref / build target. Pairs with #33: #34 covers "what the
+    build fetched", #33 covers "what the running container does".
+    Honest scope: only fetches that honour `HTTPS_PROXY` are seen
+    (statically-linked downloaders that ignore it, or
+    `--network=none` builds that pre-vendor, are out); pinned-digest
+    base-image pulls are logged but not age-gated (no publish-time
+    semantics, same as git fetches).
+
+35. **Image declared-vs-observed SBOM diff** *(priority: medium —
+    depends on #30 + #34)* — the container specialisation of #30.
+    Diff the **declared** image package set (a Trivy/Syft SBOM of
+    the final image, or the OS-package + lockfile manifests inside
+    it) against the **observed** build-time fetch set from #34. The
+    high-signal bucket is "fetched during build but absent from the
+    final image": build-stage exfil, a `curl | sh` dropper that ran
+    and cleaned up, a compiler-plugin pulled and deleted. No
+    image-scanning tool can produce this bucket because it only
+    sees the end state; sakimori sees the build's fetch timeline.
+    Exits non-zero on observed-but-not-in-image correlated with an
+    IOC (#18) / cloud-secret-egress (#17) observation for the same
+    build. Out of scope for the first slice: layer-level
+    attribution of *which* `RUN` fetched what (BuildKit doesn't
+    expose a clean fetch→layer map) — the diff is build-scoped, not
+    per-layer.
+
 Explicitly **out of scope** (different product philosophy, not
 a missing feature):
 
